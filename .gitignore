@@ -1,0 +1,5 @@
+# Generated code index (codegraph)
+.codegraph/
+
+# Local napkin knowledge-base state
+.napkin/
