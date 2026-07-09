@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>PROTOTYPE — throw away after decision — Observatory CLI Contract</title>
+<style>
+:root{--ink:#e9eadf;--muted:#9da397;--dim:#666d64;--paper:#101310;--panel:#171b17;--line:#394138;--hot:#ffb000;--cool:#6ee7b7;--bad:#ff6b5f;--blue:#8ab4f8;--shadow:#050705;--measure:1180px;--mono:"IBM Plex Mono","Cascadia Code","SFMono-Regular",Consolas,"Liberation Mono",monospace;--sans:"Avenir Next Condensed","DIN Condensed","Arial Narrow",sans-serif}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 var(--mono);background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:100% 28px}a{color:var(--cool)}button,input,textarea{font:inherit}button{cursor:pointer}.mast{border-bottom:1px solid var(--line);background:#0b0e0b;position:relative;overflow:hidden}.mast:after{content:"OBS / 009";position:absolute;right:-.04em;top:-.32em;color:#151a15;font:900 clamp(80px,17vw,230px)/1 var(--sans);letter-spacing:-.07em;pointer-events:none}.mast-inner{max-width:var(--measure);margin:auto;padding:36px 24px 28px;position:relative;z-index:1}.kicker{color:var(--bad);font-weight:800;letter-spacing:.09em;text-transform:uppercase}.mast h1{font:900 clamp(38px,7vw,88px)/.88 var(--sans);letter-spacing:-.035em;text-transform:uppercase;max-width:850px;margin:20px 0}.dek{max-width:760px;color:#c4c8bd;font-size:17px}.question{display:inline-block;border:1px solid var(--hot);color:var(--hot);padding:6px 10px;margin-top:16px}.statebar{border-bottom:1px solid var(--line);background:#151915;position:sticky;top:0;z-index:20}.statebar-inner{max-width:var(--measure);margin:auto;padding:9px 24px;display:flex;gap:20px;align-items:center;overflow:auto;white-space:nowrap}.statebar b{color:var(--hot)}.statebar span{color:var(--muted)}main{max-width:var(--measure);margin:auto;padding:0 24px 150px}.variant{display:none}.variant.active{display:block}.variant.design-b.active{display:grid}.variant-head{padding:44px 0 28px;border-bottom:3px double var(--line)}.variant-mark{font:900 96px/.7 var(--sans);color:var(--line);float:right}.variant-head h2{font:900 clamp(32px,5vw,64px)/1 var(--sans);text-transform:uppercase;margin:0 0 14px}.variant-head p{max-width:800px;color:#c8ccc1}.recommend{border-left:7px solid var(--hot);background:#201b0d;padding:18px 20px;margin:26px 0}.recommend strong{display:block;color:var(--hot);text-transform:uppercase;letter-spacing:.08em}.section{padding:34px 0;border-bottom:1px solid var(--line)}.section h3{font:800 26px/1.1 var(--sans);text-transform:uppercase;letter-spacing:.03em;margin:0 0 18px}.section h4{font-size:14px;color:var(--hot);text-transform:uppercase;letter-spacing:.1em;margin:24px 0 8px}.note{color:var(--muted);max-width:860px}.terminal{background:#080a08;border:1px solid #303730;box-shadow:8px 8px 0 var(--shadow);margin:14px 0 24px;overflow:hidden}.terminal-label{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #303730;padding:6px 10px;color:var(--dim);font-size:12px;text-transform:uppercase}.terminal pre{margin:0;padding:16px;overflow:auto;color:#dde1d6;font:13px/1.55 var(--mono);white-space:pre}.terminal .cmd{color:var(--cool)}.terminal .err{color:var(--bad)}.terminal .warn{color:var(--hot)}code{color:#d9e7d6}.tree{columns:2;column-gap:20px}.tree .terminal{break-inside:avoid}.matrix{width:100%;border-collapse:collapse;margin:15px 0;font-size:13px}.matrix th,.matrix td{text-align:left;vertical-align:top;padding:9px 10px;border:1px solid var(--line)}.matrix th{color:var(--hot);background:#1c201b;text-transform:uppercase;letter-spacing:.05em}.matrix td:first-child{white-space:nowrap;color:var(--cool)}.rules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line);border-left:1px solid var(--line)}.rule{padding:16px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.rule b{display:block;color:var(--cool);margin-bottom:5px}.flow{display:flex;align-items:stretch;gap:0;overflow:auto;margin:20px 0}.flow div{min-width:170px;padding:16px;border:1px solid var(--line);background:var(--panel)}.flow i{display:flex;align-items:center;padding:8px;color:var(--hot);font-style:normal}.callout{border:1px solid var(--bad);padding:16px;margin:20px 0}.callout b{color:var(--bad)}
+/* A: linear manual */.design-a .section{max-width:930px}.design-a .chapter{display:grid;grid-template-columns:90px 1fr;gap:26px}.design-a .chapter-no{font:900 56px/1 var(--sans);color:var(--line);position:sticky;top:70px;align-self:start}.design-a h3{border-bottom:8px solid #283028;padding-bottom:8px}
+/* B: resource field guide */.variant.design-b.active{display:grid;grid-template-columns:220px minmax(0,1fr);gap:34px}.design-b .variant-head{grid-column:1/-1}.design-b nav{position:sticky;top:56px;align-self:start;padding-top:34px}.design-b nav a{display:block;padding:7px 0;border-bottom:1px solid var(--line);color:var(--muted);text-decoration:none}.design-b nav a:hover{color:var(--hot)}.design-b .content{min-width:0}.design-b .section h3:before{content:":: ";color:var(--hot)}
+/* C: operation ledger */.design-c .variant-head{border-bottom:1px solid var(--blue)}.design-c .ledger{display:grid;grid-template-columns:170px 1fr;border-top:1px solid var(--line)}.design-c .ledger-key,.design-c .ledger-body{padding:24px 0;border-bottom:1px solid var(--line)}.design-c .ledger-key{color:var(--blue);font-weight:bold;text-transform:uppercase}.design-c .ledger-body{min-width:0}.design-c .terminal{border-color:#35465d}.design-c .intent{border-left:3px solid var(--blue);padding-left:18px}
+.approval{margin-top:64px;border:2px solid var(--hot);background:#141812;box-shadow:12px 12px 0 #070907}.approval header{padding:18px 22px;border-bottom:1px solid var(--hot);display:flex;justify-content:space-between;gap:15px}.approval h2{font:900 25px/1 var(--sans);text-transform:uppercase;margin:0}.approval form{padding:22px}.choices{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}.choice{background:#111511;padding:16px;cursor:pointer}.choice:has(input:checked){background:#2a230f;outline:2px solid var(--hot);outline-offset:-2px}.choice input{accent-color:var(--hot)}.choice b{display:block;margin-top:10px}.approval label[for=changes]{display:block;margin:22px 0 7px;color:var(--hot)}textarea{width:100%;min-height:110px;resize:vertical;background:#090c09;color:var(--ink);border:1px solid var(--line);padding:12px}.submit{display:flex;align-items:center;gap:16px;margin-top:16px}.submit button{background:var(--hot);color:#151000;border:0;padding:11px 16px;font-weight:900;text-transform:uppercase}.status{color:var(--cool)}.switcher{position:fixed;z-index:50;left:50%;bottom:18px;transform:translateX(-50%);display:flex;align-items:center;background:#eef0e7;color:#101310;border:2px solid #101310;box-shadow:6px 6px 0 var(--hot);min-width:min(560px,calc(100vw - 28px))}.switcher button{border:0;background:#101310;color:#eef0e7;font-size:22px;padding:10px 18px}.switcher button:hover{background:var(--hot);color:#101310}.switch-label{flex:1;text-align:center;font-weight:900;text-transform:uppercase;padding:0 10px}.switch-label small{display:block;font-weight:400;text-transform:none;color:#495048}.nowrap{white-space:nowrap}.bad{color:var(--bad)}.good{color:var(--cool)}.hot{color:var(--hot)}
+@media(max-width:800px){.tree{columns:1}.rules{grid-template-columns:1fr}.variant.design-b.active{display:block}.design-b nav{position:static;display:flex;overflow:auto;gap:16px;border-bottom:1px solid var(--line)}.design-b nav a{white-space:nowrap}.design-a .chapter{display:block}.design-a .chapter-no{position:static;font-size:36px}.choices{grid-template-columns:1fr 1fr}.variant-mark{font-size:60px}.matrix{display:block;overflow:auto}.ledger{grid-template-columns:1fr!important}.ledger-key{padding-bottom:0!important;border-bottom:0!important}.approval header{display:block}.flow i{padding:4px}.statebar-inner{padding-inline:14px}main,.mast-inner{padding-left:16px;padding-right:16px}}
+@media(max-width:480px){.choices{grid-template-columns:1fr}.switcher button{padding:9px 13px}.switch-label{font-size:12px}.terminal pre{font-size:11.5px;padding:12px}.mast h1{font-size:44px}.variant-head{padding-top:30px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header class="mast">
+ <div class="mast-inner">
+  <div class="kicker">Wayfinder ticket 009 · decision artifact</div>
+  <h1>Agent-facing CLI contract</h1>
+  <p class="dek">Three command structures for the same settled Observatory behavior. Judge which one lets an agent act correctly after reading only <code>obs --help</code>.</p>
+  <div class="question">PROTOTYPE — throw away after decision.</div>
+ </div>
+</header>
+<div class="statebar" aria-live="polite"><div class="statebar-inner"><b id="stateVariant">A / Workflow verbs</b><span id="stateGrammar">Grammar: intent → resource</span><span>Transport: daemon client</span><span>Authority: one backend writer</span><span>Review state: awaiting one choice</span></div></div>
+<main>
+<!-- VARIANT A -->
+<article class="variant design-a" data-variant="A">
+ <header class="variant-head"><span class="variant-mark">A</span><h2>Workflow verbs</h2><p>Start with what the agent wants to do, then name the resource. This reads like imperative prose: <code>obs publish create</code>, <code>obs register service</code>, <code>obs remove artifact</code>.</p><div class="recommend"><strong>Tradeoff</strong>Excellent for the first publish. Weak for discovery: an agent must search several verb families to learn everything it can do to one resource.</div></header>
+ <section class="section chapter"><div class="chapter-no">01</div><div><h3>Complete help tree</h3><p class="note">Every leaf below is a runnable command. Parent nodes print their child commands and examples, then exit 0.</p><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — catalogue browser work
+
+USAGE  obs [GLOBAL OPTIONS] &lt;COMMAND&gt;
+
+GLOBAL OPTIONS
+  --server URL       daemon API; default http://127.0.0.1:3773
+  --project PATH     canonical Project; default current directory
+  --json             one JSON value on stdout; diagnostics stay on stderr
+  --timeout DURATION client deadline; default 30s
+  --idempotency-key KEY  bind a mutation to one request fingerprint
+
+COMMANDS
+  publish       create or explicitly replace an Artifact
+  import        migrate existing browser files into Publish
+  register      strictly create a Service
+  update        explicitly update an existing Service or Target
+  list          list Artifacts, Services, Projects, or Targets
+  show          inspect one Artifact, Service, Project, or Target
+  remove        remove an Artifact, Service, or Target
+  restore       restore a recoverable Artifact
+  pin           suppress Artifact or Service expiry
+  unpin         restore expiry policy
+  teardown      run a Service's registered Teardown Action, then remove
+  refresh       probe Service Targets now
+  keep          restart an offline Service's seven-day grace period
+  target        add or promote a Service Target
+  cleanup       preview or run eligible catalogue/storage cleanup
+  diagnostics   inspect backend, storage, Serve, and reachability state
+  setup         reconcile the owned Tailscale Serve root handler
+  status        summarize daemon and canonical address
+  serve         run the loopback HTTP daemon and sole write authority
+
+Run 'obs &lt;command&gt; --help' for every leaf.</pre></div>
+<div class="tree">
+<div class="terminal"><div class="terminal-label"><span>mutation families</span><span>complete</span></div><pre>publish
+  create SOURCE [--entry PATH] [--title TEXT]
+    [--description TEXT] [--ttl DURATION|--pin]
+  replace ARTIFACT SOURCE [same metadata flags]
+
+import
+  create SOURCE... [--entry PATH] [--title TEXT]
+    [--ttl DURATION|--pin]
+  replace ARTIFACT SOURCE [same flags]
+  batch --manifest FILE
+
+register
+  service NAME --target NAME=URL [--primary NAME]
+    [--label TEXT] [--teardown-arg ARG...]
+
+update
+  service SERVICE [--label TEXT]
+    [--teardown-clear|--teardown-arg ARG...]
+  target SERVICE TARGET --url URL [--label TEXT]
+
+remove
+  artifact ARTIFACT [--yes]
+  service SERVICE [--yes]
+  target SERVICE TARGET [--yes]
+    [--new-primary TARGET]
+
+restore artifact ARTIFACT [--ttl DURATION|--pin]
+pin artifact ARTIFACT [--reason TEXT]
+pin service SERVICE [--reason TEXT]
+unpin artifact ARTIFACT [--ttl DURATION]
+unpin service SERVICE
+teardown service SERVICE --yes [--action-timeout D]
+keep service SERVICE</pre></div>
+<div class="terminal"><div class="terminal-label"><span>read/control families</span><span>complete</span></div><pre>list artifacts [--all] [--project PATH]
+list services [--project PATH]
+list projects
+list targets SERVICE
+show artifact ARTIFACT [--revisions]
+show service SERVICE
+show project PROJECT
+show target SERVICE TARGET
+
+target add SERVICE NAME=URL [--primary]
+target promote SERVICE TARGET
+target remove SERVICE TARGET --yes
+  [--new-primary TARGET]
+
+refresh target SERVICE TARGET
+refresh service SERVICE
+refresh all
+
+cleanup preview [--pressure]
+cleanup run --yes [--pressure]
+
+diagnostics [--deep]
+setup check
+setup apply --yes
+status
+serve [--listen 127.0.0.1:3773]
+  [--canonical-origin URL] [--storage PATH]</pre></div></div></div></section>
+ <section class="section chapter"><div class="chapter-no">02</div><div><h3>Concrete session</h3><h4>Create, replace, then inspect an Artifact</h4><div class="terminal"><div class="terminal-label"><span>human output</span><span>stdout + exit 0</span></div><pre><span class="cmd">$ obs --project /home/will/projects/observatory publish create docs/review \
+    --entry cli.html --title "CLI contract" --ttl 14d \
+    --idempotency-key issue-9-cli-v1</span>
+Published Artifact CLI contract
+Artifact  6r3t8w2y5b9c4d7f0g1h3j5k7m
+Revision  7s4v9x3z6c0d5f8g1h2j4k6m8n
+URL       https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract~6r3t8w2y5b9c4d7f0g1h3j5k7m/
+Expires   2026-07-23T17:40:00Z
+
+<span class="cmd">$ obs publish replace 6r3t8w2y5b9c4d7f0g1h3j5k7m docs/review-v2 \
+    --entry cli.html --idempotency-key issue-9-cli-v2</span>
+Replaced Artifact CLI contract
+Revision  1a6p9m2x5c8f0h3k7n4q6t8v0z
+URL       https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract~6r3t8w2y5b9c4d7f0g1h3j5k7m/
+Previous  https://desktop.greyhound-chinstrap.ts.net/revisions/7s4v9x3z6c0d5f8g1h2j4k6m8n/</pre></div><p class="note">The daemon returns both URLs. The client never constructs a route from title, slug, Project, or ID.</p>
+<h4>Register a Service and manage Targets</h4><div class="terminal"><div class="terminal-label"><span>human output</span><span>stdout + exit 0</span></div><pre><span class="cmd">$ obs register service lavish \
+  --target tailnet=https://desktop.greyhound-chinstrap.ts.net:8443/ \
+  --target local=http://127.0.0.1:4173/ --primary tailnet \
+  --teardown-arg ./scripts/stop-lavish --idempotency-key lavish-register-01</span>
+Registered Service lavish (unknown; probe queued)
+Detail  https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/services/lavish~8t5w0x4z7c1d6f9g2h3j5k7m9n/
+Open    https://desktop.greyhound-chinstrap.ts.net:8443/
+
+<span class="cmd">$ obs target add lavish review=https://desktop.greyhound-chinstrap.ts.net:9443/session/9</span>
+Added Target review (unknown; probe queued)
+<span class="cmd">$ obs update target lavish review --url https://desktop.greyhound-chinstrap.ts.net:9443/session/10</span>
+Updated Target review (unknown; prior observation invalidated)
+<span class="cmd">$ obs refresh service lavish</span>
+tailnet  online  HTTP 200  42ms
+local    online  HTTP 200  3ms
+review   offline timeout   5000ms</pre></div></div></section>
+ <section class="section chapter"><div class="chapter-no">03</div><div><h3>Machine and failure contract</h3><div class="terminal"><div class="terminal-label"><span>obs publish create … --json</span><span>stdout only · exit 0</span></div><pre>{
+  "schemaVersion": 1,
+  "ok": true,
+  "result": {
+    "kind": "artifact",
+    "operation": "create",
+    "id": "6r3t8w2y5b9c4d7f0g1h3j5k7m",
+    "revisionId": "7s4v9x3z6c0d5f8g1h2j4k6m8n",
+    "url": "https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract~6r3t8w2y5b9c4d7f0g1h3j5k7m/",
+    "detailUrl": "https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/artifacts/cli-contract~6r3t8w2y5b9c4d7f0g1h3j5k7m/",
+    "retention": {"mode":"ttl","expiresAt":"2026-07-23T17:40:00Z"},
+    "files": 4, "bytes": 183442
+  }
+}</pre></div><div class="terminal"><div class="terminal-label"><span>source changed</span><span>stdout empty · stderr · exit 7</span></div><pre><span class="cmd">$ obs import create /tmp/live-report --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"source_changed","message":"source changed while it was copied","retryable":true,"details":{"item":0,"source":"live-report"}}}</span></pre></div><div class="terminal"><div class="terminal-label"><span>non-TTY destructive request</span><span>stdout empty · stderr · exit 2</span></div><pre><span class="cmd">$ obs remove artifact 6r3t… &lt; /dev/null</span>
+<span class="err">error[confirmation_required]: refusing destructive action without --yes</span>
+<span class="err">hint: preview with 'obs show artifact 6r3t…'; retry with --yes</span></pre></div><p class="note">A gives agents consistent English phrases, but aliases would be tempting (<code>delete</code> vs <code>remove</code>, <code>add</code> vs <code>register</code>). More vocabulary means more help-search misses.</p></div></section>
+</article>
+
+<!-- VARIANT B -->
+<article class="variant design-b" data-variant="B">
+ <header class="variant-head"><span class="variant-mark">B</span><h2>Resource namespaces</h2><p>Choose a noun, then see every legal operation on it: <code>obs artifact publish</code>, <code>obs service register</code>, <code>obs service target add</code>. The hierarchy mirrors the domain language and keeps strict create/update intent visible.</p><div class="recommend"><strong>Recommended</strong>This is the smallest self-documenting interface for agents. Six top-level nouns expose the whole model; each noun’s help is a complete capability inventory. No generic CRUD hides Publish, teardown, restore, refresh, or keep.</div></header>
+ <nav aria-label="Variant B sections"><a href="#b-tree">Help tree</a><a href="#b-artifact">Artifact / import</a><a href="#b-service">Service / Targets</a><a href="#b-ops">Operations</a><a href="#b-machine">Machine contract</a><a href="#approval">Choose</a></nav>
+ <div class="content">
+ <section class="section" id="b-tree"><h3>Complete help tree</h3><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — publish Artifacts; catalogue externally owned Services
+
+USAGE  obs [GLOBAL OPTIONS] &lt;RESOURCE&gt; &lt;ACTION&gt;
+
+GLOBAL OPTIONS
+  --server URL            default http://127.0.0.1:3773
+  -p, --project PATH      default $PWD; daemon resolves canonical directory
+  --json                  exactly one JSON value on stdout
+  --timeout DURATION      client request deadline (default 30s)
+  --idempotency-key KEY   required by automation for mutations
+
+RESOURCES
+  artifact     owned static bundles and immutable Revisions
+  service      links to externally run browser applications
+  project      canonical work contexts
+  cleanup      expiration, recovery windows, and stored bytes
+  system       setup, diagnostics, and daemon status
+  serve        run the loopback daemon (the only write authority)
+
+EXAMPLES
+  obs artifact publish ./report.html --json
+  obs service register lavish --target tailnet=https://host:8443/
+  obs service show lavish --json
+
+CONTRACT
+  Create is strict. Updates and replacements are explicit.
+  Returned URLs are canonical; never construct one from an ID.
+  With --json, stdout is machine output and stderr is diagnostics only.
+  Non-TTY invocations never prompt.</pre></div>
+<div class="terminal"><div class="terminal-label"><span>all resource help</span><span>every leaf</span></div><pre>obs artifact
+  publish SOURCE          strictly create an Artifact
+  replace ARTIFACT SOURCE explicitly create and select a Revision
+  import SOURCE...        explicit migration intake; per-item atomic
+  list                    list live Artifacts (add --all for tombstones)
+  show ARTIFACT           inspect metadata (add --revisions)
+  remove ARTIFACT         enter seven-day recovery window
+  restore ARTIFACT        restore recoverable identity
+  pin ARTIFACT            suppress expiration
+  unpin ARTIFACT          start TTL/default retention
+
+obs service
+  register NAME           strictly create in selected Project
+  update SERVICE          update presentation/action, never identity
+  list                    list Services in selected Project
+  show SERVICE            show all Targets and observations
+  remove SERVICE          remove catalogue record only
+  teardown SERVICE        run explicit action; remove only on success
+  refresh SERVICE         probe all Targets now
+  refresh --all           bounded bulk probe
+  pin SERVICE             suppress automatic catalogue expiry
+  unpin SERVICE           enable fresh seven-day all-offline grace
+  keep SERVICE            restart all-offline grace only
+  target list SERVICE
+  target show SERVICE TARGET
+  target add SERVICE NAME=URL [--primary]
+  target update SERVICE TARGET --url URL [--label TEXT]
+  target remove SERVICE TARGET [--new-primary TARGET]
+  target promote SERVICE TARGET
+  target refresh SERVICE TARGET
+
+obs project
+  list
+  show PROJECT
+  resolve [PATH]          print canonical directory and allocated key
+
+obs cleanup
+  preview [--pressure]
+  run --yes [--pressure]
+
+obs system
+  status
+  diagnostics [--deep]
+  setup check
+  setup apply --yes
+
+obs serve
+  [--listen 127.0.0.1:3773]
+  [--canonical-origin URL]
+  [--storage PATH]</pre></div>
+<table class="matrix"><thead><tr><th>Leaf convention</th><th>Meaning</th><th>Required safety</th></tr></thead><tbody><tr><td>publish / register</td><td>Strict creation. Existing identity or replay key mismatch is conflict.</td><td>Automation supplies <code>--idempotency-key</code>.</td></tr><tr><td>replace / update</td><td>Requires an existing identity. Never inferred from source, title, or URL.</td><td>Record-version contention fails; no implicit retry across changed input.</td></tr><tr><td>remove / teardown / cleanup run</td><td>Destructive catalogue or byte intent.</td><td>Prompt only in a TTY; otherwise require <code>--yes</code>. Teardown never implied by remove.</td></tr><tr><td>list / show / preview / status</td><td>Read-only.</td><td>Never prompt; safe with <code>--json</code>.</td></tr></tbody></table></section>
+
+ <section class="section" id="b-artifact"><h3>Artifact and import</h3><div class="terminal"><div class="terminal-label"><span>obs artifact publish --help</span><span>exit 0</span></div><pre>USAGE  obs artifact publish SOURCE [OPTIONS]
+
+Strictly create one owned Artifact from a regular file or directory.
+
+OPTIONS
+  --entry PATH            directory entry point; explicit wins over .obs.json
+  --title TEXT            display title
+  --description TEXT      display description
+  --slug TEXT             suggested readable route component
+  --ttl DURATION          positive TTL; default 30d
+  --pin [--reason TEXT]   no expiration deadline
+  -p, --project PATH      catalogue association; default $PWD
+  --idempotency-key KEY   same key + same request replays result
+  --json                  one result object on stdout
+
+The daemon copies and validates bytes before commit. It returns the canonical
+stable URL and immutable Revision URL. SOURCE never becomes identity.</pre></div>
+<div class="terminal"><div class="terminal-label"><span>create + explicit replace</span><span>stdout · exits 0 / 0</span></div><pre><span class="cmd">$ obs artifact publish docs/prototypes/observatory-cli-contract.html \
+  --project /home/will/projects/observatory --title "CLI contract prototype" \
+  --ttl 14d --idempotency-key issue-9-prototype-v1</span>
+Published Artifact CLI contract prototype
+ID        6r3t8w2y5b9c4d7f0g1h3j5k7m
+Revision  7s4v9x3z6c0d5f8g1h2j4k6m8n
+Open      https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract-prototype~6r3t8w2y5b9c4d7f0g1h3j5k7m/
+Immutable https://desktop.greyhound-chinstrap.ts.net/revisions/7s4v9x3z6c0d5f8g1h2j4k6m8n/
+
+<span class="cmd">$ obs artifact replace 6r3t8w2y5b9c4d7f0g1h3j5k7m ./revised.html \
+  --idempotency-key issue-9-prototype-v2</span>
+Replaced Artifact CLI contract prototype
+Revision  1a6p9m2x5c8f0h3k7n4q6t8v0z
+Open      https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract-prototype~6r3t8w2y5b9c4d7f0g1h3j5k7m/</pre></div>
+<div class="terminal"><div class="terminal-label"><span>ordered import batch</span><span>stdout · exit 8 partial</span></div><pre><span class="cmd">$ obs artifact import /tmp/auth-flow.html /tmp/live-dashboard \
+  --project . --idempotency-key migration-20260709 --json</span>
+{
+  "schemaVersion": 1, "ok": false, "partial": true,
+  "result": {"operation":"import","items":[
+    {"index":0,"source":"auth-flow.html","status":"committed",
+     "artifactId":"2c5f8h1k4n7q0t3w6y9b2d5g8j",
+     "revisionId":"3d6g9j2m5p8s1v4x7z0c3f6h9k",
+     "url":"https://desktop.greyhound-chinstrap.ts.net/artifacts/auth-flow~2c5f8h1k4n7q0t3w6y9b2d5g8j/",
+     "files":1,"bytes":48211,"retention":{"mode":"default","expiresAt":"2026-08-08T17:40:00Z"}},
+    {"index":1,"source":"live-dashboard","status":"failed",
+     "error":{"code":"source_changed","message":"source changed while it was copied","retryable":true}}
+  ]}
+}</pre></div><p class="note">A partial batch reports every item in input order. Successful siblings remain committed; retry the failure with a new key. Absolute source paths never persist.</p>
+<div class="rules"><div class="rule"><b>Remove</b><code>obs artifact remove ID --yes</code> returns a tombstone and recovery deadline; it does not purge bytes.</div><div class="rule"><b>Restore</b><code>obs artifact restore ID --pin</code> chooses retention explicitly and returns the daemon’s canonical URL.</div><div class="rule"><b>Pin</b><code>obs artifact pin ID --reason "standing architecture"</code> protects the live Artifact and current Revision, not unbounded history.</div><div class="rule"><b>Unpin</b><code>obs artifact unpin ID --ttl 30d</code> starts the deadline at unpin time.</div></div></section>
+
+ <section class="section" id="b-service"><h3>Service and Targets</h3><div class="terminal"><div class="terminal-label"><span>obs service register --help</span><span>exit 0</span></div><pre>USAGE  obs service register NAME --target NAME=URL... [OPTIONS]
+
+Strictly create one Service in the selected Project. Exactly one Target is
+primary. URLs must be absolute, credential-free HTTP(S) URLs.
+
+OPTIONS
+  --target NAME=URL       repeatable; first is primary unless --primary names one
+  --primary TARGET        configured Open link; not a health assertion
+  --label TEXT            presentation label
+  --description TEXT      presentation description
+  --teardown-arg ARG      repeatable argv; first value is executable; no shell
+  --pin [--reason TEXT]   suppress all-offline catalogue expiry
+  -p, --project PATH      identity scope; default $PWD
+  --idempotency-key KEY   bind retry to request fingerprint
+  --json
+
+Registration commits before probing. All Targets begin unknown.</pre></div>
+<div class="terminal"><div class="terminal-label"><span>register / inspect / mutate</span><span>stdout · exit 0</span></div><pre><span class="cmd">$ obs service register pi-annotate \
+  --target tailnet=https://desktop.greyhound-chinstrap.ts.net:8443/session/current \
+  --target local=http://127.0.0.1:18181/session/current --primary tailnet \
+  --teardown-arg ./scripts/pi-annotate-stop --teardown-arg current \
+  --idempotency-key pi-annotate-current-v1</span>
+Registered Service pi-annotate (probe queued)
+ID      8t5w0x4z7c1d6f9g2h3j5k7m9n
+Detail  https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/services/pi-annotate~8t5w0x4z7c1d6f9g2h3j5k7m9n/
+Open    https://desktop.greyhound-chinstrap.ts.net:8443/session/current
+
+<span class="cmd">$ obs service target add pi-annotate review=https://desktop.greyhound-chinstrap.ts.net:9443/r/9</span>
+Added Target review (unknown; probe queued)
+<span class="cmd">$ obs service target promote pi-annotate review</span>
+Primary Target is now review
+Open    https://desktop.greyhound-chinstrap.ts.net:9443/r/9
+<span class="cmd">$ obs service update pi-annotate --label "Current annotation session"</span>
+Updated Service pi-annotate (Targets unchanged)
+<span class="cmd">$ obs service refresh pi-annotate</span>
+review   online   HTTP 200   38ms  observed 2026-07-09T17:44:02Z
+tailnet  online   HTTP 302   41ms  observed 2026-07-09T17:44:02Z
+local    offline  connection  2ms  observed 2026-07-09T17:44:02Z</pre></div>
+<div class="callout"><b>Catalogue, not supervisor.</b> <code>service remove</code> never touches the process. <code>service teardown --yes</code> is the only external runtime action: it runs registered argv once in the canonical Project directory, then removes only the unchanged record after exit 0. Observatory never starts, restarts, kills, proxies, configures ports, or falls back to another Target.</div>
+<div class="terminal"><div class="terminal-label"><span>teardown failure</span><span>stdout empty · stderr · exit 9</span></div><pre><span class="cmd">$ obs service teardown pi-annotate --yes --action-timeout 20s --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"teardown_failed","message":"Teardown Action exited 1; Service was preserved","retryable":true,"details":{"serviceId":"8t5w0x4z7c1d6f9g2h3j5k7m9n","actionExitCode":1,"capturedStderr":"session is busy"}}}</span></pre></div>
+<div class="rules"><div class="rule"><b>Refresh</b>One Target, one Service, or <code>--all</code>. Bulk results are per Target and can be partial; all probes use the backend host and five-second deadline.</div><div class="rule"><b>Keep</b><code>obs service keep NAME</code> restarts only the seven-day all-offline grace. It does not change observations, config, or process state.</div><div class="rule"><b>Pin / unpin</b>Pin suppresses catalogue expiry, not probes. Unpin starts a fresh grace only while every Target is confirmed offline.</div><div class="rule"><b>Primary removal</b><code>target remove … --new-primary NAME --yes</code> changes both atomically. A Service never has zero or two primaries.</div></div></section>
+
+ <section class="section" id="b-ops"><h3>Project, cleanup, diagnostics, and serve</h3><div class="flow" aria-label="write authority flow"><div><b>obs client</b><br><span class="note">parses args<br>never opens SQLite</span></div><i>→</i><div><b>loopback API</b><br><code>127.0.0.1:3773</code></div><i>→</i><div><b>obs serve</b><br><span class="note">validation + one write queue</span></div><i>→</i><div><b>SQLite + bytes</b><br><span class="note">authoritative catalogue</span></div></div>
+<div class="terminal"><div class="terminal-label"><span>selection + read</span><span>stdout · exit 0</span></div><pre><span class="cmd">$ cd /home/will/projects/observatory
+$ obs project resolve</span>
+Project  observatory
+Path     /home/will/projects/observatory
+Key      observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p
+<span class="cmd">$ obs artifact list --json</span>
+{"schemaVersion":1,"ok":true,"result":{"project":{"id":"4m7k2x9q1v6c8d3f5g0h2j4n6p","path":"/home/will/projects/observatory"},"artifacts":[{"id":"6r3t8w2y5b9c4d7f0g1h3j5k7m","title":"CLI contract prototype","state":"live","pinned":false,"expiresAt":"2026-07-23T17:40:00Z","url":"https://desktop.greyhound-chinstrap.ts.net/artifacts/cli-contract-prototype~6r3t8w2y5b9c4d7f0g1h3j5k7m/"}]}}</pre></div>
+<div class="terminal"><div class="terminal-label"><span>cleanup preview / run</span><span>no mutation / explicit mutation</span></div><pre><span class="cmd">$ obs cleanup preview</span>
+ACTION             ENTRY / REVISION                    BYTES      RECOVERABLE
+purge expired      Old CSS audit · 0p4s7v…             12.4 MiB   no
+remove superseded  CLI contract · revision 9z2c5f…      1.8 MiB   no
+reclaim total                                               14.2 MiB
+<span class="cmd">$ obs cleanup run --yes --idempotency-key cleanup-20260709-01</span>
+Cleanup completed: 2 candidates, 14.2 MiB quarantined, 0 failures</pre></div>
+<div class="terminal"><div class="terminal-label"><span>setup / status / daemon</span><span>operator surface</span></div><pre><span class="cmd">$ obs system setup check</span>
+<span class="warn">NEEDS SETUP</span>  canonical origin has no owned Serve root handler
+Planned: https://desktop.greyhound-chinstrap.ts.net/ → http://127.0.0.1:3773
+<span class="cmd">$ obs system setup apply --yes</span>
+Configured and verified owned Tailscale Serve root handler
+<span class="cmd">$ obs system diagnostics --deep</span>
+PASS daemon            http://127.0.0.1:3773 (4ms)
+PASS canonical origin  https://desktop.greyhound-chinstrap.ts.net/
+PASS sqlite            quick_check ok; WAL; schema 1
+PASS revision bytes    18 checked; 0 missing; 0 mismatch
+PASS storage reserve   81.2 GiB free; reserve 13.4 GiB
+WARN service targets   1 offline; 0 stale; 0 unknown
+<span class="cmd">$ obs serve --listen 127.0.0.1:3773 \
+  --canonical-origin https://desktop.greyhound-chinstrap.ts.net/</span>
+Observatory listening on http://127.0.0.1:3773
+Canonical origin https://desktop.greyhound-chinstrap.ts.net/
+Write authority active; scheduled probes and cleanup active</pre></div><p class="note"><code>obs serve</code> refuses non-loopback listen addresses. Setup inspects existing Tailscale Serve state and refuses unrelated handlers; ordinary requests never mutate Serve configuration. A second daemon fails before accepting writes.</p></section>
+
+ <section class="section" id="b-machine"><h3>Machine contract and exact exits</h3><table class="matrix"><thead><tr><th>Exit</th><th>Stable category</th><th>Examples</th></tr></thead><tbody><tr><td>0</td><td>success</td><td>Committed, read completed, or idempotent replay.</td></tr><tr><td>2</td><td>usage / validation / confirmation</td><td>Bad flags, unsafe member, missing <code>--yes</code>, no prompt in non-TTY.</td></tr><tr><td>3</td><td>not_found / gone</td><td>Unknown ID or tombstoned URL/entry requested as live.</td></tr><tr><td>4</td><td>conflict</td><td>Strict create collision, idempotency key reused with different fingerprint, record changed.</td></tr><tr><td>5</td><td>unavailable / timeout</td><td>Daemon unavailable or client deadline reached; committed state is reported as unknown when needed.</td></tr><tr><td>6</td><td>contention</td><td>Bounded SQLite busy handling exhausted or sole writer unavailable.</td></tr><tr><td>7</td><td>source_changed</td><td>Import/publish source mutated during owned copy.</td></tr><tr><td>8</td><td>partial</td><td>Some batch items or Targets succeeded and some failed.</td></tr><tr><td>9</td><td>external_action_failed</td><td>Teardown launch, nonzero exit, or action timeout; Service preserved.</td></tr><tr><td>10</td><td>capacity / unhealthy</td><td>Reserve or ceiling blocks byte-adding Publish; reads continue.</td></tr></tbody></table>
+<div class="terminal"><div class="terminal-label"><span>contention</span><span>stdout empty · stderr · exit 6</span></div><pre><span class="cmd">$ obs artifact pin 6r3t… --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"contention","message":"catalogue remained busy for 5s","retryable":true,"details":{"retryAfterMs":250}}}</span></pre></div>
+<div class="terminal"><div class="terminal-label"><span>client timeout after dispatch</span><span>stdout empty · stderr · exit 5</span></div><pre><span class="cmd">$ obs artifact publish ./large-report --timeout 1s --idempotency-key report-44 --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"client_timeout","message":"deadline reached; commit state is unknown","retryable":true,"details":{"idempotencyKey":"report-44","retry":"repeat the identical request with the same key"}}}</span></pre></div>
+<div class="terminal"><div class="terminal-label"><span>strict creation conflict</span><span>stdout empty · stderr · exit 4</span></div><pre><span class="cmd">$ obs service register pi-annotate --target primary=https://host:8443/ --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"already_exists","message":"Service 'pi-annotate' already exists in this Project","retryable":false,"details":{"serviceId":"8t5w0x4z7c1d6f9g2h3j5k7m9n","hint":"use 'obs service update pi-annotate'"}}}</span></pre></div>
+<div class="rules"><div class="rule"><b>stdout</b>Human success output or exactly one JSON value. Never progress, logs, warnings, spinners, or diagnostics.</div><div class="rule"><b>stderr</b>Errors, warnings, progress, and verbose diagnostics. With <code>--json</code>, errors are one JSON object here.</div><div class="rule"><b>TTY</b>Human destructive calls may ask one confirmation. Non-TTY never prompts and fails unless <code>--yes</code> is present.</div><div class="rule"><b>Idempotency</b>All mutations accept a key. Agents should always send one. Same fingerprint replays/resumes; changed input conflicts.</div></div></section>
+ </div>
+</article>
+
+<!-- VARIANT C -->
+<article class="variant design-c" data-variant="C">
+ <header class="variant-head"><span class="variant-mark">C</span><h2>Intent commands</h2><p>Put lifecycle intent at the root: <code>obs create artifact</code>, <code>obs replace artifact</code>, <code>obs update service</code>. Reads use <code>get</code>; operational actions use <code>act</code>. The grammar is compact and maps cleanly to request objects.</p><div class="recommend"><strong>Tradeoff</strong>Best for generated clients and request manifests. Worst at the terminal: domain-specific operations hide behind <code>act</code>, and <code>get</code> reduces the visibility of Artifact versus Service capabilities.</div></header>
+ <div class="ledger"><div class="ledger-key">Grammar</div><div class="ledger-body"><code>obs &lt;intent&gt; &lt;kind&gt; [identity] [fields]</code>. The help system is organized around mutation semantics rather than resources.</div>
+ <div class="ledger-key">Complete tree</div><div class="ledger-body"><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — send explicit intents to the Observatory daemon
+
+USAGE  obs [--project PATH] [--json] [--timeout D] &lt;INTENT&gt;
+
+INTENTS
+  create artifact SOURCE       strict Publish creation
+  create service NAME          strict Service registration
+  import artifact SOURCE...    migrate existing browser files
+  replace artifact ID SOURCE   explicit Publish replacement
+  update service ID|NAME       presentation or Teardown Action
+  update target SERVICE NAME   Target URL or label
+  get artifacts|artifact       list or inspect Artifacts
+  get services|service         list or inspect Services
+  get projects|project         list, resolve, or inspect Projects
+  get targets|target           list or inspect Targets
+  delete artifact|service      recoverable Artifact / catalogue-only Service
+  delete target                remove Target; primary needs replacement
+  act artifact restore|pin|unpin
+  act service teardown|refresh|pin|unpin|keep
+  act target add|promote|refresh
+  act cleanup preview|run
+  act system diagnostics|setup|status
+  serve                        run sole loopback backend/write authority
+
+GLOBAL  --server URL  --project PATH  --json  --timeout D
+        --idempotency-key KEY  --yes
+
+Run 'obs &lt;intent&gt; --help' for exact fields.</pre></div><div class="terminal"><div class="terminal-label"><span>leaf synopsis</span><span>complete</span></div><pre>create artifact SOURCE [--entry P] [--title T] [--ttl D|--pin]
+create service NAME --target NAME=URL... [--primary NAME]
+  [--label T] [--teardown-arg ARG...]
+import artifact SOURCE... [--entry P] [--ttl D|--pin]
+  [--item-manifest FILE]
+replace artifact ARTIFACT SOURCE [publish options]
+update service SERVICE [--label T]
+  [--teardown-clear|--teardown-arg ARG...]
+update target SERVICE TARGET --url URL [--label T]
+get artifacts [--all]
+get artifact ARTIFACT [--revisions]
+get services
+get service SERVICE
+get projects | get project PROJECT | get project --resolve [PATH]
+get targets SERVICE | get target SERVICE TARGET
+delete artifact ARTIFACT --yes
+delete service SERVICE --yes
+delete target SERVICE TARGET --yes [--new-primary TARGET]
+act artifact restore ARTIFACT [--ttl D|--pin]
+act artifact pin ARTIFACT [--reason T]
+act artifact unpin ARTIFACT [--ttl D]
+act service teardown SERVICE --yes [--action-timeout D]
+act service refresh SERVICE | act service refresh --all
+act service pin SERVICE [--reason T]
+act service unpin SERVICE
+act service keep SERVICE
+act target add SERVICE NAME=URL [--primary]
+act target promote SERVICE TARGET
+act target refresh SERVICE TARGET
+act cleanup preview [--pressure]
+act cleanup run --yes [--pressure]
+act system diagnostics [--deep]
+act system setup check | act system setup apply --yes
+act system status
+serve [--listen 127.0.0.1:3773] [--canonical-origin URL]
+  [--storage PATH]</pre></div></div>
+ <div class="ledger-key">Artifact intent</div><div class="ledger-body intent"><div class="terminal"><div class="terminal-label"><span>publish / replace / JSON</span><span>exit 0</span></div><pre><span class="cmd">$ obs create artifact ./auth-flow --entry index.html --ttl 30d \
+  --idempotency-key auth-flow-v1</span>
+Created Artifact auth-flow
+URL  https://desktop.greyhound-chinstrap.ts.net/artifacts/auth-flow~6r3t8w2y5b9c4d7f0g1h3j5k7m/
+<span class="cmd">$ obs replace artifact 6r3t8w2y5b9c4d7f0g1h3j5k7m ./auth-flow-v2 \
+  --idempotency-key auth-flow-v2 --json</span>
+{"schemaVersion":1,"ok":true,"result":{"intent":"replace","kind":"artifact","id":"6r3t8w2y5b9c4d7f0g1h3j5k7m","revisionId":"1a6p9m2x5c8f0h3k7n4q6t8v0z","url":"https://desktop.greyhound-chinstrap.ts.net/artifacts/auth-flow~6r3t8w2y5b9c4d7f0g1h3j5k7m/","revisionUrl":"https://desktop.greyhound-chinstrap.ts.net/revisions/1a6p9m2x5c8f0h3k7n4q6t8v0z/"}}</pre></div><div class="terminal"><div class="terminal-label"><span>import partial</span><span>stderr JSON · exit 8</span></div><pre><span class="cmd">$ obs import artifact ./one.html ./changing-dir --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"partial":true,"result":{"items":[{"index":0,"status":"committed","artifactId":"2c5f8h1k4n7q0t3w6y9b2d5g8j","url":"https://desktop.greyhound-chinstrap.ts.net/artifacts/one~2c5f8h1k4n7q0t3w6y9b2d5g8j/"},{"index":1,"status":"failed","error":{"code":"source_changed","retryable":true}}]}}</span></pre></div></div>
+ <div class="ledger-key">Service intent</div><div class="ledger-body intent"><div class="terminal"><div class="terminal-label"><span>strict create + target actions</span><span>exit 0</span></div><pre><span class="cmd">$ obs create service lavish \
+ --target tailnet=https://desktop.greyhound-chinstrap.ts.net:8443/ \
+ --target local=http://127.0.0.1:4173/ --primary tailnet</span>
+Created Service lavish (unknown; probe queued)
+Detail  https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/services/lavish~8t5w0x4z7c1d6f9g2h3j5k7m9n/
+Open    https://desktop.greyhound-chinstrap.ts.net:8443/
+<span class="cmd">$ obs act target add lavish review=https://desktop.greyhound-chinstrap.ts.net:9443/r/9</span>
+Added Target review (unknown; probe queued)
+<span class="cmd">$ obs update target lavish review --url https://desktop.greyhound-chinstrap.ts.net:9443/r/10</span>
+Updated Target review (unknown; probe queued)
+<span class="cmd">$ obs act service refresh lavish</span>
+tailnet online HTTP 200 42ms
+local   online HTTP 200 3ms
+review  offline timeout 5000ms</pre></div><p class="note">Targets remain explicit direct URLs. No proxy, automatic fallback, health claim, process start, or supervision is introduced.</p></div>
+ <div class="ledger-key">Operational intent</div><div class="ledger-body"><div class="terminal"><div class="terminal-label"><span>project / lifecycle / control</span><span>selected examples</span></div><pre><span class="cmd">$ obs --project /home/will/projects/observatory get services</span>
+NAME    PRIMARY   STATE   OPEN
+lavish  tailnet   online  https://desktop.greyhound-chinstrap.ts.net:8443/
+<span class="cmd">$ obs act artifact pin 6r3t… --reason "canonical review"</span>
+Pinned Artifact CLI contract
+<span class="cmd">$ obs act service keep lavish</span>
+Renewed catalogue grace; configuration and observations unchanged
+<span class="cmd">$ obs act cleanup preview</span>
+2 eligible candidates · 14.2 MiB reclaimable · no changes made
+<span class="cmd">$ obs act cleanup run --yes</span>
+2 cleaned · 14.2 MiB quarantined · 0 failed
+<span class="cmd">$ obs act system diagnostics --deep</span>
+PASS backend · PASS sqlite · PASS revisions · WARN 1 Target offline
+<span class="cmd">$ obs serve --listen 127.0.0.1:3773</span>
+Observatory listening; sole write authority active</pre></div><p class="note">The client sends every read and mutation to <code>obs serve</code>. It never opens SQLite. Setup is an explicit <code>act system setup</code>; ordinary commands do not touch Tailscale Serve.</p></div>
+ <div class="ledger-key">Failure ledger</div><div class="ledger-body"><table class="matrix"><thead><tr><th>Exit</th><th>Meaning</th></tr></thead><tbody><tr><td>0</td><td>success/replay</td></tr><tr><td>2</td><td>usage, validation, confirmation required</td></tr><tr><td>3</td><td>not found/gone</td></tr><tr><td>4</td><td>conflict or changed record</td></tr><tr><td>5</td><td>daemon unavailable/client timeout</td></tr><tr><td>6</td><td>catalogue contention</td></tr><tr><td>7</td><td>source changed</td></tr><tr><td>8</td><td>partial batch/probe result</td></tr><tr><td>9</td><td>teardown failed/timed out</td></tr><tr><td>10</td><td>capacity/unhealthy storage</td></tr></tbody></table><div class="terminal"><div class="terminal-label"><span>no prompt + timeout + contention</span><span>stderr only</span></div><pre><span class="cmd">$ obs delete service lavish &lt;/dev/null</span>
+<span class="err">error[confirmation_required]: non-TTY destructive action requires --yes</span>
+<span class="err">exit 2</span>
+<span class="cmd">$ obs act service teardown lavish --yes --action-timeout 5s --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"teardown_timeout","message":"action timed out; Service preserved","retryable":true}}</span>
+<span class="err">exit 9</span>
+<span class="cmd">$ obs update service lavish --label Review --json</span>
+<span class="err">{"schemaVersion":1,"ok":false,"error":{"code":"contention","message":"catalogue remained busy for 5s","retryable":true}}</span>
+<span class="err">exit 6</span></pre></div><p class="note">As in A and B: JSON success is one value on stdout. JSON failure is one value on stderr. Human diagnostics never contaminate stdout. Every mutation accepts an idempotency key; same key/different request returns exit 4.</p></div>
+ <div class="ledger-key">Verdict</div><div class="ledger-body"><p>C makes API intent obvious and keeps create versus update strict. But <code>act</code> becomes a miscellaneous drawer containing nine unrelated verbs. Agents asking “what can I do with a Service?” must cross <code>create</code>, <code>update</code>, <code>get</code>, <code>delete</code>, and <code>act</code>. The root is compact; discovery is not.</p></div></div>
+</article>
+
+<section class="approval" id="approval">
+ <header><h2>Human decision boundary</h2><span>One choice · ticket stays open</span></header>
+ <form id="decisionForm" data-lavish-question="observatory-cli-contract">
+  <fieldset><legend>Which CLI structure should become the contract?</legend><div class="choices">
+   <label class="choice"><input type="radio" name="decision" value="A — Workflow verbs" required><b>A — Workflow verbs</b><span>Imperative, approachable, scattered by resource.</span></label>
+   <label class="choice"><input type="radio" name="decision" value="B — Resource namespaces"><b>B — Resource namespaces</b><span>Recommended: complete capability inventory per noun.</span></label>
+   <label class="choice"><input type="radio" name="decision" value="C — Intent commands"><b>C — Intent commands</b><span>Request-oriented, compact root, hidden special actions.</span></label>
+   <label class="choice"><input type="radio" name="decision" value="Recommended B with changes"><b>Recommended with changes</b><span>Keep B’s structure; specify edits below.</span></label>
+  </div></fieldset>
+  <label for="changes">Required changes or rationale</label>
+  <textarea id="changes" name="changes" placeholder="Example: Choose B, but rename ‘system setup’ to ‘system expose’…"></textarea>
+  <div class="submit"><button type="submit">Queue Lavish decision</button><span class="status" id="formStatus" role="status"></span></div>
+ </form>
+</section>
+</main>
+<div class="switcher" aria-label="Prototype variant switcher"><button type="button" id="prev" aria-label="Previous variant">←</button><div class="switch-label" id="switchLabel">A — Workflow verbs<small>Use ← → · URL stores selection</small></div><button type="button" id="next" aria-label="Next variant">→</button></div>
+<script>
+(() => {
+  const variants = [
+    {key:'A', name:'Workflow verbs', grammar:'intent → resource'},
+    {key:'B', name:'Resource namespaces · recommended', grammar:'resource → action'},
+    {key:'C', name:'Intent commands', grammar:'lifecycle intent → kind'}
+  ];
+  const sections = [...document.querySelectorAll('[data-variant]')];
+  const label = document.getElementById('switchLabel');
+  const stateVariant = document.getElementById('stateVariant');
+  const stateGrammar = document.getElementById('stateGrammar');
+  function valid(raw){ return variants.some(v => v.key === raw) ? raw : 'A'; }
+  function show(key, push=true){
+    key = valid(key);
+    sections.forEach(section => section.classList.toggle('active', section.dataset.variant === key));
+    const v = variants.find(item => item.key === key);
+    label.innerHTML = `${v.key} — ${v.name}<small>Use ← → · URL stores selection</small>`;
+    stateVariant.textContent = `${v.key} / ${v.name}`;
+    stateGrammar.textContent = `Grammar: ${v.grammar}`;
+    document.title = `PROTOTYPE — ${v.key} ${v.name} — Observatory CLI Contract`;
+    if(push){ const url = new URL(location.href); url.searchParams.set('variant', key); history.replaceState({},'',url); }
+    window.scrollTo({top:0,behavior:'instant'});
+  }
+  function cycle(delta){
+    const current = valid(new URL(location.href).searchParams.get('variant') || 'A');
+    const index = variants.findIndex(v => v.key === current);
+    show(variants[(index + delta + variants.length) % variants.length].key);
+  }
+  document.getElementById('prev').addEventListener('click', () => cycle(-1));
+  document.getElementById('next').addEventListener('click', () => cycle(1));
+  addEventListener('keydown', event => {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if(['INPUT','TEXTAREA'].includes(tag) || document.activeElement?.isContentEditable) return;
+    if(event.key === 'ArrowLeft'){ event.preventDefault(); cycle(-1); }
+    if(event.key === 'ArrowRight'){ event.preventDefault(); cycle(1); }
+  });
+  document.getElementById('decisionForm').addEventListener('submit', event => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const decision = data.get('decision');
+    const changes = String(data.get('changes') || '').trim();
+    const prompt = `Observatory CLI contract decision for issue #9: ${decision}. Required changes: ${changes || 'none'}. Apply this human decision to the specification, then remove the throwaway prototype when its answer is captured.`;
+    const status = document.getElementById('formStatus');
+    if(window.lavish && typeof window.lavish.queuePrompt === 'function'){
+      window.lavish.queuePrompt(prompt, {tag:'observatory-cli-contract', text:String(decision), element:event.currentTarget, data:{decision,changes}, queueKey:'observatory-cli-contract-issue-9'});
+      status.textContent = 'Decision queued in Lavish.';
+    } else {
+      status.textContent = 'Lavish SDK unavailable. Open this artifact in Lavish to queue the decision.';
+    }
+  });
+  show(valid(new URL(location.href).searchParams.get('variant') || 'A'), false);
+})();
+</script>
+</body>
+</html>
