@@ -1,5 +1,8 @@
 # Generated code index (codegraph)
 .codegraph/
 
-# Local napkin knowledge-base state
-.napkin/
+# Obsidian app state (machine-local)
+.obsidian/
+
+# napkin runtime cache (config.json stays tracked)
+.napkin/search-cache.json
