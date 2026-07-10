@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Observatory — Implementation Handoff Review</title>
+<style>
+:root{--night:#08100f;--deep:#0d1917;--paper:#e9e3d2;--ink:#16201d;--muted:#8c968f;--line:#31413c;--amber:#f2b53d;--cyan:#60d7d1;--green:#9bd66f;--red:#ee745e;--mono:"IBM Plex Mono","Courier New",monospace;--serif:"Iowan Old Style","Palatino Linotype",Palatino,serif}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--night);color:var(--paper);font:14px/1.55 var(--mono);background-image:linear-gradient(rgba(96,215,209,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(96,215,209,.035) 1px,transparent 1px);background-size:32px 32px}a{color:var(--cyan)}button,input,textarea{font:inherit}.topline{height:8px;background:linear-gradient(90deg,var(--amber) 0 67%,var(--cyan) 67%)}.mast{position:relative;overflow:hidden;border-bottom:1px solid var(--line);padding:38px max(24px,calc((100vw - 1180px)/2)) 46px}.mast:after{content:"OBS / 001";position:absolute;right:2vw;top:-42px;font:900 clamp(90px,16vw,240px)/1 var(--mono);color:rgba(233,227,210,.035);white-space:nowrap}.kicker{color:var(--amber);letter-spacing:.18em;text-transform:uppercase;font-weight:800}.mast h1{max-width:900px;margin:12px 0 16px;font:700 clamp(43px,7vw,96px)/.93 var(--serif);letter-spacing:-.045em}.lede{max-width:760px;color:#b9c1bb;font-size:15px}.stamp{display:inline-flex;gap:10px;align-items:center;margin-top:22px;padding:9px 13px;border:1px solid var(--green);color:var(--green);text-transform:uppercase;letter-spacing:.1em}.stamp i{width:9px;height:9px;background:var(--green);border-radius:50%;box-shadow:0 0 18px var(--green)}.shell{max-width:1180px;margin:auto;padding:0 24px 110px}.rail{display:grid;grid-template-columns:210px 1fr;border-left:1px solid var(--line);border-right:1px solid var(--line)}.rail-label{padding:24px 18px;color:var(--amber);border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.12em;font-size:11px}.rail-body{padding:24px 28px;border-left:1px solid var(--line);border-bottom:1px solid var(--line)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line)}.metric{background:var(--deep);padding:22px}.metric strong{display:block;font:700 34px/1 var(--serif);color:var(--paper)}.metric span{display:block;margin-top:8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.journey{display:grid;grid-template-columns:repeat(5,1fr);position:relative;padding:20px 0}.journey:before{content:"";position:absolute;left:8%;right:8%;top:44px;height:1px;background:var(--line)}.step{position:relative;padding:0 12px;text-align:center}.step b{display:grid;place-items:center;width:48px;height:48px;margin:0 auto 12px;border:1px solid var(--line);background:var(--night);border-radius:50%;color:var(--muted)}.step.done b{border-color:var(--green);color:var(--green)}.step.corrected b{border-color:var(--amber);color:var(--amber)}.step.current b{background:var(--cyan);border-color:var(--cyan);color:var(--night);box-shadow:0 0 0 7px rgba(96,215,209,.08)}.step span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.step strong{display:block;margin-top:4px;font-size:12px}.verdicts{display:grid;grid-template-columns:1.15fr .85fr;gap:24px}.ledger{border-top:2px solid var(--paper)}.ledger-row{display:grid;grid-template-columns:26px minmax(160px,.8fr) 1.7fr 92px;gap:14px;align-items:start;padding:16px 4px;border-bottom:1px solid var(--line)}.ledger-row .n{color:var(--muted)}.ledger-row p{margin:0;color:#b6beb8;font-size:12px}.pass{color:var(--green);text-align:right;font-weight:800}.aside{border:1px solid var(--amber);background:rgba(242,181,61,.055);padding:22px}.aside h3,.decision h2{margin:0 0 14px;font:700 28px/1 var(--serif)}.aside ul{padding-left:18px;margin:0}.aside li{margin:9px 0;color:#c9c5b8}.aside small{color:var(--muted)}.corrections{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line)}.correction{background:var(--deep);padding:22px;min-height:190px}.correction .issue{color:var(--amber);font-size:11px}.correction h3{font:700 22px/1.1 var(--serif);margin:8px 0 12px}.correction p{color:#adb7b0;font-size:12px}.correction a{font-size:11px}.decision{margin-top:34px;background:var(--paper);color:var(--ink);display:grid;grid-template-columns:1fr .8fr}.decision-copy{padding:34px}.decision-copy p{max-width:640px}.decision-form{padding:34px;border-left:1px solid #b8b09c;background:#ded6c1}.decision-form fieldset{border:0;padding:0;margin:0 0 18px}.decision-form legend{font-weight:900;margin-bottom:11px;text-transform:uppercase;letter-spacing:.08em;font-size:11px}.option{display:block;border:1px solid #aaa18b;padding:11px;margin-top:-1px;cursor:pointer}.option:has(input:checked){background:var(--ink);color:var(--paper)}.option input{accent-color:var(--amber)}.decision-form label[for=notes]{display:block;font-size:11px;text-transform:uppercase;font-weight:800}.decision-form textarea{width:100%;min-height:80px;margin:7px 0 12px;padding:10px;background:#f4efdf;color:var(--ink);border:1px solid #aaa18b}.action{border:0;background:var(--ink);color:var(--paper);padding:12px 15px;font-weight:800;cursor:pointer}.action:hover{background:#2e403a}.response{width:100%;min-height:92px;margin-top:12px;padding:10px;background:#f4efdf;border:1px dashed #8c836f;color:var(--ink);font-size:11px}.status{display:block;margin-top:8px;color:#49645b;font-size:11px}.scope-note{padding:18px 22px;border:1px solid var(--line);margin-top:22px;color:#aeb8b0}.scope-note strong{color:var(--amber)}.links{display:flex;flex-wrap:wrap;gap:14px;margin-top:20px;font-size:11px}.footer{margin-top:30px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+@media(max-width:850px){.rail{grid-template-columns:1fr}.rail-label{padding-bottom:8px}.rail-body{border-left:0;padding:18px}.metrics{grid-template-columns:1fr 1fr}.journey{grid-template-columns:1fr;gap:12px}.journey:before{display:none}.step{display:grid;grid-template-columns:48px 1fr;text-align:left;align-items:center;gap:12px}.step b{margin:0}.verdicts,.decision{grid-template-columns:1fr}.corrections{grid-template-columns:1fr}.decision-form{border-left:0;border-top:1px solid #b8b09c}.ledger-row{grid-template-columns:22px 1fr 64px}.ledger-row p{grid-column:2/4}.mast{padding-top:28px}.mast h1{font-size:48px}}
+</style>
+</head>
+<body>
+<div class="topline"></div>
+<header class="mast">
+  <div class="kicker">Wayfinder map #1 · final human gate</div>
+  <h1>Observatory is ready for implementation handoff.</h1>
+  <p class="lede">The planning map now has a single decision-locked contract for Observatory as the tailnet front door to agent-produced browser work. The first handoff review rejected three real gaps; all three were resolved, synthesized, and independently re-reviewed.</p>
+  <div class="stamp"><i></i> Independent reviewers: approve</div>
+</header>
+<main class="shell">
+<section class="rail">
+  <div class="rail-label">Map position</div>
+  <div class="rail-body">
+    <div class="metrics">
+      <div class="metric"><strong>18/18</strong><span>Child decisions resolved</span></div>
+      <div class="metric"><strong>59</strong><span>Versioned API operations</span></div>
+      <div class="metric"><strong>56</strong><span>Agent CLI leaves</span></div>
+      <div class="metric"><strong>0</strong><span>Planning fog items</span></div>
+    </div>
+  </div>
+  <div class="rail-label">Decision path</div>
+  <div class="rail-body">
+    <div class="journey">
+      <div class="step done"><b>01</b><span>Contracts</span><strong>Artifacts · Services · routes</strong></div>
+      <div class="step done"><b>02</b><span>Architecture</span><strong>SQLite · Rust · tailnet</strong></div>
+      <div class="step corrected"><b>03</b><span>First review</span><strong>Rejected three gaps</strong></div>
+      <div class="step done"><b>04</b><span>Corrections</span><strong>#17 · #18 · #19</strong></div>
+      <div class="step current"><b>05</b><span>Now</span><strong>Human handoff approval</strong></div>
+    </div>
+  </div>
+  <div class="rail-label">Destination ledger</div>
+  <div class="rail-body">
+    <div class="verdicts">
+      <div class="ledger">
+        <div class="ledger-row"><span class="n">A</span><strong>Purpose and scope</strong><p>One known tailnet-only entry point for owned static Artifacts and direct links to externally owned Services. Public internet, LAN-only compatibility, distributed storage, and Service absorption remain excluded.</p><span class="pass">PASS</span></div>
+        <div class="ledger-row"><span class="n">B</span><strong>Public behavior</strong><p>Project identity, Artifact Publish/import/lifecycle, Service Targets/liveness/teardown, canonical routes, Project-led browser UI, exact API schemas, and resource-scoped CLI are fixed.</p><span class="pass">PASS</span></div>
+        <div class="ledger-row"><span class="n">C</span><strong>Authority and recovery</strong><p>SQLite is authoritative; immutable Revision directories, intent-driven crash protocols, diagnostics, candidate recovery, external backup publication, and data-retaining uninstall are explicit.</p><span class="pass">PASS</span></div>
+        <div class="ledger-row"><span class="n">D</span><strong>Security and deployment</strong><p>Loopback Rust backend, least-privilege Tailscale grants, one owned Serve root, signed release bundle, systemd user service, XDG state, and empty-machine bootstrap are fixed.</p><span class="pass">PASS</span></div>
+        <div class="ledger-row"><span class="n">E</span><strong>Implementability</strong><p>Acceptance fixtures cover API/CLI/UI parity, browser security, races, crashes, power loss, storage capacity, filesystem support, setup/Serve integration, and target ABI.</p><span class="pass">PASS</span></div>
+      </div>
+      <aside class="aside">
+        <h3>Proof still required</h3>
+        <p>These are implementation gates, not unresolved planning decisions:</p>
+        <ul>
+          <li>Descriptor-relative walker race tests</li>
+          <li>Crash, I/O fault, and power-loss injection</li>
+          <li>Every-connection SQLite pragmas</li>
+          <li>Tokio load and thread-limit validation</li>
+          <li>Real systemd + Tailscale Serve journey</li>
+          <li>Release signing, ABI, and remote grant checks</li>
+        </ul>
+        <small>A failing proof gate reopens planning only when it requires changing a fixed contract.</small>
+      </aside>
+    </div>
+  </div>
+  <div class="rail-label">Rejected gaps</div>
+  <div class="rail-body">
+    <div class="corrections">
+      <article class="correction"><div class="issue">ISSUE #17 · CLOSED</div><h3>Public control plane</h3><p>Defined the exact API, schemas, conditional updates, idempotency, Project move, complete CLI surface, browser mutations, CSRF, batch outcomes, configuration, and shared acceptance fixtures.</p><a href="https://github.com/Whamp/observatory/issues/17">Review decision ↗</a></article>
+      <article class="correction"><div class="issue">ISSUE #18 · CLOSED</div><h3>Backup topology</h3><p>Separated source authority from destination payload: verified cross-filesystem copy into destination-local staging, completion marker, no-replace finalization, resume/cancel, and candidate restore.</p><a href="https://github.com/Whamp/observatory/issues/18">Review decision ↗</a></article>
+      <article class="correction"><div class="issue">ISSUE #19 · CLOSED</div><h3>Bootstrap authority</h3><p>Defined the narrow local setup/service adapter, signed release activation, systemd and Serve ownership, empty-machine apply, health verification, rollback, and data-retaining removal.</p><a href="https://github.com/Whamp/observatory/issues/19">Review decision ↗</a></article>
+    </div>
+    <div class="scope-note"><strong>What approval means:</strong> approve the planning handoff in issue #14 and close map #1. It does <em>not</em> start production implementation or deployment; that remains a separate future effort governed by <code>SPEC.md</code>.</div>
+  </div>
+</section>
+<section class="decision" id="decision">
+  <div class="decision-copy">
+    <div class="kicker" style="color:#7d5a16">Your decision</div>
+    <h2>Does this reach the destination?</h2>
+    <p>Three fresh reviewers attempted to disprove completion. Decision consistency: <strong>APPROVE</strong>. Destination audit: <strong>APPROVE</strong>. Standards and rendered artifacts: <strong>PASS</strong>.</p>
+    <p>Approve when the specification is complete enough to hand to a future implementation effort without another product or architecture decision.</p>
+    <div class="links">
+      <a href="https://github.com/Whamp/observatory/blob/153f229/SPEC.md">Canonical SPEC.md ↗</a>
+      <a href="https://github.com/Whamp/observatory/issues/14">Handoff issue #14 ↗</a>
+      <a href="https://github.com/Whamp/observatory/issues/1">Wayfinder map #1 ↗</a>
+      <a href="https://github.com/Whamp/observatory/commit/153f229">Reviewed commit ↗</a>
+    </div>
+  </div>
+  <form class="decision-form" id="handoffForm">
+    <fieldset><legend>Select one response</legend>
+      <label class="option"><input type="radio" name="decision" value="approve" checked> Approve implementation handoff</label>
+      <label class="option"><input type="radio" name="decision" value="reject"> Reject — a planning gap remains</label>
+    </fieldset>
+    <label for="notes">Gap or note (required only to reject)</label>
+    <textarea id="notes" placeholder="Name the missing big-picture decision."></textarea>
+    <button class="action" type="submit">Prepare response</button>
+    <textarea class="response" id="response" readonly aria-label="Prepared response"></textarea>
+    <span class="status" id="status">The response will be copied when browser permissions allow; otherwise copy it from the box.</span>
+  </form>
+</section>
+<div class="footer">Observatory planning dossier · reviewed commit 153f229 · production implementation intentionally not started</div>
+</main>
+<script>
+const form=document.getElementById('handoffForm');
+form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  const decision=new FormData(form).get('decision');
+  const notes=document.getElementById('notes').value.trim();
+  const status=document.getElementById('status');
+  if(decision==='reject'&&!notes){status.textContent='Name the planning gap before rejecting.';document.getElementById('notes').focus();return}
+  const text=decision==='approve'
+    ? 'Approve Observatory implementation handoff for issue #14. Close #14 and Wayfinder map #1 as completed. This approves the planning handoff only; production implementation remains a separate future effort.'
+    : `Reject Observatory implementation handoff for issue #14. Planning gap: ${notes}`;
+  document.getElementById('response').value=text;
+  if(window.lavish&&typeof window.lavish.queuePrompt==='function'){
+    window.lavish.queuePrompt(text,{tag:'observatory-handoff',text:decision,element:form,data:{decision,notes},queueKey:'observatory-handoff-14'});
+    status.textContent='Response queued in Lavish. Send it to the agent.';
+    return;
+  }
+  try{await navigator.clipboard.writeText(text);status.textContent='Response copied. Paste it into the conversation.'}
+  catch{document.getElementById('response').focus();document.getElementById('response').select();status.textContent='Copy the selected response and paste it into the conversation.'}
+});
+</script>
+</body>
+</html>
