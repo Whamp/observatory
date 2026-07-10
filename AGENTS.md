@@ -11,3 +11,7 @@ Five canonical roles mapped 1:1 to default label strings (`needs-triage`, `needs
 ### Domain docs
 
 Single-context layout (`CONTEXT.md` + `docs/adr/` at repo root). See `docs/agents/domain.md`.
+
+### Product specification
+
+[`SPEC.md`](SPEC.md) is authoritative for Observatory product and implementation decisions.
