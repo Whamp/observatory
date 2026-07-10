@@ -6,15 +6,38 @@ Canonical deployment origin: `https://desktop.greyhound-chinstrap.ts.net/`
 Planning map: [issue #1](https://github.com/Whamp/observatory/issues/1)
 Specification assembly: [issue #13](https://github.com/Whamp/observatory/issues/13)
 
+## Contents
+
+- [1. Purpose, authority, and normative language](#1-purpose-authority-and-normative-language)
+- [2. Scope and planning boundary](#2-scope-and-planning-boundary)
+- [3. Domain model and authority](#3-domain-model-and-authority)
+- [4. Project identity and lifecycle](#4-project-identity-and-lifecycle)
+- [5. Artifact contract](#5-artifact-contract)
+- [6. Service contract](#6-service-contract)
+- [7. Routes and public API](#7-routes-and-public-api)
+- [8. Agent CLI contract](#8-agent-cli-contract)
+- [9. Project-led browser interface](#9-project-led-browser-interface)
+- [10. Artifact retention and capacity](#10-artifact-retention-and-capacity)
+- [11. Service reachability and expiry](#11-service-reachability-and-expiry)
+- [12. Persistence, backup, and crash protocols](#12-persistence-backup-and-crash-protocols)
+- [13. Storage diagnostics and recovery](#13-storage-diagnostics-and-recovery)
+- [14. Network and security boundary](#14-network-and-security-boundary)
+- [15. Implementation, bootstrap, and supervision](#15-implementation-bootstrap-and-supervision)
+- [16. Configuration, defaults, errors, and health](#16-configuration-defaults-errors-and-health)
+- [17. Implementation acceptance criteria](#17-implementation-acceptance-criteria)
+- [18. Deferred work and unsupported configurations](#18-deferred-work-and-unsupported-configurations)
+- [19. Install-time agent onboarding text](#19-install-time-agent-onboarding-text)
+- [20. Decision traceability](#20-decision-traceability)
+
 ## 1. Purpose, authority, and normative language
 
 Observatory is the single known starting point for browser-based work produced or used by AI agents. It makes persistent static Artifacts and separately running browser Services findable from one private, tailnet-only front door.
 
-This file is authoritative for Observatory product and implementation behavior. It synthesizes the closed decisions linked in the [traceability matrix](#20-decision-traceability). The linked issues, research notes, and prototypes retain rationale and evidence; they do not override this specification. A later change that conflicts with a MUST, MUST NOT, SHOULD, SHOULD NOT, or MAY here requires an explicit new product decision and an update to this file.
+This file is authoritative for Observatory product and implementation behavior. It synthesizes every closed decision in the [traceability matrix](#20-decision-traceability). Linked issues and research notes retain detailed rationale and evidence; they do not override this specification. Any later conflict with a MUST, MUST NOT, SHOULD, SHOULD NOT, or MAY here requires an explicit product decision and a specification update.
 
-The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** state normative requirements. Unqualified present-tense statements are also requirements where they define behavior. Examples use the canonical deployment origin unless marked illustrative. Server-returned URLs are authoritative even when an example shows their shape.
+The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative. Unqualified present-tense statements are requirements when they define behavior. Server-returned URLs are authoritative even when an example shows their shape.
 
-Production implementation and deployment are outside this planning map. A later implementation MUST satisfy this complete specification and its [acceptance criteria](#17-implementation-acceptance-criteria); this planning effort does not build, install, approve, or deploy the service.
+Production implementation and deployment are outside this planning map. A later implementation MUST satisfy this specification and [section 17](#17-implementation-acceptance-criteria). This planning effort does not build, install, approve, or deploy Observatory.
 
 ## 2. Scope and planning boundary
 
@@ -23,29 +46,30 @@ Production implementation and deployment are outside this planning map. A later 
 Observatory specifies:
 
 - an owned catalogue of static Artifacts and immutable Revisions;
-- a link-first catalogue of externally owned Services and their Targets;
-- canonical browser routes, a versioned machine API, and an agent-first `obs` CLI;
-- a Project-led human index with lifecycle, reachability, search, and detail controls;
-- retention, probing, cleanup, storage diagnostics, backup, and recovery contracts;
-- a SQLite-authoritative local persistence model and crash protocols;
-- a private Tailscale Serve deployment and least-privilege tailnet authorization boundary; and
-- the chosen Rust binary, embedded frontend, XDG layout, packaging, setup, and systemd user supervision model.
+- a link-first catalogue of externally owned Services and Targets;
+- canonical browser routes and one versioned `/api/v1` application control plane;
+- an agent-first resource-oriented `obs` CLI;
+- a Project-led browser ledger with secondary search and explicit controls;
+- retention, reachability probes, cleanup, diagnostics, backup, and recovery;
+- SQLite-authoritative local persistence and crash protocols;
+- a private Tailscale Serve deployment with least-privilege grants; and
+- one Rust binary, embedded frontend, XDG layout, capability-allowlisted bootstrap, package activation, and systemd user supervision.
 
 ### Explicit non-goals
 
 Observatory MUST NOT:
 
-- reimplement, embed, absorb, rewrite, or proxy an external Service's UI, rendering, application logic, API, behavior, or state;
+- reimplement, embed, absorb, rewrite, or proxy an external Service's UI, application logic, API, behavior, or state;
 - discover Services from processes, listeners, ports, DNS, or network scans;
 - start, restart, kill, signal, allocate ports for, supervise, or automatically decommission external Services;
-- convert pi-annotate or Sideshow state into static reports or provide producer-specific snapshot/conversion adapters;
-- act as a generic file browser, source-tree browser, directory listing, SPA host with fallback routing, or source-file watcher;
+- convert pi-annotate or Sideshow state into Artifacts or provide producer-specific snapshot/conversion adapters;
+- act as a generic file browser, source-tree browser, directory listing, SPA fallback host, or source watcher;
 - expose public-internet access, Tailscale Funnel, or LAN-only/non-tailnet compatibility;
-- provide multi-user accounts, application login, API keys, sessions, read/write roles, or per-Entry authorization;
-- provide multi-host replication, distributed storage, external database/search infrastructure, or transparent compatibility proxying for arbitrary applications; or
-- support production implementation or deployment as part of issue #1.
+- provide accounts, application login, API keys, sessions, read/write roles, or per-Entry authorization;
+- provide multi-host replication, distributed storage, or external database/search infrastructure; or
+- implement or deploy production as part of issue #1.
 
-The unsupported and deferred boundary is listed fully in [section 18](#18-deferred-work-and-unsupported-configurations).
+The complete deferred and unsupported boundary is in [section 18](#18-deferred-work-and-unsupported-configurations).
 
 ## 3. Domain model and authority
 
@@ -54,54 +78,80 @@ The terms below are exact and follow [`CONTEXT.md`](CONTEXT.md).
 - **Entry**: a named browser destination discoverable through Observatory. An Entry is exactly one Artifact or one Service.
 - **Artifact**: a static, persistent, browser-viewable bundle owned by Observatory. It is one regular file or one directory tree of regular files. Its stable identity selects one current Revision while live.
 - **Revision**: an immutable published state of an Artifact. A successful replacement creates a Revision and atomically advances the Artifact's current selection.
-- **Project**: a work context rooted at a canonical directory. The canonical directory is Project identity. A public Project ID/key is an address, not the identity claim.
+- **Project**: a work context rooted at a canonical directory. The canonical directory is Project identity. A public ID/key addresses it but does not replace that identity claim.
 - **Service**: a separately running interactive browser application referenced by Observatory while retaining its own behavior and state. Its identity is its name within one Project.
 - **Target**: a named absolute browser URL through which a Service may be reached. Target names are unique within a Service. Every Service has exactly one primary Target and zero or more alternatives.
 - **Teardown Action**: an optional Project-supplied executable and argument list that decommissions a Service only when explicitly requested.
 - **Publish**: make an Artifact part of Observatory's owned collection under a stable identity.
 
-Authority is deliberately split:
+Authority is split exactly:
 
-- SQLite is the sole catalogue authority for Projects, identities, metadata, current Revision selection, lifecycle state, Services, Targets, observations, tombstones, intents, leases, and audit events.
+- The daemon application service is the sole domain authority. The CLI, browser UI, and scheduled workers call it and MUST NOT reimplement lifecycle rules.
+- SQLite is the sole catalogue authority for identity, metadata, current Revision selection, lifecycle, Services, Targets, observations, tombstones, intents, backup leases, setup-independent operations, and audit events.
 - Observatory owns copied Artifact bytes and their lifecycle.
-- The Project supplies Project identity context and any Teardown Action.
 - An external Service owns its process, behavior, state, exposure, TLS, authorization, and normal lifecycle.
-- Tailscale grants authorize access to the Observatory origin. They do not transfer authorization to Service Targets.
-- Recovery manifests, filesystem presence, and SQLite recovery output are evidence only. They never make an Entry live.
+- Tailscale grants authorize the Observatory origin and do not transfer authorization to Service Targets.
+- Recovery manifests, filesystem presence, workspace receipts, completion markers, and SQLite recovery output are evidence only. They never make an Entry or operation live.
+- The invoking verified release-bundle process has narrow local bootstrap authority only for the eight setup/service leaves in [section 15](#local-bootstrap-authority). It MUST NOT access domain or storage authority.
 
-## 4. Project identity and moves
+## 4. Project identity and lifecycle
 
-A Project MUST be identified by its resolved canonical directory. `-p, --project PATH` selects that directory and defaults to the CLI invocation's current working directory. The daemon, not the client, resolves the canonical path.
+A Project is identified by its daemon-resolved canonical directory. `-p, --project PATH` selects Project context and defaults to the invocation's current working directory. Selection does not allocate identity.
 
-On first catalogue creation in that context, Observatory MUST allocate a non-secret 128-bit random Project ID and return a public key of the form `<project-slug>~<project-id>`. Project IDs are never supplied by callers, reassigned, or reused. Project display title and slug are presentation; the canonical directory remains identity.
+### Resolve and register
 
-Service names are unique within Project identity. Artifact Project association is catalogue metadata and does not enter Artifact serving URLs.
+`project resolve [PATH]` and `GET /api/v1/projects/resolve?path=…` are read-only. They require an existing accessible directory, canonicalize once, allocate no ID, and return:
 
-Observatory MUST NOT infer a directory move. A move requires explicit registration of a new Project identity/key, removal and re-registration of Services, and tombstoning of the old Project ID. The old Project MUST return `410 Gone`, with no redirect to the new Project. Artifacts MUST NOT be silently reassociated, and their serving URLs MUST remain unchanged. Losing a Project directory MUST NOT delete Observatory-owned Artifacts, including pinned Artifacts.
+- `registered` plus the existing Project reference;
+- `unregistered` with no Project reference; or
+- `gone` when that canonical directory has a terminal identity.
+
+`project register [PATH]` and `POST /api/v1/projects` are the sole simple allocation operations. Registration canonicalizes the directory, rejects nonexistent/non-directory/inaccessible paths, conflicts when a live Project owns it, returns `410 project_gone` for a tombstoned directory, allocates a random Project ID and stable creation slug, and commits before Service registration can select it. Other create operations MUST return `project_not_registered`; they MUST NOT hide Project allocation inside a read or another create.
+
+The public Project key is `<project-slug>~<project-id>`. Project IDs are caller-independent, never reassigned, and never reused. Title and slug are mutable presentation metadata. `PATCH /api/v1/projects/{projectId}` and `obs project update` may change only title or slug.
+
+### Explicit move
+
+`project move PROJECT NEW_PATH --yes` and `POST /api/v1/projects/{oldProjectId}/move` perform one atomic catalogue transition. The request MUST carry the old Project `If-Match` and enumerate every live Service exactly once with its expected record version. The daemon MUST:
+
+1. canonicalize `NEW_PATH` and require it to be unregistered and never tombstoned;
+2. verify the complete Service enumeration and every version;
+3. allocate a new Project ID and a new ID for each re-registered Service;
+4. copy each Service's configuration, Targets, primary choice, pin metadata, and Teardown Action;
+5. reset every new Target observation to `unknown` and queue probes;
+6. tombstone every old Service ID;
+7. tombstone the old Project ID with cause `moved`;
+8. leave every Artifact associated with the old tombstoned Project;
+9. leave every Artifact serving URL unchanged; and
+10. return ordered old-to-new Project and Service mappings.
+
+A missing/extra/changed Service, path conflict, validation failure, or authority gate aborts the entire move. Move does not redirect old IDs, infer filesystem movement, execute teardown, reassociate Artifacts, or affect external processes.
+
+### Tombstone
+
+`project tombstone PROJECT --yes` and `DELETE /api/v1/projects/{projectId}` require matching record version, zero live Services, and no nonterminal Project-scoped operation. Artifacts remain associated and continue independently. The Project then returns `410 Gone` permanently without redirect or ID reuse.
 
 ## 5. Artifact contract
 
-### 5.1 Publish shapes, entry point, and media
+### Publish shapes, entry point, and media
 
-Publish MUST accept exactly two source shapes:
+Publish accepts exactly:
 
 1. one regular file, which is its own entry point; or
 2. one directory tree of regular files, which is one Artifact.
 
-Directory entry-point precedence is exact:
+Directory entry precedence is:
 
-1. an entry supplied by the request;
+1. request option;
 2. `entry` in root `.obs.json`;
 3. root `index.html`;
 4. otherwise failure.
 
-The entry path MUST be relative, stay inside the Artifact root, and name a regular file. Valid entry media types are `text/*`, `image/*`, `audio/*`, `video/*`, PDF, and JSON. Markdown is served as text. CSS, JavaScript, fonts, archives, and arbitrary binaries MAY be supporting files but MUST NOT be entry points. MIME type comes from the filename. Every byte response MUST include `X-Content-Type-Options: nosniff`.
+The entry path MUST be relative, remain inside the root, and name a regular file. Valid entry media types are `text/*`, `image/*`, `audio/*`, `video/*`, PDF, and JSON. Markdown is served as text. CSS, JavaScript, fonts, archives, and arbitrary binaries may support an entry but MUST NOT be entries. MIME comes from the filename and every byte response includes `X-Content-Type-Options: nosniff`.
 
-Observatory MUST copy and serve bytes without compilation, rendering, transformation, fetching, inlining, or URL rewriting. Internal references SHOULD be relative. Root-relative references are unsupported; detectable instances SHOULD warn. Absolute external URLs are allowed and remain network-dependent.
+Observatory copies and serves bytes without compilation, rendering, transformation, fetching, inlining, or URL rewriting. Internal references SHOULD be relative. Root-relative references are unsupported and detectable instances SHOULD warn. Absolute external URLs remain network-dependent. An Artifact/Revision base serves its entry; a suffix MUST name an actual file. There is no SPA fallback or directory listing. Hash routing remains available.
 
-Opening an Artifact or Revision base serves its declared entry point. A suffix MUST resolve to an actual file. There is no SPA fallback or directory listing. Hash-based browser routing remains valid.
-
-### 5.2 Portable metadata
+### Portable metadata
 
 Root `.obs.json` is optional and recognized only for directory Artifacts:
 
@@ -114,444 +164,691 @@ Root `.obs.json` is optional and recognized only for directory Artifacts:
 }
 ```
 
-Only `schemaVersion`, `entry`, `title`, and `description` are permitted portable fields. `.obs.json` is consumed and MUST NOT be served. Project, slug, publication time, stable identity, retention, and Revision history belong only to the catalogue. Equivalent single-file metadata comes from request options.
+Only `schemaVersion`, `entry`, `title`, and `description` are portable. `.obs.json` is consumed and not served. Project, slug, publication time, stable identity, retention, and Revision history belong to SQLite. Equivalent single-file metadata comes from options. Title precedence is option, `.obs.json`, HTML `<title>`, source basename. Description precedence is option, `.obs.json`, empty.
 
-Title precedence is request option, `.obs.json`, HTML `<title>`, then source basename. Description precedence is request option, `.obs.json`, then empty.
+### Validation and ownership
 
-### 5.3 Validation and ownership
+Publish rejects symlinks, multiple-link-count files, sockets, devices, FIFOs, absolute/traversal paths, unreadable members, anything outside the root, and non-regular leaves. Sources are opened descriptor-relatively without following links. Every regular file, including dotfiles, is copied except root `.obs.json`; there are no implicit ignores.
 
-Publish MUST reject symbolic links, files with multiple hard links, sockets, devices, FIFOs, absolute or traversal paths, unreadable members, anything outside the root, and any non-regular leaf. Selected roots and members MUST be opened descriptor-relatively without following links. All regular files, including dotfiles, are copied except root `.obs.json`; there are no implicit ignore rules.
+Missing/invalid entry, malformed metadata, unsafe content, unreadable bytes, or unsupported entry media blocks Publish. Missing references, root-relative URLs, unreachable dependencies, and browser/JavaScript failures may warn but do not block. Observatory does not execute an Artifact to prove it renders.
 
-Contract violations block Publish: missing/invalid entry, malformed `.obs.json`, unsafe filesystem content, unreadable bytes, or unsupported entry media. Missing references, detectable root-relative URLs, unreachable external dependencies, and browser/JavaScript failures MAY warn but MUST NOT block. Observatory does not execute an Artifact to prove it renders.
+There is no default file-count or per-Artifact byte limit. Capacity and configured ceilings fail clearly before visibility. Artifacts are trusted single-user content; JavaScript runs normally on the Observatory origin without per-Artifact isolation.
 
-There is no default file-count or byte-size limit. Insufficient capacity or configured operational ceilings MUST fail clearly before visibility.
+### Create, replace, and Revision semantics
 
-Artifacts are trusted single-user content. JavaScript runs normally on the Observatory origin without per-Artifact sandboxing or isolation. Filesystem checks prevent accidental escape; they are not a hostile-publisher security boundary.
+`artifact publish` is strict creation and allocates never-reused Artifact/Revision IDs. Identity is never inferred from title, filename, source path, slug, bytes, or metadata.
 
-### 5.4 Create, replace, and immutable Revision semantics
+`artifact replace ARTIFACT SOURCE` explicitly names a live Artifact, creates an immutable Revision, and atomically advances current selection. Prior Revisions remain immutable until retention removes them. A failed/interrupted replacement leaves current selection and retention unchanged.
 
-`artifact publish` is strict creation. It allocates new never-reused Artifact and Revision IDs. Existing identity is never inferred from title, filename, source path, slug, bytes, or metadata.
+Publish stages, validates, checksums, and durably finalizes a complete owned copy before catalogue visibility. Later source changes do not affect it. No failure exposes a partial bundle.
 
-`artifact replace ARTIFACT SOURCE` MUST name an existing Artifact. It creates a new immutable Revision and atomically advances the stable Artifact selection. The prior current Revision remains immutable and available until retention removes it. A failed or interrupted replacement leaves the current Revision and retention state unchanged.
+### Explicit import and per-entry outcomes
 
-Publish MUST stage, validate, checksum, and durably finalize a complete owned copy before catalogue visibility. Later source changes MUST NOT affect the owned copy. No failure or crash may expose a partial bundle.
+`artifact import SOURCE...` is explicit migration intake into normal Publish, never discovery or another Artifact kind.
 
-### 5.5 Explicit import
+- Each ordered entry selects one host-local regular file or directory. Relative paths resolve against the caller working directory. URL import, stdin archives, internal globbing, crawling, watch mode, and conversion are prohibited.
+- A directory is one Artifact. Publish entry, metadata, validation, MIME, warning, copy, retention, route, and Revision rules apply.
+- Request defaults and each per-entry option may set only `projectId`, `entry`, `title`, `description`, `slug`, and `retention`. Per-entry options cannot change source or index.
+- Import always copies and never serves through, links, bind-mounts, moves, deletes, or retains a source relationship.
+- Copy compares opened identity, type, size, timestamps, and link count before/after each read and retraverses directories. Any addition, removal, rename, or metadata change fails that entry as `source_changed`.
+- A fingerprint over entry path plus ordered relative paths, sizes, and digests may identify duplicate candidates but never reuses/replaces identity.
+- Repeated normalized selections fail every occurrence as `duplicate_selection`.
+- Commit is atomic per entry, not per batch. Bulk idempotency derives per-entry keys as `SHA-256("observatory-import-v1" || 0x00 || request-key || 0x00 || decimal-index)`.
+- Each ordered outcome contains index, safe label, `committed|failed|unchanged_replay`, Artifact/Revision IDs when allocated, canonical URLs, logical files/bytes, effective retention, warnings, duplicate candidates, stable error details, and a separate cleanup/quarantine error when cleanup also failed.
+- Durable provenance records import method, commit instant, actor/request identity, and content fingerprint, but excludes absolute source paths, home components, device/inode, ownership, and permissions.
 
-`artifact import SOURCE...` is explicit migration intake into normal Publish, not discovery or another Artifact kind.
-
-- Each ordered input explicitly selects one host-local regular file or directory. Relative paths resolve once against the caller's working directory. Observatory MUST NOT accept URL import, stdin archives, internal glob expansion, project-root crawling, watch mode, or conversion.
-- A directory is one Artifact. Entry selection, metadata, validation, MIME, warnings, copy, retention, routes, and Revision semantics are identical to Publish.
-- Project defaults to the selected CLI Project and MAY be overridden per import entry. It MUST NOT be inferred from source parents or `.obs.json`.
-- Import always copies. It MUST NOT serve through, link, bind-mount, move, delete, or retain a live relationship to the source.
-- Copying MUST compare file identity, type, size, timestamps, and link count before and after each read and retraverse directories before commit. Any addition, removal, rename, or metadata change fails that import entry as `source_changed`.
-- A content fingerprint over entry path plus ordered relative paths, sizes, and digests MAY identify an advisory duplicate candidate. Equal content MUST NOT silently reuse or replace an identity.
-- Batch commit is atomic per import entry, not across the batch. Results preserve input order and report `committed`, `failed`, or `unchanged_replay`; successful siblings survive mixed outcomes.
-- Repeated normalized selection in one request MUST fail those repeated entries. Bulk request idempotency derives stable per-entry keys from the request key and position.
-- Long-lived provenance records the import method, commit time, actor/request identity, and content fingerprint, but MUST NOT retain absolute source paths, home components, device/inode values, ownership, or permissions. Remote results use ordinal and basename unless the caller supplied a safe label.
+Trustworthy mixed and zero-success batch behavior follows [section 7](#batch-and-bulk-results).
 
 ## 6. Service contract
 
-### 6.1 Identity, registration, and update
+### Identity, registration, and update
 
-A Service is identified by `(Project canonical directory, Service name)`. The name MUST be immutable, normalized to Unicode NFC, non-empty after trimming, free of control characters, and compared case-sensitively as NFC UTF-8. Moving Project or renaming Service requires removal and strict re-registration, producing a new ID and leaving the old ID tombstoned. Target URL changes do not change Service identity.
+A Service is identified by `(Project canonical directory, Service name)`. The immutable name is Unicode NFC, nonempty after trimming, control-free, and compared case-sensitively as NFC UTF-8. Project move or Service rename creates a new identity and tombstones the old. Target URL changes do not change identity.
 
-Registration is explicit strict creation and MUST conflict on an existing identity. It commits without requiring reachability, starts every Target at `unknown`, and queues probes after commit. Update requires an existing Service and MAY atomically change Targets, presentation metadata, or Teardown Action, but MUST NOT change identity. Update or removal of a missing Service returns not found.
+Registration is strict creation and conflicts on an existing identity. It commits without reachability, starts every Target at `unknown`, and queues probes. Update requires a live Service and may atomically change presentation, Targets, or Teardown Action but not identity. Missing update/removal returns not found. Removal deletes catalogue metadata/observations only and does not affect the process. Observatory never discovers Services.
 
-Removal deletes only catalogue metadata and observations. It MUST NOT affect the external process. Observatory MUST NOT discover Services automatically.
+### Targets and Open behavior
 
-### 6.2 Targets and Open behavior
+Every Service has exactly one primary Target and zero or more alternatives. Each Target has a Service-local unique NFC name, absolute credential-free HTTP(S) URL, and optional label. `local` and `tailnet` are conventions only. Primary means configured Open destination, not health. Alternatives appear in details. Observatory never probe-selects or silently falls back. Removing primary names replacement in the same atomic mutation.
 
-Every Service MUST have exactly one primary Target and MAY have alternatives. Each Target has a Service-local unique arbitrary name, an absolute credential-free HTTP(S) URL, and an optional label. `local` and `tailnet` are conventions with no hidden behavior. URLs MUST NOT contain userinfo, bearer tokens, signed query credentials, or credential fragments.
+Service representations return distinct `detailUrl` and direct `primaryTargetUrl`. Service Open navigates directly to `primaryTargetUrl`; Observatory does not proxy, rewrite, wrap, or derive it.
 
-The primary Target is the configured default Open destination, not a health or deployment claim. Alternatives appear in details. Observatory MUST NOT select a Target based on probes or silently fall back. Removing the primary MUST nominate its replacement in the same atomic update.
+### Credential-free Target validation
 
-Service representations return distinct `detailUrl` and direct `primaryTargetUrl` values. Service Open MUST navigate directly to `primaryTargetUrl`; Observatory MUST NOT proxy, rewrite, wrap, or derive it.
+A Target URL is valid only when:
 
-### 6.3 Teardown Action and runtime authority
+1. it parses as an absolute URI;
+2. normalized scheme is exactly `http` or `https`;
+3. authority and nonempty valid IPv4, bracketed IPv6, or IDNA DNS host exist;
+4. explicit port is `1..65535`;
+5. userinfo is absent, including empty userinfo syntax;
+6. fragment is absent;
+7. no control, space, CR/LF/tab/NUL, invalid escape, raw backslash, or traversal interpretation exists;
+8. stored escapes use uppercase hex; and
+9. percent-decoded, ASCII-case-folded query names exclude exactly:
 
-A Service MAY store one Teardown Action as an executable plus argv, never an implicit shell string. It runs only after an explicit confirmed teardown request, with the Project canonical directory as working directory and a bounded timeout.
+```text
+access_token api_key apikey auth authorization bearer credential jwt key
+passwd password sig signature token x-amz-credential x-amz-signature
+x-goog-credential x-goog-signature
+```
 
-Exit `0` removes only the unchanged Service record. Missing Project directory, launch error, nonzero exit, timeout, or concurrent record mutation preserves the Service and reports captured output safely. Record-version comparison or serialization MUST prevent an old action from deleting a changed record. Missing action reports teardown unavailable; normal removal remains possible.
+Unknown ordinary query names are allowed. Canonical serialization does not probe, rewrite path/query, follow redirects, or change Service identity. Rejected credential material MUST NOT enter logs, diagnostics, or observations.
 
-Teardown is the sole permitted external runtime effect. Automatic expiry and all other Observatory actions MUST NOT invoke it.
+### Teardown Action
 
-## 7. Routes, names, and canonical URLs
+A Service may store one executable plus argv, never a shell string, and a default action timeout. Default is 30,000 ms; accepted range is `1000..300000` ms. An explicit teardown may override the timeout within that range.
 
-### 7.1 Namespace allocation
+Teardown runs only after explicit confirmation in the Project canonical directory. Success requires an action, existing Project directory, argv launch, no timeout, exit `0`, and unchanged record version; only then is the Service tombstoned. Missing directory, launch error, signal, nonzero exit, timeout, or changed record preserves it.
+
+Captured stdout/stderr are each limited to 16 KiB after UTF-8 replacement, control-escaped, truncation-labeled, omitted from ordinary logs, and returned only in the confirmed outcome. A known action failure/timeout is trustworthy `ok:true` and CLI exit `9`; it is not unknown commit. Teardown is the sole external runtime effect and automatic expiry never invokes it.
+
+## 7. Routes and public API
+
+### Namespace allocation and browser routes
 
 | Namespace | Contract |
 | --- | --- |
 | `/` | Permanent front door; `308 Permanent Redirect` to `/ui/`. |
-| `/ui/…` | Unversioned human ledger, Project, detail, and control pages. |
-| `/api/v1/…` | Versioned machine API. Compatible additions are allowed; existing meanings and URL semantics are stable. |
+| `/ui/…` | Human ledger, Project, detail, and allowed control pages. |
+| `/api/v1/…` | Versioned JSON application control plane. |
 | `/_static/<build-id>/…` | Immutable embedded UI assets. |
 | `/artifacts/<artifact-key>/…` | Stable-current Artifact bytes. |
 | `/revisions/<revision-id>/…` | Immutable Revision bytes. |
 
-These six first segments are reserved. Unknown top-level routes return `404 Not Found`. `/api` and unversioned API routes MUST NOT redirect. Resource types remain explicit; there is no generic `/entries/` route.
+These first segments are reserved. Unknown top-level routes return `404`. `/api` and unversioned API routes do not redirect. There is no generic `/entries` route.
 
-Project, Service, and Artifact route keys are `<slug>~<id>`. Revision routes contain only the ID. Project, Service, Artifact, and Revision IDs are independently generated random 128-bit values encoded as exactly 26 lowercase Crockford-base32 characters. IDs are opaque, caller-independent, collision-retried before visibility, never reassigned, and never reused.
+Project, Service, and Artifact route keys are `<slug>~<id>`; Revision routes use only ID. IDs are independently random 128-bit values encoded as exactly 26 lowercase Crockford-base32 characters. They are opaque, caller-independent, collision-retried before visibility, never reassigned, and never reused. Issued terminal IDs retain tombstones and return `410`; unknown IDs return `404`.
 
-Issued terminal IDs retain durable tombstones with at least ID, type, and terminal state. Formerly valid URLs return `410 Gone`; unknown or never-issued IDs return `404 Not Found`.
+Slug normalization is exact: Unicode NFKD; discard combining marks and non-ASCII not transliterated by decomposition; lowercase ASCII; replace maximal non-`a-z0-9` runs with `-`; collapse/trim; truncate to 48 without trailing `-`. Stored grammar is `[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?`. Empty supplied values fail; empty derived values use `project|service|artifact`. Bare-slug collisions are allowed. Explicit rename preserves ID; stale valid slug with a live ID receives one `308` to current key. No aliases bridge IDs.
 
-### 7.2 Slugs
+Artifact suffixes reserve no child segment. Decode once as UTF-8 per segment. Reject malformed/encoded separators, backslash, NUL, `.`/`..`, traversal, duplicate separators, and double decoding. Canonical URLs leave unreserved bytes literal and uppercase-percent-encode all others. Manifest lookup is case-sensitive.
 
-A caller MAY suggest a slug; otherwise it derives from Project directory basename, Service name, or Artifact title/source fallback. Normalization is exact:
+UI collection/detail and Artifact/Revision bases end in `/`; files do not. Safely identifiable GET/HEAD slash, uppercase-ID, stale-slug, or encoded-key canonicalization gets one absolute `308`. API routes are exact and never redirect. Redirects preserve query. Query is not identity/file lookup; fragments are browser semantics.
 
-1. Unicode NFKD;
-2. discard combining marks and non-ASCII characters not transliterated by decomposition;
-3. lowercase ASCII;
-4. replace each maximal run outside `a-z0-9` with one `-`;
-5. collapse and trim `-`; and
-6. truncate to 48 ASCII characters without trailing `-`.
+### Common API contract
 
-Stored grammar is `[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?`, including a one-character alphanumeric. Empty caller-supplied normalization is rejected; empty automatic derivation becomes `project`, `service`, or `artifact`. `~` never belongs to a slug. Bare-slug collisions are allowed because IDs disambiguate.
+All `/api/v1` requests/responses are UTF-8 JSON with `Content-Type: application/json`, `Accept: application/json`, and `Cache-Control: no-store`. Successful or trustworthy outcomes use:
 
-The creation slug remains stable after title/label changes. Explicit slug rename preserves ID. Any syntactically valid stale or noncanonical slug paired with the same live ID receives `308` to the current key. There are no aliases or redirects between IDs.
-
-### 7.3 Artifact paths and request canonicalization
-
-Under `/artifacts/<artifact-key>/` and `/revisions/<revision-id>/`, every suffix is an Artifact-relative bundle path. No child segment is reserved. Paths are decoded exactly once as UTF-8 by segment. Malformed escapes, encoded `/` or `\`, NUL, `.`/`..`, traversal, double decoding, and duplicate separators are rejected. Canonical paths leave RFC 3986 unreserved bytes literal and percent-encode all other UTF-8 bytes with uppercase hexadecimal. Lookup is case-sensitive against the manifest and never filesystem-dependent.
-
-UI collection/detail and Artifact/Revision base URLs end in `/`; actual file URLs do not. For `GET`/`HEAD`, safely identifiable missing/extra slash, uppercase ID, stale slug, or encoded key character receives one absolute `308`. API routes are exact and do not depend on redirects.
-
-Redirects preserve query strings. Queries do not establish identity or file lookup; Artifact JavaScript MAY interpret them. Fragments never reach the server. Returned canonical identity URLs omit query and fragment unless the caller supplied separate application navigation state.
-
-### 7.4 Representative absolute URLs
-
-```text
-Front door
-https://desktop.greyhound-chinstrap.ts.net/
-
-UI
-https://desktop.greyhound-chinstrap.ts.net/ui/
-
-Project
-https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/
-
-Artifact details
-https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/artifacts/auth-flow~6r3t8w2y5b9c4d7f0g1h3j5k7m/
-
-Stable Artifact and supporting file
-https://desktop.greyhound-chinstrap.ts.net/artifacts/auth-flow~6r3t8w2y5b9c4d7f0g1h3j5k7m/
-https://desktop.greyhound-chinstrap.ts.net/artifacts/auth-flow~6r3t8w2y5b9c4d7f0g1h3j5k7m/api/v1/_static/client.js
-
-Immutable Revision
-https://desktop.greyhound-chinstrap.ts.net/revisions/7s4v9x3z6c0d5f8g1h2j4k6m8n/
-
-Service details and separately returned direct Target
-https://desktop.greyhound-chinstrap.ts.net/ui/projects/observatory~4m7k2x9q1v6c8d3f5g0h2j4n6p/services/pi-annotate~8t5w0x4z7c1d6f9g2h3j5k7m9n/
-https://desktop.greyhound-chinstrap.ts.net:8443/session/current
-
-API and UI asset
-https://desktop.greyhound-chinstrap.ts.net/api/v1/artifacts/6r3t8w2y5b9c4d7f0g1h3j5k7m
-https://desktop.greyhound-chinstrap.ts.net/_static/sha256-8f31c2/app.js
+```json
+{"schemaVersion":1,"ok":true,"result":{}}
 ```
 
-Every create/get/update response MUST return canonical absolute URLs. Clients MUST use them rather than construct routes from origin, IDs, keys, slugs, paths, titles, or names.
+Command-level inability uses:
+
+```json
+{"schemaVersion":1,"ok":false,"error":{"code":"changed_record","message":"the resource changed","retryable":false,"details":{}}}
+```
+
+`ok:true` does not mean every entry succeeded, storage is healthy, a Service is reachable, or teardown exited `0`. `ok:false` means no trustworthy requested outcome could be returned. Unknown enums are never coerced; unknown input fields are ignored only where explicitly extensible.
+
+API instants are RFC 3339 UTC `Z` strings with millisecond precision; durations are integer milliseconds; byte counts/versions are unsigned integers; digest is lowercase `<algorithm>:<hex>`, initially SHA-256.
+
+Every API resource create/get/update/transition and every successful per-entry API outcome returns opaque IDs, current key where applicable, `recordVersion`, `apiUrl`, and all applicable canonical browser URLs. This requirement applies to API resource representations, never byte-serving GETs under `/artifacts/` or `/revisions/`. Clients MUST NOT construct URLs.
+
+Project, Artifact, Service, and Revision path parameters use opaque IDs; Target routes use the exact Target name. Live/tombstoned/unknown/wrong-type/malformed selectors map respectively to success, `410`, `404`, `404`, and `422`. API routes never redirect to repair IDs, keys, slashes, or versions.
+
+Resource schemas are stable:
+
+| Schema | Required fields |
+| --- | --- |
+| Project | `kind`, `id`, `key`, `recordVersion`, `state`, `title`, `slug`, `canonicalDirectory`, `createdAt`, `updatedAt`, `apiUrl`, `detailUrl`; gone adds `terminalState`, `tombstonedAt`, `cause` |
+| Retention | `mode=default|ttl|pinned`, `ttlMs`, `expiresAt`, `pinReason`, `recoveryUntil` |
+| Artifact | `kind`, `id`, `key`, `recordVersion`, `state`, `title`, `description`, `slug`, Project reference, `currentRevisionId`, Retention, `files`, `logicalBytes`, `revisionCount`, `publishedAt`, `updatedAt`, `apiUrl`, `openUrl`, `detailUrl` |
+| Revision | `kind`, `id`, `artifactId`, `state=current|superseded|unavailable|gone`, `entryPath`, `entryMediaType`, `files`, `logicalBytes`, `manifestDigest`, `publishedAt`, `apiUrl`, `openUrl` |
+| Service | `kind`, `id`, `key`, `recordVersion`, `state`, immutable `name`, `label`, `description`, `slug`, Project reference, pin/expiry fields, `primaryTargetName`, `reachability`, redacted teardown availability/timeout, Targets, `apiUrl`, `detailUrl`, `primaryTargetUrl` |
+| Target | `name`, `label`, canonical credential-free `url`, `primary`, `targetVersion`, `reachability`, latest observation result/time/duration/status-or-failure/host-vantage |
+| Per-entry outcome | `index`, safe `label`, operation-specific terminal `status`, and exactly one of `result` or stable `error` |
+| Durable operation | opaque operation/backup/plan ID, `recordVersion`, state/phase/progress, resumability/expiry, redacted locators, and canonical status `apiUrl` |
+
+Ordinary Service representations expose Teardown Action availability and timeout, never executable/argv. Absolute Project `canonicalDirectory` is visible because it is identity; other remote private paths are redacted.
+
+Mutable singleton representations carry strong `ETag: "rv-N"` and matching positive `recordVersion`. PATCH, DELETE, and action POSTs on existing resources require `If-Match`. Target mutations use the containing Service ETag; recovery apply uses the plan/current operation ETag; backup cancel uses the backup operation ETag. Missing is `428 precondition_required`; mismatch is `412 changed_record`; state conflict after a match is `409`; success returns a new ETag/version. Collection strict creation has no `If-Match` and conflicts with `409`. Immutable Revision metadata has no mutation precondition.
+
+Every API mutation requires `Idempotency-Key`. Non-TTY/automation CLI mutations require a caller key. Interactive TTY mutation may generate a cryptographically random key but MUST display it before dispatch. Keys are 8–200 visible ASCII characters with no whitespace, controls, quote, or backslash, compared byte-for-byte deployment-wide and redacted in logs.
+
+Fingerprint is SHA-256 over API version, uppercase method, canonical route, RFC 8785 canonical JSON body, normalized IDs/resolved canonical Project/source paths, `If-Match`, and semantic options. Accept/user-agent/client-timeout/tracing are excluded. Host-source first acceptance also binds the durable intent to the observed snapshot. New key executes; same fingerprint resumes/replays; different fingerprint is `409 idempotency_conflict`; concurrent nonterminal duplicate is retryable `409 idempotency_in_progress` with `Retry-After`. Validation before dispatch consumes no key. Replay sets `Idempotency-Replayed: true` and preserves original semantics, URLs, operation ID, and ETag.
+
+A CLI wait timeout after dispatch leaves stdout empty, emits `ok:false client_timeout` to stderr, exits `5`, states commit is unknown, and directs identical retry with the same key. Disconnect never cancels durable work.
+
+### Pagination and search
+
+Every unbounded collection accepts `limit=50` (`1..200`), `after=<opaque>`, `order=<enum>`, and `direction=asc|desc`. Responses contain ordered `items` and `{limit,nextCursor,hasMore}` plus an absolute RFC 8288 `rel="next"` Link when needed. Integrity-protected cursors bind endpoint/filter/order and expire after 15 minutes; malformed/mismatched is `422 invalid_cursor`, expired is `409 cursor_expired`. ID is final ascending tie-breaker.
+
+Projects filter `state|query`; Artifacts `projectId|state|retentionMode|query`; Services `projectId|reachability|pinned|query`; Revisions `availability`; ledger `projectId|kind|query`; audit `resourceType|resourceId|cause|actor|since|until`. Orders are the endpoint-appropriate `recent|title|attention|published|superseded|timestamp`. Search is literal Unicode-aware case-folded substring matching, not relevance-ranked full-text search.
+
+### Exact `/api/v1` inventory
+
+#### Projects and ledger
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| GET | `/api/v1/projects` | List Projects |
+| POST | `/api/v1/projects` | Strict Project registration |
+| GET | `/api/v1/projects/resolve?path=…` | Resolve without allocation |
+| GET | `/api/v1/projects/ledger` | All-Projects ledger |
+| GET | `/api/v1/projects/{projectId}` | Show Project |
+| PATCH | `/api/v1/projects/{projectId}` | Update title/slug |
+| GET | `/api/v1/projects/{projectId}/ledger` | Project ledger |
+| POST | `/api/v1/projects/{projectId}/move` | Atomic explicit move |
+| DELETE | `/api/v1/projects/{projectId}` | Tombstone empty Project |
+
+#### Artifacts and Revisions
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| GET | `/api/v1/artifacts` | List Artifacts |
+| POST | `/api/v1/artifacts` | Strict Publish |
+| POST | `/api/v1/artifact-imports` | Ordered import batch |
+| GET | `/api/v1/artifacts/{artifactId}` | Show Artifact |
+| PATCH | `/api/v1/artifacts/{artifactId}` | Update title/description/slug |
+| DELETE | `/api/v1/artifacts/{artifactId}` | Enter recovery |
+| POST | `/api/v1/artifacts/{artifactId}/replace` | Publish/select Revision |
+| POST | `/api/v1/artifacts/{artifactId}/restore` | Restore |
+| POST | `/api/v1/artifacts/{artifactId}/pin` | Pin |
+| POST | `/api/v1/artifacts/{artifactId}/unpin` | Unpin |
+| POST | `/api/v1/artifacts/{artifactId}/purge-plans` | Plan early purge |
+| POST | `/api/v1/artifact-purge-plans/{planId}/apply` | Apply early purge |
+| GET | `/api/v1/artifacts/{artifactId}/revisions` | Revision history |
+| GET | `/api/v1/revisions/{revisionId}` | Revision metadata |
+
+#### Services and Targets
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| GET | `/api/v1/services` | List Services |
+| POST | `/api/v1/services` | Strict registration |
+| GET | `/api/v1/services/{serviceId}` | Show Service/Targets |
+| PATCH | `/api/v1/services/{serviceId}` | Atomic presentation/Targets/action update |
+| DELETE | `/api/v1/services/{serviceId}` | Catalogue-only removal |
+| POST | `/api/v1/services/{serviceId}/teardown` | Explicit teardown |
+| POST | `/api/v1/services/{serviceId}/refresh` | Refresh Service |
+| POST | `/api/v1/services/refresh` | Refresh all |
+| POST | `/api/v1/services/{serviceId}/pin` | Pin |
+| POST | `/api/v1/services/{serviceId}/unpin` | Unpin |
+| POST | `/api/v1/services/{serviceId}/keep` | Renew grace only |
+| GET | `/api/v1/services/{serviceId}/targets` | List Targets |
+| POST | `/api/v1/services/{serviceId}/targets` | Add Target |
+| GET | `/api/v1/services/{serviceId}/targets/{targetName}` | Show Target |
+| PATCH | `/api/v1/services/{serviceId}/targets/{targetName}` | Update URL/label |
+| DELETE | `/api/v1/services/{serviceId}/targets/{targetName}` | Remove with primary replacement |
+| POST | `/api/v1/services/{serviceId}/targets/{targetName}/promote` | Promote |
+| POST | `/api/v1/services/{serviceId}/targets/{targetName}/refresh` | Refresh Target |
+
+#### Cleanup, diagnostics, recovery, backup, configuration, audit
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| GET | `/api/v1/cleanup/preview?pressure=false` | Cleanup preview |
+| POST | `/api/v1/cleanup/runs` | Run cleanup |
+| GET | `/api/v1/cleanup/runs/{operationId}` | Cleanup state/result |
+| GET | `/api/v1/system/health` | Readiness/health |
+| GET | `/api/v1/system/status` | Fast status |
+| POST | `/api/v1/system/diagnostics` | Normal/deep diagnostics |
+| POST | `/api/v1/system/recovery/plans` | Create durable non-destructive plan |
+| GET | `/api/v1/system/recovery/plans/{planId}` | Show plan |
+| POST | `/api/v1/system/recovery/plans/{planId}/apply` | Apply plan |
+| POST | `/api/v1/system/recovery/resume` | Resume intent |
+| GET | `/api/v1/system/recovery/operations/{operationId}` | Show operation |
+| POST | `/api/v1/system/backups` | Create backup |
+| GET | `/api/v1/system/backups/{backupId}` | Backup state/result |
+| POST | `/api/v1/system/backups/{backupId}/cancel` | Cancel nonterminal backup |
+| POST | `/api/v1/system/backups/verify` | Verify backup |
+| GET | `/api/v1/system/configuration` | Redacted effective configuration |
+| POST | `/api/v1/system/configuration/validate` | Validate proposed TOML without activation |
+| GET | `/api/v1/system/audit` | Paginated audit |
+
+There is no remote endpoint for release installation/activation, setup check/apply/remove/uninstall, systemd service status/start/stop/restart, stable command links, configuration installation, or Tailscale Serve mutation. In particular, `/api/v1/system/setup`, `/api/v1/system/service`, and aliases are absent.
+
+### Batch and bulk results
+
+Trustworthy import, refresh, cleanup, diagnostic, backup-verification, and recovery fan-out outcomes always use `ok:true` on stdout. Per-entry failures live in `result.items[].error`. Aggregate fields are exact:
+
+| `overall` | Meaning | `partial` | CLI exit |
+| --- | --- | ---: | ---: |
+| `complete` | every entry succeeded or replayed unchanged | false | 0 |
+| `partial` | at least one succeeded and at least one failed/skipped | true | 8 |
+| `failed` | zero succeeded and at least one trustworthy entry failure exists | false | 8 |
+
+Empty input or inability to establish trustworthy entry outcomes is `ok:false` on stderr with the command-level exit. Diagnostics retain the broader rule that omitted/errored/skipped requested checks set `partial:true`; completed unhealthy diagnostics exit `10`.
+
+### HTTP status and CLI exit mapping
+
+| HTTP | Stable meaning | CLI exit |
+| ---: | --- | ---: |
+| 200 | read/mutation/replay/trustworthy fan-out | 0, 8, 9, or 10 by result |
+| 201 | strict resource creation | 0 |
+| 202 | durable nonterminal operation | 0 |
+| 400 | malformed JSON/query encoding | 2 |
+| 404 | `not_found` | 3 |
+| 409 | strict/idempotency/cursor/domain conflict | 4 |
+| 410 | `gone` | 3 |
+| 412 | `changed_record` | 4 |
+| 413 | metadata body too large | 2 |
+| 415 | unsupported media | 2 |
+| 422 | validation/unsafe input; `source_changed` exception | 2 or 7 |
+| 423 | maintenance/authority lock | 6 |
+| 428 | `precondition_required` | 4 |
+| 429 | bounded queue exhausted | 6 |
+| 500 | internal | 10 |
+| 503 | daemon/storage authority unavailable | 5 or 10 |
+| 507 | capacity/reserve/ceiling | 10 |
+
+`204` and WebDAV `207` are not used; envelopes are always returned.
 
 ## 8. Agent CLI contract
 
-The approved grammar is **B — Resource namespaces**:
+The grammar is resource namespaces:
 
 ```text
 obs [GLOBAL OPTIONS] <RESOURCE> <ACTION>
 ```
 
-`obs --help` MUST list all six namespaces. `obs <resource> --help` MUST list that resource's complete capability inventory, runnable leaf synopses, and examples. Parent help exits `0`. Resource/action inventory is:
+`obs --help` lists all namespaces; `obs <resource> --help` lists that resource's complete leaves, runnable synopses, and examples. Parent help exits `0`. Global options are `--server URL`, `-p|--project PATH`, `--json`, `--timeout DURATION`, `--idempotency-key KEY`, and leaf-specific `--yes`. `--yes` is accepted only where confirmation is required.
+
+### Artifact leaves
 
 ```text
-obs artifact
-  publish SOURCE
-  replace ARTIFACT SOURCE
-  import SOURCE...
-  list [--all]
-  show ARTIFACT [--revisions]
-  remove ARTIFACT
-  restore ARTIFACT [--ttl DURATION|--pin]
-  pin ARTIFACT [--reason TEXT]
-  unpin ARTIFACT [--ttl DURATION]
+obs artifact publish SOURCE
+  [--entry PATH] [--title TEXT] [--description TEXT] [--slug TEXT]
+  [--ttl DURATION | --pin] [--reason TEXT]
+obs artifact replace ARTIFACT SOURCE
+  [--entry PATH] [--title TEXT] [--description TEXT] [--slug TEXT]
+  [--ttl DURATION | --pin] [--reason TEXT] [--record-version VERSION]
+obs artifact import SOURCE...
+  [--entry PATH] [--title TEXT] [--description TEXT] [--slug TEXT]
+  [--ttl DURATION | --pin] [--reason TEXT] [--options FILE]
+obs artifact list
+  [--all] [--state STATE] [--retention MODE] [--query TEXT]
+  [--order recent|title|attention] [--limit N] [--after CURSOR]
+obs artifact show ARTIFACT [--revisions]
+obs artifact remove ARTIFACT --yes [--record-version VERSION]
+obs artifact restore ARTIFACT [--ttl DURATION | --pin] [--reason TEXT]
+obs artifact pin ARTIFACT [--reason TEXT]
+obs artifact unpin ARTIFACT [--ttl DURATION]
+obs artifact purge preview ARTIFACT
+obs artifact purge apply PLAN --yes
+```
 
-obs service
-  register NAME --target NAME=URL... [--primary NAME]
-  update SERVICE
-  list
-  show SERVICE
-  remove SERVICE
-  teardown SERVICE
-  refresh SERVICE | refresh --all
-  pin SERVICE [--reason TEXT]
-  unpin SERVICE
-  keep SERVICE
-  target list SERVICE
-  target show SERVICE TARGET
-  target add SERVICE NAME=URL [--primary]
-  target update SERVICE TARGET --url URL [--label TEXT]
-  target remove SERVICE TARGET [--new-primary TARGET]
-  target promote SERVICE TARGET
-  target refresh SERVICE TARGET
+`--options FILE` is a JSON array with one nullable object per positional source and only the per-entry overrides in [section 5](#explicit-import-and-per-entry-outcomes).
 
-obs project
-  list
-  show PROJECT
-  resolve [PATH]
+### Service and Target leaves
 
-obs cleanup
-  preview [--pressure]
-  run --yes [--pressure]
+```text
+obs service register NAME
+  --target NAME=URL...
+  [--primary NAME] [--label TEXT] [--description TEXT] [--slug TEXT]
+  [--teardown-arg ARG...] [--action-timeout DURATION]
+  [--pin] [--reason TEXT]
+obs service update SERVICE
+  [--label TEXT] [--description TEXT] [--slug TEXT]
+  [--teardown-clear | --teardown-arg ARG...]
+  [--action-timeout DURATION] [--record-version VERSION]
+obs service list
+  [--reachability STATE] [--pinned BOOL] [--query TEXT]
+  [--order recent|title|attention] [--limit N] [--after CURSOR]
+obs service show SERVICE
+obs service remove SERVICE --yes [--record-version VERSION]
+obs service teardown SERVICE --yes
+  [--action-timeout DURATION] [--record-version VERSION]
+obs service refresh SERVICE
+obs service refresh --all
+obs service pin SERVICE [--reason TEXT]
+obs service unpin SERVICE
+obs service keep SERVICE
+obs service target list SERVICE
+obs service target show SERVICE TARGET
+obs service target add SERVICE NAME=URL [--label TEXT] [--primary]
+obs service target update SERVICE TARGET [--url URL] [--label TEXT]
+obs service target remove SERVICE TARGET --yes [--new-primary TARGET]
+obs service target promote SERVICE TARGET
+obs service target refresh SERVICE TARGET
+```
 
-obs system
-  status
-  diagnostics [--deep]
-  setup check
-  setup apply --yes
-  recovery preview OPERATION [SELECTOR...]
-  recovery apply PLAN --yes
-  recovery resume [OPERATION]
-  backup create DESTINATION
-  backup verify BACKUP [--deep]
+### Project, cleanup, system, and serve leaves
+
+```text
+obs project list
+  [--all] [--query TEXT] [--order title|recent]
+  [--limit N] [--after CURSOR]
+obs project show PROJECT
+obs project resolve [PATH]
+obs project register [PATH] [--title TEXT] [--slug TEXT]
+obs project update PROJECT [--title TEXT] [--slug TEXT]
+obs project move PROJECT NEW_PATH --yes [--title TEXT] [--slug TEXT]
+obs project tombstone PROJECT --yes
+
+obs cleanup preview [--pressure]
+obs cleanup run --yes [--pressure]
+
+obs system status
+obs system diagnostics [--deep]
+obs system recovery preview OPERATION [SELECTOR...]
+obs system recovery apply PLAN --yes
+obs system recovery resume [OPERATION]
+obs system backup create DESTINATION
+obs system backup verify BACKUP [--deep]
+obs system backup cancel BACKUP --yes
+obs system config show
+obs system config validate FILE
+obs system setup check
+obs system setup apply --yes
+obs system setup remove --yes
+obs system setup uninstall --yes
+obs system service status
+obs system service start
+obs system service stop --yes
+obs system service restart --yes
 
 obs serve
   [--listen 127.0.0.1:3773]
   [--canonical-origin URL]
   [--storage PATH]
+  [--max-stored-bytes BYTES]
+  [--max-live-artifacts COUNT]
+  [--teardown-timeout DURATION]
 ```
 
-The diagnostics decision extends the approved `system` noun without changing the B grammar. Recovery `OPERATION` is one of `reconcile`, `quarantine`, `repair_catalogue_candidate`, `salvage_catalogue_candidate`, `rebuild_catalogue_candidate`, `validate_candidate`, `activate_candidate`, `restore_backup`, or `discard`.
+Recovery operations are exactly `reconcile`, `quarantine`, `repair_catalogue_candidate`, `salvage_catalogue_candidate`, `rebuild_catalogue_candidate`, `validate_candidate`, `activate_candidate`, `restore_backup`, and `discard`.
 
-Global options are `--server URL`, `-p, --project PATH`, `--json`, `--timeout DURATION`, and `--idempotency-key KEY`. Destructive mutations also accept `--yes`. Project defaults to current working directory; the daemon resolves it. `project resolve [PATH]` returns canonical directory and Project key.
+### Output, confirmation, and daemon boundary
 
-### Output, errors, and idempotency
+Human results use stdout; warnings/progress/log guidance use stderr. JSON success/trustworthy outcomes emit one stdout value. Command inability emits one stderr error with empty stdout. Existing-resource CLI mutations translate record version into API `If-Match`; selectors follow Project ID/key/path, Artifact ID/key, Revision ID, Service ID/key or Project-scoped name, and exact Target name rules. Ambiguous Service name is rejected.
 
-Human success goes to stdout. Warnings, progress, logs, and diagnostics go to stderr. With `--json`, success writes exactly one JSON value to stdout; failure leaves stdout empty and writes exactly one JSON error to stderr. The stable envelopes are:
+TTY destructive calls may prompt once. Non-TTY calls never prompt and require `--yes`. Idempotency follows [section 7](#common-api-contract): non-TTY/automation mutation requires a supplied key; interactive TTY may generate/display one. Future agents must always supply one.
 
-```json
-{"schemaVersion":1,"ok":true,"result":{}}
-{"schemaVersion":1,"ok":false,"error":{"code":"contention","message":"catalogue remained busy for 5s","retryable":true,"details":{"retryAfterMs":250}}}
-```
+`system config show` returns the daemon's redacted active effective configuration. `system config validate FILE` requires FILE: the CLI opens that local regular file through the safe no-follow input boundary, reads its TOML contents, and sends content—not a path—to `POST /api/v1/system/configuration/validate`. There is no stdin mode. The daemon returns ordered parse, schema, and semantic checks and never installs or activates the proposal. This POST is non-mutating and needs neither `If-Match` nor `Idempotency-Key`; daemon absence exits `5`.
 
-Batch/bulk results preserve order, report each outcome, and set `partial:true` when mixed. Successful resource results include opaque IDs and server-returned URLs.
+All commands except the exact eight local setup/service leaves call the daemon. The CLI never opens SQLite/storage or autostarts the daemon. Missing daemon is `daemon_unavailable`, exit `5`. `--server` selects daemon-backed commands and is a usage error on local setup/service leaves. Setup check may reuse the same pure TOML parser/schema module locally, but that module has no domain/SQLite/storage dependency and does not add a local-authority leaf.
 
-Every mutation MUST accept an idempotency key; agents and automation MUST always provide one. A key binds to a canonical request fingerprint. Same key and fingerprint returns or resumes the recorded result; changed input conflicts; committed effects never repeat. A client timeout after dispatch reports unknown commit state and directs an identical retry with the same key.
+## 9. Project-led browser interface
 
-A human TTY MAY prompt once for a destructive command. Non-TTY invocation MUST NOT prompt and returns confirmation-required unless `--yes` is present. Confirmation is required for Artifact removal, Service removal, Service teardown, primary Target removal, cleanup run, setup apply, catalogue replacement, availability-changing quarantine, restore, and permanent discard.
+### Ledger and navigation
 
-### Daemon boundary
+Observatory opens as a Project-led catalogue, not an activity feed or search-first surface. All Projects is the default first level; each Project shows its canonical directory context. The second level is one ledger of Artifacts and Services. Default order is most recent observation/Publish; Title and Needs attention are alternatives.
 
-The CLI sends every read and mutation to the backend. It MUST NOT open SQLite or storage. `obs serve` is the sole backend write authority, binds loopback, owns validation and scheduled work, and refuses a second daemon before writes. Normal commands MUST NOT auto-start it. `system setup` alone may reconcile Observatory's owned Serve root handler.
+Each row shows Entry kind/identity cue, title, description, lifecycle or reachability, size/Revision or diagnostics, recency, Project, and separate Open/Details actions. Artifact states are current, pinned, expiring, and recoverable with retention/deadline/current Revision/logical size. Service states are online, offline, unknown, and stale with host-vantage age/status/duration/failure and expiry warning. Reachability is not application health.
 
-## 9. Human index and navigation
+Artifact Open uses stable current bytes. Service Open leaves Observatory for the direct primary Target. Details stays under Observatory. Alternatives are explicit named choices only in Service details. Secondary search operates inside Project scope over visible fields and never replaces Project navigation or hides lifecycle. Kind filters are All/Artifacts/Services. The ledger never executes or embeds Entry previews.
 
-The approved UI is **B — Project ledger**, with C-style fast search only as a secondary affordance.
+Mobile uses horizontally scrollable Project navigation and stacked cards preserving the same state, diagnostics, recency, Open, and Details. Baseline accessibility includes semantic landmarks/headings, skip link, labels, keyboard navigation, visible focus, non-stealing status announcements, sufficient contrast, 200% reflow, reduced motion, and core server-rendered navigation without JavaScript.
 
-- The first navigation level is All Projects, then each Project name with canonical directory context. All Projects is default.
-- The second level is one dense ledger of Artifacts and Services in scope. Default order is most recent observation or Publish first; Title and Needs attention are alternatives.
-- Each row shows kind/accession cue, title, description, lifecycle or reachability, size/Revision or diagnostics, recency, Project, and separate Open and Details actions.
-- Artifact rows expose current, pinned, expiring, and recoverable states; retention mode/deadline or recovery warning; current Revision; logical size; Project; and Publish recency. Recoverable stable URLs remain `410` until restore.
-- Service rows expose the primary Target's online, offline, unknown, or stale host-vantage state, observation age, HTTP status and duration or categorized transport failure, and all-offline expiry deadline. They never label reachability as application health.
-- Artifact Open uses the stable `/artifacts/<artifact-key>/` URL. Service Open leaves Observatory and opens the primary Target directly. Details stays in Observatory. Alternatives appear only as named choices in Service details.
-- Search stays within current Project scope and covers title, description, kind, and visible state/diagnostic terms. Kind filters are All, Artifacts, and Services. Search MUST NOT replace Project navigation or hide lifecycle, liveness, recency, retention, or diagnostics.
-- The catalogue MUST NOT execute or embed previews.
+### Browser mutation inventory
 
-At mobile widths, Project navigation becomes a horizontally scrollable strip and ledger rows become stacked cards. Cards MUST preserve the desktop state, lifecycle/diagnostic, recency, Open, and Details information.
+The UI exposes only:
 
-The baseline MUST support semantic landmarks and headings, keyboard navigation and visible focus, a skip link, programmatic labels, status announcements that do not steal focus, sufficient contrast, viewport reflow without lost actions, and `prefers-reduced-motion`. Core Project navigation, ledger state, and links MUST work without JavaScript; JavaScript progressively enhances search, filtering, ordering, and forms.
+- Project: register by typed daemon-host path, update title/slug, explicit move, tombstone empty Project;
+- Artifact: update title/description/slug, pin/unpin, remove, restore, early-purge preview/apply;
+- Service: update presentation/action, pin/unpin, keep, refresh, remove, teardown, and Target add/update/remove/promote/refresh;
+- Operations: cleanup preview/run, normal status/diagnostics, and read-only recovery/backup/audit state.
 
-## 10. Artifact retention, cleanup, and audit
+The UI excludes Publish, replace, import, deep diagnostics, recovery apply/resume, backup create/restore, candidate activation/discard, configuration installation, every setup/service-manager leaf, and arbitrary host-path selection.
 
-Every Artifact has exactly one mode:
+No GET mutates. Confirmation is ordinary submit for metadata/pin/keep/refresh/non-primary Target changes; a resource/version/effect review for Artifact remove/restore, Service remove, and primary Target removal; exact Service name plus process consequence for teardown; exact Project key plus Service/Artifact consequences for move/tombstone; exact cleanup preview for run; and exact purge plan plus Artifact key/permanent warning for early purge.
 
-| Mode | Required behavior |
+Every browser mutation MUST pass exact canonical Host/authority; exact Origin, or exact-origin Referer only when Origin is unavailable; `Sec-Fetch-Site: same-origin` when supplied; one-use CSRF token bound to action/resource/version/confirmation; `If-Match`; and idempotency key. The cryptographically random token expires in ten minutes, is consumed only on accepted dispatch, is not a login/session, and cannot authorize another action/version. JavaScript sends `X-Observatory-CSRF`; non-JavaScript form adapters perform identical validation/application operation then `303` to a server-returned detail URL. Cross-origin/missing-source-origin/mismatched Host returns `403 browser_origin_rejected`. Loopback non-browser clients do not need CSRF but still need idempotency/preconditions.
+
+## 10. Artifact retention and capacity
+
+Every Artifact has exactly one retention mode:
+
+| Mode | Behavior |
 | --- | --- |
-| Expiring | Default. Expire 30 days after latest successful Publish/replacement. Views do not renew it. |
-| Explicit TTL | Positive request duration from successful Publish; replacement restarts the same duration unless changed. |
-| Pinned | No deadline until explicit unpin/delete. Unpin selects a positive TTL or starts the 30-day default at unpin time. |
+| Default | Expire 30 days after latest successful Publish/replacement; views do not renew. |
+| Explicit TTL | Positive requested duration from successful Publish; replacement restarts unless changed. |
+| Pinned | No deadline until unpin/delete; unpin selects TTL or starts default at unpin. |
 
-Retention belongs to Artifact identity. Failed Publish does not change it. Times are stored as absolute UTC instants. Pin reason is optional visible metadata. Pinning protects the Artifact and current Revision, not unlimited history.
+Retention belongs to Artifact identity; failed Publish changes nothing. Times are absolute UTC. Pin reason is visible optional metadata. Pin protects Artifact/current Revision, not unlimited history.
 
-At deadline an Artifact is expired even before cleanup. It leaves normal discovery and its stable URL returns `410`. Expiry and normal explicit deletion start a seven-day recovery window. Restore chooses pinned, explicit TTL, or default retention. After seven days cleanup may purge bytes and Revisions while retaining tombstone identity, Project, title, expiration/deletion time, cause, and reclaimed byte count. Early purge is a separately previewed, exact, confirmed destructive operation.
+At deadline, Artifact is expired before cleanup, leaves discovery, and stable URL returns `410`. Expiry and normal deletion start a seven-day recovery window. Restore chooses a mode. After it, cleanup may purge bytes/Revisions while retaining tombstone identity, Project, title, time, cause, and reclaimed bytes. Early purge requires exact unexpired plan, matching record, explicit confirmation, no active lease/current reference, durable tombstones, and audit.
 
-A superseded Revision is normally eligible only when older than seven days **and** outside the five most recent superseded Revisions. Pressure cleanup MAY remove older superseded Revisions inside those windows, oldest first, but MUST preserve every live current Revision. Removed Revision URLs return `410` and IDs are never reused.
+A superseded Revision is normally eligible only when older than seven days **and** outside the five newest superseded Revisions. Pressure may remove superseded Revisions inside those windows oldest-first but preserves every live current Revision. Removed Revision URL is `410` and ID is not reused.
 
-There are no default byte, file, live-Artifact count, or global storage ceilings. Deployments MAY configure global stored-byte and live-Artifact count ceilings. Observatory MUST reserve the greater of 1 GiB or 5% of the storage filesystem as operational free space.
+There are no default byte/file/live-count ceilings. Configured `max_stored_bytes` counts logical served-file bytes of every owned Revision not physically discarded: current, superseded, recoverable, unavailable, quarantine pending deletion, plus source-copy staging reservations. It excludes `.obs.json`, recovery manifests, SQLite/WAL/audit metadata, exported backups/recovery candidates, and external Service data. Each byte-adding operation reserves exact source regular-file lengths; replacement reserves new bytes without subtracting current.
 
-Before a Publish that would breach a ceiling/reserve, cleanup order is:
+`max_live_artifacts` counts discoverable, non-expired stable Artifact identities in live state. Revisions, tombstones, expired, deleted-recoverable, and gone identities do not count. Replacement does not increase it; restore does.
 
-1. abandoned staging;
-2. normally eligible superseded Revisions;
-3. expired/deleted Artifacts past recovery;
-4. additional superseded Revisions oldest first, preserving live current Revisions.
+Filesystem safety separately reserves `max(1 GiB, ceil(filesystem_total_bytes × 0.05))`. Before Publish, cleanup order is abandoned staging; normally eligible superseded Revisions; expired/deleted past recovery; then additional superseded oldest-first. Cleanup never shortens recovery or evicts a live current Revision.
 
-Cleanup MUST NOT shorten recovery or evict a live Artifact. Insufficient safe capacity fails before commit with required bytes, available capacity, blocking limit/reserve, and reclaimable bytes. Existing reads continue.
+Capacity results contain `requiredBytes`, `accountedStoredBytes`, `maxStoredBytes`, `liveArtifacts`, `maxLiveArtifacts`, `filesystemAvailableBytes`, `reserveBytes`, `reclaimableBytes`, and `blockingConstraint`. Failure happens before commit; existing reads continue.
 
-Preview lists candidates, reasons, Revisions, bytes, and recoverability. Catalogue/UI diagnostics show retention, deadline/pin, recoverability, logical size, Revision count, cleanup errors, aggregate use, limits, reserve, reclaimable bytes, and latest run.
+Preview lists candidates, reasons, Revisions, bytes, and recoverability. Every expiry, restore, retention mutation, Revision removal, deletion, purge, pressure cleanup, and failure appends timestamp/actor/cause/IDs/bytes. Cleanup is single-writer, restart-safe, idempotent intent/quarantine/finalize/delete. Independent candidates continue after one failure. Persistent failure/reserve breach blocks byte additions while intact reads continue.
 
-Every expiry, restore, retention mutation, Revision removal, deletion, purge, pressure cleanup, and failure appends an audit event with timestamp, actor (`operator` or `system`), cause, IDs, and byte result. Cleanup is a single-writer, restart-safe, idempotent intent state machine. It marks unavailable, atomically quarantines complete directories on the same filesystem, finalizes tombstones, and removes bytes asynchronously. One candidate's failure remains retryable and does not block independent candidates. Persistent failure or reserve breach makes storage unhealthy and blocks byte-adding writes while intact reads continue.
+## 11. Service reachability and expiry
 
-## 11. Service reachability, expiry, and concurrency
+The backend probes every Target from its host/network namespace using direct HTTP(S) GET, no ambient proxy, no redirects, and five-second header deadline. Any HTTP response is reachable; DNS/connection/TLS/protocol/timeout is unreachable. Status is diagnostic, not application health.
 
-Observatory probes each Target from the backend host/network namespace with direct HTTP(S) `GET`, no ambient proxy, no redirect following, and a five-second deadline through response headers. Any HTTP response means reachable; DNS, connection, TLS, protocol, and timeout errors mean unreachable. Probes do not claim application health.
+Targets schedule every 60 seconds with up to 10% jitter, once after startup, and immediately after committed relevant mutation. Writes do not wait; page views do not probe. Current-version state is unknown with no result; online/offline for response/failure no older than two minutes; stale thereafter with underlying fact labeled. Scheduler/internal failure creates no offline observation. Late old-version results are discarded. URL/add/rename/delete invalidation is exact; unchanged URL preserves observation.
 
-All Targets are scheduled every 60 seconds with up to 10% jitter, once after startup, and immediately after committed registration/relevant update. Writes do not wait. Page views never probe. Target state for its current URL/version is:
+Services are unpinned by default. Seven-day grace begins only when every current Target is current-version offline and none online. Online resets; unknown/stale neither starts nor completes. Target mutation, keep, or unpin starts fresh grace when all-offline. Pin suppresses expiry, not probes. Reachable Services have no age-only lease.
 
-- `unknown`: no completed observation;
-- `online`: response observation no older than two minutes;
-- `offline`: failure observation no older than two minutes; or
-- `stale`: latest observation older than two minutes, retaining the labeled underlying result.
+Cleanup runs at least hourly and freshly probes every Target at deadline under normal bounds. It deletes only on all-offline completed results and unchanged record version. Reachability, internal failure, unknown, concurrency, or incomplete confirmation preserves. Automatic deletion never invokes teardown.
 
-Scheduler/internal failures do not create offline facts. Late prior-version results are discarded. URL change resets that Target to unknown; add starts unknown; rename is delete/add; delete removes observation. Unchanged URLs preserve observations.
+Manual refresh supports Target, Service, or all. Concurrency is 16 global, two per destination host, one per Target; duplicates coalesce; every probe source shares bounds. Ordered trustworthy partial results follow [section 7](#batch-and-bulk-results). Details show URL/state/time/duration/status or stable failure category, host vantage, pin/activity/expiry without credential leakage.
 
-Services are unpinned by default. Seven-day expiry grace starts only when every current Target has a current-version offline observation and none is online. Online resets it. Unknown/stale neither starts nor completes expiry. Target mutation, explicit keep, or unpin starts a fresh seven-day grace when still all-offline. Pin suppresses automatic expiry but not probes. Reachable Services have no age-only lease.
+## 12. Persistence, backup, and crash protocols
 
-Cleanup runs at least hourly. At deadline it freshly probes every current Target under normal bounds and deletes catalogue data only when all finish offline and the record version is unchanged. Reachability, internal failure, unknown, concurrent mutation, or incomplete confirmation preserves the Service. Automatic deletion never invokes teardown.
+### SQLite authority and private layout
 
-Manual refresh supports one Target, one Service, or all Services and returns ordered per-Target partial outcomes. Global concurrency is 16, per destination host is two, and per Target is one. Duplicate work coalesces. Scheduled, startup, manual, and cleanup probes share these bounds. One Target cannot block writes or independent results.
-
-Service details MUST show every Target URL, state, timestamp, duration, HTTP status or DNS/connection/TLS/protocol/timeout category, host vantage, pin, last register/update/keep activity, and expiry deadline. URLs and diagnostics MUST NOT expose credentials.
-
-## 12. Persistence and crash protocols
-
-### Authority and exact storage layout
-
-SQLite is authoritative. The exact private durable root is:
+SQLite is authoritative. The private data root is:
 
 ```text
 catalogue.sqlite
 staging/<operation-id>/
-revisions/<opaque-revision-id>/
+revisions/<revision-id>/
 quarantine/<operation-or-revision-id>/
 backups/<backup-id>/
 candidates/<candidate-id>/
 ```
 
-SQLite owns all visibility and lifecycle state. Immutable Revision directories contain served bytes plus one reserved non-served recovery manifest with schema, Artifact/Revision IDs, entry path, counts, Publish instant, and ordered file path/size/digest records. SQLite stores the manifest digest.
+A final Revision has exact served tree plus reserved non-served recovery manifest with schema, IDs, entry, counts, Publish instant, ordered path/size/digest; SQLite stores manifest digest. Paths derive only from opaque IDs.
 
-Database and byte paths use generated opaque IDs, never mutable or source-derived values. Catalogue, sidecars, staging, Revisions, quarantine, backups, and candidates MUST share one supported local filesystem wherever atomic rename is required. Remote/cross-mount layouts are unsupported.
+Catalogue/sidecars/staging/Revisions/quarantine/source backup workspace/candidates share one supported local filesystem wherever private atomic rename applies. Use STRICT tables, constraints, `foreign_keys=ON` every connection, local WAL, `synchronous=FULL`, bounded busy handling, short `BEGIN IMMEDIATE`, decided indexes, compare-and-swap versions, and latest Target observation only.
 
-Use `STRICT` tables, constraints, foreign keys on every connection, WAL only on local storage, `synchronous=FULL`, bounded busy handling, short `BEGIN IMMEDIATE` writes, indexes for decided lookup/due-work paths, and compare-and-swap record versions. Keep only the latest Target observation.
+Publish protocol is durable intent; descriptor-relative stage/validate/checksum/manifest/sync; atomic final Revision rename plus parent sync; then short SQLite visibility/current/retention/audit commit. Startup completes/resumes matching intents only and quarantines malformed/mismatched/unreferenced bytes.
 
-### Publish protocol
+Cleanup transactionally rechecks/marks unavailable/audits; atomically renames complete Revision to quarantine and syncs parents; finalizes tombstone/bytes; unlinks asynchronously. Missing bytes are error, not proof.
 
-1. Preflight validation/capacity; allocate IDs; commit durable staging intent without visibility.
-2. Descriptor-relatively copy, validate, checksum, write manifest, and sync every file/directory in same-filesystem staging.
-3. Atomically rename to final Revision and sync the parent.
-4. In one short SQLite transaction, verify intent/version, insert Revision/audit state, update current selection and retention, and commit visibility.
+### External backup topology
 
-Startup MAY complete only an intent whose final bytes, IDs, manifest, and catalogue expectations match. It MAY resume intact staging. It MUST quarantine malformed, mismatched, or unreferenced bytes rather than adopt them.
+`backups/<backup-id>/` is a source-side SQLite snapshot, workspace, and non-authoritative receipt directory. It contains the Online Backup snapshot and operation/receipt evidence, not duplicate Revision payload. SQLite operation/backup/lease rows remain authority. Revision bytes copy directly from leased immutable Revision directories. The workspace may be removed after completion/lease release; path presence cannot create, complete, cancel, renew, or release anything.
 
-### Cleanup protocol
+`obs system backup create DESTINATION` names one exact absolute host-local final directory. Parent exists/accessibly; leaf is absent; no ancestors are created; relative/root/empty/dot/dotdot/symlinked/ambiguous paths fail. Backup gets never-reused 26-character ID. Destination sibling staging is `.<leaf>.observatory-<backup-id>.incomplete`, mode `0700`, no-follow/no-replace. Unknown collision is untouched. Finalization never overwrites, merges, deduplicates, or forces.
 
-1. Transactionally recheck eligibility/pin/current/version, append intent/audit, and mark the Revision unavailable.
-2. Atomically rename its complete directory to quarantine and sync both parents.
-3. Transactionally finalize tombstone and reclaimed-byte state; unlink asynchronously and idempotently.
+Write-capable destination filesystem is only Linux btrfs, ext4, or XFS **and** must pass an active disposable probe proving exclusive/no-follow file create, write/read, file+directory sync, `RENAME_NOREPLACE` success/collision, child-directory rename, cleanup, stable mount/parent identity. Network/FUSE/9p/virtiofs/overlay/tmpfs/read-only/unknown fails. `statfs`, mountinfo, and `statx` mount identity are rechecked through finalization.
 
-Missing bytes are an error, not evidence of completed deletion.
+Destination bundle is:
 
-### Backup, migration, rebuild, and repair boundaries
+```text
+catalogue.sqlite
+revisions/<revision-id>/<served tree and recovery manifest>
+backup-manifest.json
+.observatory-complete
+```
 
-A complete backup leases the exact committed Revisions, takes a consistent SQLite Online Backup snapshot, copies leased immutable directories, binds snapshot/schema/application ID and exact digests in a top-level manifest, syncs/finalizes/verifies, then releases the lease. Copying only `catalogue.sqlite` while WAL is active is not a complete backup.
+The manifest binds format/backup/build/API/schema, instants, catalogue length/digest, exact ordered leased Revision set and every member path/size/digest, totals, verification. It excludes private paths, mount/inode/owner/mode, teardown argv, and secret URLs. Format v1 must freeze one canonical serialization/digest fixture before emission. Completion marker is written last and binds backup ID plus manifest/catalogue digests; it is evidence only. A backup is valid only at final name with exact marker/manifest/catalogue/Revision inventory.
 
-Migrations are ordered, transactional, monotonic, exclusive-lock protected, and fail closed. Observatory sets application ID/user version, refuses newer unknown schema, creates and verifies a complete pre-migration backup, updates version transactionally, then runs foreign-key and quick checks before writes.
+Creation order is authoritative intent; Online Backup snapshot; exact Revision-set lease under short availability barrier; source/destination capacity; destination classification/probe; hidden stage; copy/hash/sync/reopen catalogue; copy/hash/sync exact Revisions; bottom-up directory sync; write/sync manifest; deep reread verification; write/sync marker; recheck parent/final absence; `renameat2(..., RENAME_NOREPLACE)`; sync destination parent; mark completed/audit/release lease in SQLite; asynchronously clean source evidence. Cross-filesystem transport is verified copy, never rename. Success returns only after SQLite completion.
 
-Repair, SQLite recovery salvage, and manifest rebuild MUST produce separate candidates and loss/ambiguity reports. They MUST NOT mutate the only copy or become authority automatically. Rebuild cannot recover current selection, retention/pins, tombstones, audit history, Services, Targets, teardown, or observations from manifests alone. Activation requires full validation, maintenance lock, exact preview, confirmation, atomic authority selection with WAL sidecars, retained rollback material, and audit.
+Every member is newly created `0600`/directory `0700`; links/devices/FIFOs/mounts/extras fail. Ownership, ACL/xattrs, links/reflinks, sparseness, and source modes are not preserved. Checked copy loops require exact length/digest.
+
+Source capacity includes snapshot/workspace/receipt and preserves normal reserve; Revision payload is not duplicated there. Destination requires catalogue + exact Revision/manifest/marker + allocation overhead minus deeply verified reusable staging and preserves its own greater-of-1-GiB-or-5% reserve. Capacity error returns filesystem class, required/available/reserve/already-staged bytes without path.
+
+### Backup crash, resume, cancel, and privacy
+
+Crashes before intent leave no operation; thereafter SQLite phase drives resume. Incomplete source snapshot may be recreated; exact lease protects Revisions; destination partial work stays hidden; allegedly completed files are rehashed; marker-before-rename remains invalid by location; rename leaves hidden or complete final, never half; after parent sync before SQLite completion exact evidence permits completion/lease release. Absence never proves success.
+
+Client disconnect/timeout does not cancel. SIGTERM stops safely and leaves resumable state. `backup cancel BACKUP --yes` and `POST /api/v1/system/backups/{backupId}/cancel` require current If-Match/idempotency, record `cancel_requested`, quiesce current file, record `cancelled`, release lease, retain exact incomplete evidence. Completed is `409 backup_completed`. Durable finalization winning a race yields completed.
+
+Resumable state and lease persist 24 hours after last durable progress. Then reconciler may mark abandoned/release only after no worker/finalization. Exact matching staging may be deleted; ambiguity becomes `stale_ambiguous` and requires exact discard. Final external backup is operator-owned and never retention-cleaned.
+
+Stable backup states are `intent_recorded`, `snapshotting`, `leasing`, `probing_destination`, `copying`, `verifying`, `completion_marker_synced`, `finalizing`, `completed`, `cancel_requested`, `cancelled`, `failed_resumable`, `failed_terminal`, `abandoned`, `stale_ambiguous`.
+
+Remote API never exposes absolute destination/storage/Project/home/mount paths. It returns safe basename/redacted. Local CLI may echo only its caller-supplied DESTINATION. Manifests/audit/logs/errors exclude those paths, source identities, owner/inode, contents, argv, secret URLs. Verification accepts exact finalized path or known backup ID, never `.incomplete`. Normal verifies path/marker/binding/schema/quick/foreign keys/inventory/manifest/types/sizes/no extras; deep adds integrity check and complete rehash. Database alone is `catalogue_only`.
+
+Restore deep-verifies supported local finalized input, rejects remote/FUSE/incomplete/symlink/overlap/change, records exact loss/conflict/capacity effects, copies into private `staging/<operation-id>`, re-verifies, syncs, atomically renames to candidate, validates, and never serves/links/depends on external bytes. Activation remains separate and authority-last.
 
 ## 13. Storage diagnostics and recovery
 
-### Profiles and health
+### Profiles, checks, and health gates
 
-| Profile | Required checks and effect |
+| Profile | Contract |
 | --- | --- |
-| `system status` | Fast, read-only: filesystem/support, capacity/reserve, SQLite open/error/application/schema, WAL presence/size/checkpoint failure, counts/ages of intents/staging/quarantine/leases/cleanup failures, and live-current Revision path existence. Never waits behind long work. |
-| `system diagnostics` | Online read-only bounded snapshot: fast checks plus `quick_check`, `foreign_key_check`, passive checkpoint observation, all catalogue paths, manifest parse/version/digest, intents, staging/quarantine, leases, cleanup details. No full content hashing. |
-| `system diagnostics --deep` | Maintenance-gated: normal checks plus `integrity_check`, every path/size/digest, owned orphan scan, named backup verification, and disposable filesystem sync/rename capability probe. Catalogue reads, mutations, probes, and Artifact serving fail explicitly during the gate; external Services are untouched. |
+| `system status` | Fast non-mutating check of filesystem/capacity, SQLite open/application/schema, WAL, intents/staging/quarantine/leases/cleanup counts, and live-current path existence. |
+| `system diagnostics` | Online bounded snapshot adding quick/foreign-key, passive checkpoint, all paths, manifest parse/version/digest, intents, staging/quarantine, leases, cleanup. No full content hash. |
+| `system diagnostics --deep` | Global maintenance gate adding integrity check, every path/size/digest, owned orphan scan, named backup verification, and disposable private-filesystem capability probe. Catalogue reads/mutations/probes/Artifact serving fail with maintenance response; Services remain untouched. |
 
-`ok` reports command execution; `result.health` reports `healthy`, `degraded`, `unhealthy`, or `offline`. Requested checks return ordered entries with `id`, `status` (`pass|warn|fail|error|skipped`), stable `state`, `category`, `message`, `retryable`, `scope`, timestamps/duration, and redacted details. Partial/skipped work sets `partial:true`. Diagnostics exit `0` for complete healthy/degraded, `8` for trustworthy partial, and `10` for completed unhealthy.
+`ok` is execution; `result.health` is `healthy|degraded|unhealthy|offline`. Ordered checks contain id, `pass|warn|fail|error|skipped`, stable state/category/message/retryable/scope/time/duration/redacted details. Omitted/error/skipped requested work sets partial. Complete healthy/degraded exits 0; trustworthy partial 8; completed unhealthy 10.
 
-Required check IDs and stable states are exact:
+Required checks/states:
 
 | Check | Stable states |
 | --- | --- |
-| `sqlite.open` | `open`, `not_found`, `permission_denied`, `busy`, `io_error`, `not_database` |
-| `sqlite.application` | `matches`, `mismatch`, `unreadable` |
-| `sqlite.schema` | `supported`, `older_migration_required`, `newer_unsupported`, `invalid` |
-| `sqlite.quick` / `sqlite.integrity` / `sqlite.foreign_keys` | `ok`, `violations`, `not_run` |
-| `sqlite.wal` | `clean`, `frames_pending`, `checkpoint_blocked`, `wal_io_error`, `not_wal` |
-| `storage.intents` | `terminal`, `interrupted_resumable`, `interrupted_ambiguous`, `invalid_transition` |
-| `revision.path` | `present`, `missing`, `wrong_type`, `unexpected` |
-| `revision.manifest` | `valid`, `missing`, `parse_error`, `unsupported_version`, `catalogue_digest_mismatch` |
-| `revision.content` | `valid`, `missing_bytes`, `size_mismatch`, `digest_mismatch`, `unsafe_member`, `not_run` |
-| `storage.staging` | `clear`, `active`, `abandoned`, `unowned_or_ambiguous` |
-| `storage.quarantine` | `clear`, `retained`, `orphaned`, `purge_failed` |
-| `storage.backup_leases` | `active`, `expired_releasable`, `stale_ambiguous`, `invalid_scope` |
-| `storage.cleanup` | `ok`, `interrupted`, `candidate_failed`, `persistent_failure` |
-| `storage.filesystem` | `supported`, `read_only`, `cross_mount_layout`, `remote_or_unsupported`, `capability_failed` |
-| `storage.capacity` | `within_reserve`, `reserve_at_risk`, `reserve_breached`, `capacity_unknown` |
+| `sqlite.open` | `open|not_found|permission_denied|busy|io_error|not_database` |
+| `sqlite.application` | `matches|mismatch|unreadable` |
+| `sqlite.schema` | `supported|older_migration_required|newer_unsupported|invalid` |
+| `sqlite.quick|integrity|foreign_keys` | `ok|violations|not_run` |
+| `sqlite.wal` | `clean|frames_pending|checkpoint_blocked|wal_io_error|not_wal` |
+| `storage.intents` | `terminal|interrupted_resumable|interrupted_ambiguous|invalid_transition` |
+| `revision.path` | `present|missing|wrong_type|unexpected` |
+| `revision.manifest` | `valid|missing|parse_error|unsupported_version|catalogue_digest_mismatch` |
+| `revision.content` | `valid|missing_bytes|size_mismatch|digest_mismatch|unsafe_member|not_run` |
+| `storage.staging` | `clear|active|abandoned|unowned_or_ambiguous` |
+| `storage.quarantine` | `clear|retained|orphaned|purge_failed` |
+| `storage.backup_leases` | `active|expired_releasable|stale_ambiguous|invalid_scope` |
+| `storage.cleanup` | `ok|interrupted|candidate_failed|persistent_failure` |
+| `storage.filesystem` | `supported|read_only|cross_mount_layout|remote_or_unsupported|capability_failed` |
+| `storage.capacity` | `within_reserve|reserve_at_risk|reserve_breached|capacity_unknown` |
 
-Stable storage categories are `catalogue`, `schema`, `integrity`, `wal`, `content`, `operation_interrupted`, `missing_bytes`, `quarantine`, `lease`, `cleanup`, `filesystem`, `capacity`, `contention`, `permission`, and `internal`. Service reachability remains separate from storage health. The [diagnostics decision note](docs/research/2026-07-09-observatory-storage-diagnostics-recovery.md#check-taxonomy) retains the detailed mapping and rationale.
+Categories are `catalogue|schema|integrity|wal|content|operation_interrupted|missing_bytes|quarantine|lease|cleanup|filesystem|capacity|contention|permission|internal`. Service reachability is separate.
 
-Fail-closed gates are exact:
+Wrong/new/invalid/corrupt catalogue or unsupported private storage exposes no Entries and blocks writes/probes. Missing/corrupt Revision disables affected Revision and blocks byte additions. Interrupted Publish/cleanup blocks byte additions until classified. Reserve/cleanup failure blocks byte additions but permits healthy metadata/probes/intact reads/recovery. Checkpoint contention is degraded; WAL I/O blocks writes. Stale lease blocks cleanup only for named Revisions.
 
-- unavailable/wrong/new/invalid/corrupt catalogue or unsupported filesystem blocks catalogue writes/probes and exposes no Entries from untrusted authority;
-- missing/corrupt/invalid Revision bytes disables affected Revisions and blocks byte-adding writes pending reconciliation;
-- interrupted Publish/cleanup blocks byte additions until classified;
-- reserve breach/persistent cleanup failure blocks byte additions but permits healthy metadata, cleanup/recovery, probes, and intact reads;
-- checkpoint contention alone is degraded/retryable; WAL I/O/corruption blocks writes; and
-- stale leases block cleanup only for named Revisions.
+### Plan/apply and operation-specific recovery
 
-### Exact plan/apply contract
+Recovery preview is **non-destructive to catalogue authority and Artifact bytes**, but durably records plan and audit metadata. It returns plan ID, operation, exact selectors/identity/digest fingerprints, health generation, estimated bytes, availability effect, ambiguity/loss details, preconditions, rollback point, expiry, and confirmation. Apply accepts only the exact unexpired plan, rechecks fingerprints/preconditions before irreversible phases, never broadens, and records intent before effects. Resume continues only the same nonterminal intent. Locks are global for authority changes and per-Revision where sufficient. Crashes leave old or new complete authority.
 
-Recovery preview is read-only and creates a durable plan containing plan ID, exact identities/digests, health generation, operation, scope/effect/availability, estimated bytes, ambiguity/loss report, preconditions, confirmation, rollback point, and expiry. Apply accepts only that unexpired plan, rechecks every fingerprint/precondition, never broadens scope, and rejects changed state. Resume continues an existing nonterminal intent only.
+Operation semantics are exact:
 
-Every mutation runs through the daemon, records intent before effects, binds idempotency fingerprint, uses a global authority lock or per-Revision lock as appropriate, is crash-resumable, and appends audit. Missing paths are evidence only. Restart preserves old or new authority, never half-selected authority.
+- `reconcile`: sole automatic startup operation; completes only matching recorded Publish/cleanup/lease phases, resumes intact staging, quarantines malformed/mismatched/unreferenced owned bytes, never adopts them.
+- `quarantine`: marks committed Revision unavailable before same-filesystem move, preserves bytes/evidence, and requires preview/confirmation for available content.
+- `repair_catalogue_candidate`: requires readable catalogue with known Observatory application and schema identity; snapshots source, reconstructs only application-derivable structures/state under known schema, preserves source, and does not claim unknown-row repair.
+- `salvage_catalogue_candidate`: runs SQLite recovery into separate evidence, then accepts only records satisfying current schema, identity, constraints, and cross-resource validation; returns every accepted, rejected, lost, ambiguous, and synthesized record. Recovery rows never directly become authority.
+- `rebuild_catalogue_candidate`: starts empty current schema and uses valid manifests/content only for byte inventory. It identifies unrecoverable current selection, retention/pins, tombstones, audit, Services, Targets, Teardown Actions, and observations; no directory becomes visible automatically.
+- `validate_candidate`: runs application/schema, quick/integrity/foreign-key, intent, full manifest/content, uniqueness, tombstone, and referential checks plus exact loss/ambiguity details. Failures cannot be waived; resolutions create a new candidate/plan.
+- `activate_candidate`: requires fully passing candidate, offline maintenance, fresh exact plan, confirmation; durably stages, atomically selects catalogue/WAL unit, retains former catalogue/evidence, records activation. Rollback is a new validated activation plan.
+- `backup verify`: normal/deep behavior is defined in [section 12](#backup-crash-resume-cancel-and-privacy), returns exact missing/extra/mismatch outcomes, and never calls database-only input complete.
+- `restore_backup`: preview deep-verifies into isolated context and returns Entries/bytes/audit newer than backup that would be lost, opaque-ID conflicts, required source/candidate/rollback capacity, and exact cutover/rollback paths in redacted form. Apply uses offline gate, bytes-first/authority-last cutover, retains old authority/displaced bytes.
+- `discard`: sole irreversible storage operation. Exact preview lists IDs/digests/bytes/consequences/no-reference proof. Apply requires confirmation, unexpired plan, no lease/reference, durable intent. It cannot remove only/active catalogue, active candidate, live current Revision, or nonterminal evidence; early Artifact purge also enforces recovery contract.
 
-`reconcile` alone is automatic at startup and only follows matching intents. `quarantine` preserves evidence and marks committed bytes unavailable before moving them. Repair/salvage/rebuild create candidates. `validate_candidate` cannot waive failures. `activate_candidate` and `restore_backup` require full validation, offline maintenance, exact preview, `--yes`, authority-last cutover, and retained rollback material. `discard` is the sole irreversible storage operation and cannot remove active/only catalogue, live current Revision, active candidate/lease, or nonterminal-operation evidence.
-
-Audit covers health-gate changes, plans, all operation phases, reconciliation, quarantine, backup leases, candidates, activation/rollback, cleanup/discard, actor, IDs, before/after digests, bytes, errors, and durability phase. Diagnostics and logs redact absolute private paths, teardown argv, secret-bearing URLs, SQL/page/file content, and recovery rows.
+Every diagnostic gate change, plan, operation phase, reconciliation, quarantine, backup lease, candidate, activation/rollback, cleanup/discard, actor, IDs, digests, bytes, category, and durability phase is append-only audited. Private paths, argv, secret URLs, SQL/page/file/recovery-row content are redacted.
 
 ## 14. Network and security boundary
 
-Observatory is private and tailnet-only. The configured canonical HTTPS origin defaults to `https://desktop.greyhound-chinstrap.ts.net/`; port 443 is recommended and omitted. Another MagicDNS host/HTTPS port is a deployment migration; non-443 origins include the port. Old-origin redirects are not required.
+Observatory is private/tailnet-only. Canonical HTTPS origin defaults to `https://desktop.greyhound-chinstrap.ts.net/`; 443 is recommended/omitted. Another MagicDNS host/port is explicit migration and old-origin redirects are not required. Backend binds loopback only; local port is independently configurable and absent from public links. Exact origin must match active Serve host/port or setup blocks/diagnoses without guessing.
 
-The backend MUST bind loopback only. The local port is independently configurable and never appears in public Observatory URLs. Setup MUST verify exact active Serve host/port and reject or prominently diagnose mismatch; it MUST NOT guess.
+Deployment owns only canonical host/port root Serve handler to loopback. Setup inspects, refuses conflicts/matching-unowned adoption, preserves unrelated handlers, and verifies exact post-state. Ordinary daemon startup is Serve-read-only. Remove only receipt/live-tuple proven ownership. Observatory never owns Service handlers.
 
-The deployment owns only the root Serve handler for the canonical host/port, proxying to the loopback backend. Setup inspects state, refuses unrelated conflicts, preserves unrelated handlers, and verifies the result. Ordinary requests/startup only read Serve state. Teardown removes only a handler whose ownership fingerprint still matches. Observatory never owns Service Target handlers.
+Tailscale is sole remote authentication boundary, but membership alone is insufficient. Explicit least-privilege grant permits intended humans/agent devices to node HTTPS port; Will is default human principal and tagged/headless agents need explicit grant. Authorized principals receive full capabilities. There are no Observatory accounts/login/cookies/passwords/API keys/roles.
 
-Tailscale is the sole remote authentication boundary, but tailnet membership alone is insufficient. Deployment MUST use an explicit least-privilege Tailscale grant for intended operator identities/agent devices to the Observatory node and HTTPS TCP port. Will's identity is the default human principal; tagged/headless agents need explicit grants. Authorized principals receive the full Observatory capability set.
+Loopback prevents LAN/tailnet bypass and forged Serve headers. Identity headers may attribute but are not second authorization. Browser mutations enforce [section 9](#browser-mutation-inventory). Funnel/public and LAN-only/non-tailnet clients are prohibited. Certificate Transparency name disclosure is accepted.
 
-There are no Observatory accounts, login, cookies, password database, API keys, or roles. Backend loopback prevents LAN/tailnet bypass and forged Serve headers. Serve identity headers MAY support attribution but are not second authorization; local host processes are inside the machine boundary. Browser mutation routes MUST validate canonical Host and same-origin requests.
+Service Targets are independent origins; operator owns grants/TLS/auth/ports/proxy correctness. Root-oriented Service uses its own root Serve mount, not Observatory path. Canonical Service release validation proves actual loopback bind, root routes, public HTTPS origin/forwarded handling, live transport from host+remote client, and persistent Serve restart/rollback. Unmodified Sideshow 0.7.0 fails bind/origin and is not canonical.
 
-Tailscale Funnel and public exposure are prohibited. LAN-only and non-tailnet clients are unsupported. Enabling Tailscale HTTPS exposes the certificate name through Certificate Transparency; this is accepted.
+## 15. Implementation, bootstrap, and supervision
 
-Service Targets are independent direct origins. Their operator owns grants, TLS, authentication, ports, and proxy correctness. A root-oriented Service MUST use its own root Serve mount, not a path below Observatory. Before calling a Service URL canonical, application-specific release validation MUST prove loopback bind, root routes, correct public HTTPS origin/forwarded handling, live transport from host and remote tailnet client, and persistent Serve restart/rollback behavior. Unmodified Sideshow 0.7.0 fails loopback bind and external-origin handling and MUST NOT be the canonical example.
+### Chosen stack and runtime
 
-## 15. Implementation, packaging, and supervision
+One Rust Cargo binary `obs` uses Tokio+axum, clap, serde, rusqlite with pinned bundled upstream SQLite/backup, Observatory-owned rustix Linux filesystem deep module, and reqwest default-disabled with rustls/web-PKI roots. It embeds Project-led HTML/CSS/ES modules; no Node/Bun/npm/SPA/client router/runtime. Static build-ID assets get one-year immutable cache/strong ETag; UI/API are `no-store`.
 
-Observatory MUST be one Rust Cargo binary, `obs`, using:
+Tokio starts with four worker and at most four blocking threads plus bounded queues. Load evidence MAY reduce either fixed limit; it MUST NOT use host-CPU-derived defaults or unbounded blocking. Probe bounds remain independent. Daemon takes `$XDG_RUNTIME_DIR/observatory/daemon.lock`; second exits before domain effects. Normal commands never autostart.
 
-- Tokio + axum;
-- clap;
-- serde;
-- rusqlite with pinned bundled upstream SQLite and backup support;
-- an Observatory-owned rustix Linux filesystem deep module; and
-- reqwest with default features disabled and rustls/web-PKI roots.
+Release target is pinned/locked `x86_64-unknown-linux-gnu`; desktop baseline is kernel 7.0.14, glibc 2.43, Rust 1.96.1, systemd 261, Tailscale 1.98.8, local btrfs. Build glibc baseline is no newer than 2.43. Bundle includes stripped binary, symbols, SHA-256 manifest, detached signature, signed provenance binding source/lock/toolchain/target/command, SBOM, licenses/notices, and passing format/Clippy/tests/dependency/vulnerability/cargo-deny.
 
-The binary embeds the Project-led HTML/CSS/ES-module frontend at compile time. There is no Node, Bun, npm, SPA framework, client router, or production frontend runtime. `/_static/<build-id>/` uses a full-asset content build ID, immutable one-year caching, and strong ETags. UI shell/API use `Cache-Control: no-store`. Server-rendered core navigation works without JavaScript.
+### Local bootstrap authority
 
-`obs serve` uses four Tokio workers, at most four blocking threads, bounded filesystem/SQLite queues, and independently bounded probes. The daemon lock is `$XDG_RUNTIME_DIR/observatory/daemon.lock`. The default backend is `http://127.0.0.1:3773`; `--server` remains authoritative and normal commands never auto-start the daemon.
+Exactly these eight leaves may run without daemon:
 
-Release only pinned, locked `x86_64-unknown-linux-gnu` initially. The declared desktop baseline is kernel 7.0.14, glibc 2.43, Rust 1.96.1, systemd 261, Tailscale 1.98.8, 60 GiB RAM, and local btrfs home storage; the build's glibc baseline MUST be no newer than 2.43. A release includes stripped binary, separate symbols, SHA-256, signed provenance, SBOM, licenses, and passing formatting, Clippy, tests, dependency/vulnerability, and cargo-deny checks. Install versions atomically under XDG-adjacent user paths, select through `current`, and keep the previous version through health verification.
+```text
+obs system setup check
+obs system setup apply --yes
+obs system setup remove --yes
+obs system setup uninstall --yes
+obs system service status
+obs system service start
+obs system service stop --yes
+obs system service restart --yes
+```
 
-`system setup apply --yes` alone installs/updates the user unit, reloads/enables/starts it, verifies loopback health, then owns the one Serve root after conflict checks. Missing linger is a failed precondition with an operator command; Observatory MUST NOT run sudo/loginctl. Unrelated failed units do not block Observatory.
+They use common output envelope with `authority:"local_setup"`; `--server` is usage error. Capability allowlist permits release verification/compatibility; private install/config/unit/lock/receipt files; fixed `systemctl --user`; fixed noninteractive handler-specific Tailscale status/mutation; bounded loopback `/api/v1/system/health`; canonical HTTPS check; redacted process/socket/journal metadata.
 
-The generated systemd user unit policy is exact:
+Adapter MUST NOT import/call SQLite factory/catalogue repository, Revision/staging/quarantine/backup/candidate/recovery modules, domain dispatcher/mutation services, or authority discovery helpers. It MUST NOT open/inspect catalogue, WAL/SHM, Revisions, backups, candidates, staging, or quarantine. Daemon alone creates/opens data root, migrates/reconciles/diagnoses/recovers/backs up/cleans/serves.
+
+### External release trust and activation
+
+First install begins outside bundle: operator verifies complete bundle SHA-256, signature, provenance against published identity/pinned key before running it. Candidate repeats consistency/digest/signature/provenance-subject/target/version checks as defense in depth. Bare/incomplete bundle, symlink/non-regular/unexpected hard link, mismatch, unsupported target/provenance fails.
+
+Exact first journey is download/unpack; externally verify; `./obs system setup check --json`; resolve preconditions; `./obs system setup apply --yes --idempotency-key <unique-key>`; then use `~/.local/bin/obs`. No download/package-manager/sudo/system service.
+
+Install layout is:
+
+```text
+$HOME/.local/lib/observatory/versions/.staging-<version>-<operation-id>/{obs,release.json}
+$HOME/.local/lib/observatory/versions/<version>/{obs,release.json}
+$HOME/.local/lib/observatory/current -> versions/<version>
+$HOME/.local/lib/observatory/install-state.json
+$HOME/.local/bin/obs -> ../lib/observatory/current/obs
+```
+
+Activation validates user/HOME/ownership/permissions/target/glibc; copies verified members to unique staging; rehashes/rechecks provenance; sets private permissions; syncs files/directory; atomically renames to version and syncs versions; atomically replaces temporary relative `current` symlink and syncs parent; atomically creates relative stable command; resolves links/verifies digest. Same verified version may reuse; same version/different bytes is `ownership_conflict`. Prior version survives health and at least one later activation; never remove only rollback candidate.
+
+### XDG creation, setup lock, and receipts
+
+`setup check` creates nothing. `setup apply` may create config directory/file, runtime coordination, install state, selector, receipt, unit; daemon startup alone creates data root. XDG paths are absolute. Runtime is user-owned local `0700`; invalid/missing is hard precondition.
+
+Every mutating local leaf creates runtime subdirectory `0700`, acquires exclusive `setup.lock` within five seconds, or returns retryable contention without mutation. Check/status are lock-free snapshots and show `snapshotStable:false` during setup. Setup never takes daemon lock.
+
+Non-TTY local mutations require supplied idempotency; TTY may generate/display. `install-state.json` records non-secret install/operation/key/fingerprint, current/prior releases/digests, unit/config digest/schema, loopback/origin, owned Serve tuple/fingerprint, phase/result/partial/rollback. Temporary write + file sync + atomic rename + parent sync. Receipt proves deployment ownership only.
+
+### Exact setup check and apply
+
+`setup check` returns ordered checks/actions for:
+
+1. complete bundle digest/signature/provenance/self-check/target;
+2. non-root matching UID/home/no sudo-derived target;
+3. absolute XDG/protected runtime;
+4. destination ownership/permissions/filesystem/capacity;
+5. versions/current/stable command/receipt;
+6. candidate/prior schema compatibility metadata;
+7. config parsing/precedence/loopback/storage/config-migration preview;
+8. prospective storage parent support without opening/creating storage;
+9. setup-lock occupancy;
+10. systemd user manager;
+11. linger;
+12. exact unit digest/drift/enable/active;
+13. MainPID/cgroup/executable/last failure;
+14. loopback occupancy/daemon health identity;
+15. Tailscale CLI/daemon/login/node DNS/HTTPS/Funnel exclusion;
+16. Serve JSON classification;
+17. root absent/owned/matching-unowned/conflict;
+18. canonical-origin host/port agreement; and
+19. external tailnet-grant verification requirement.
+
+It creates nothing and does no writable probe. Missing linger blocks with argv-safe operator command but never invokes sudo/loginctl. Unrelated failed units warn only.
+
+`setup apply --yes` order is setup lock/replay; full recheck; refuse foreign/ambiguous conflicts before writes; durable candidate stage; record rollback state; create defaults or exact atomic config migration; install exact unit/reload; explicitly enable; atomically activate candidate; start/restart only owned unit; bounded exact loopback build/API/reconciliation/migration/listener/health gate; re-read and add only absent/owned Serve root; verify Serve JSON and canonical HTTPS; sync terminal receipt.
+
+Only `/api/v1/system/health` is queried locally. Permitted storage/Tailscale-only degraded may warn; unhealthy/offline fails deployment objective but preserves diagnostic daemon. Local health commits installation; later Tailscale failure yields trustworthy partial exit 8 with Serve pending, not rollback. Preexisting root conflict blocks before local mutation; late conflict preserves healthy local install and root.
+
+### systemd and Serve ownership
+
+Generated unit is exact:
 
 ```ini
 [Unit]
 Description=Observatory catalogue and Artifact server
 StartLimitIntervalSec=60
 StartLimitBurst=5
-
 [Service]
 Type=exec
 ExecStart=%h/.local/lib/observatory/current/obs serve
@@ -566,138 +863,127 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-
 [Install]
 WantedBy=default.target
 ```
 
-The unit MUST log to journald. It MUST omit `ProtectHome`, `PrivateTmp`, syscall filters, `DynamicUser`, restricted working directory, and `ProtectSystem=strict`, because those conflict with Project/source access required by Publish and Teardown. The [stack decision note](docs/research/2026-07-09-observatory-implementation-stack.md#systemd-user-supervision) retains the rationale.
+It omits incompatible home/tmp/syscall/dynamic-user/strict-system restrictions and logs stderr to journald. Apply reloads/enables/starts; service start requires installed owned unit and does not enable/install; stop verifies inactivity and leaves Serve/data; restart verifies exact selected build/API; status is inert. Clean stop does not restart; failure waits five seconds, max five starts/60 seconds. SIGTERM stops dispatch, finishes short transactions, cancels probes, leaves resumable long intents, bounded checkpoint, closes within 30 seconds.
 
-Startup order is configuration; private runtime/lock; storage/SQLite classification; application/schema validation and backup-gated migration; intent reconciliation; health gates; loopback bind/readiness; background workers; read-only Serve state. `/api/v1/system/health` appears only after classification/reconciliation and reports build/API, storage, migration, recovery, worker, and Tailscale state without private paths.
+Serve ownership tuple is canonical MagicDNS host + HTTPS port + root `/` + loopback target. States are `absent|owned_exact|matching_unowned|conflicting|unknown`; only absent/owned exact mutate. Never adopt matching unowned, reset whole config, touch Funnel/grants/other handlers. Apply mutates last and verifies unrelated state. Remove requires receipt+live tuple.
 
-Tailscale failure is degraded, not fatal. Untrusted catalogue authority is offline and exposes diagnostics but no Entries. SIGTERM stops dispatch, finishes short transactions, cancels probes, leaves resumable long intents, checkpoints when bounded/safe, closes listener/database, and exits within 30 seconds. A clean stop does not restart; failures follow the bounded restart policy.
+### Upgrade, rollback, remove, uninstall
 
-Update activation is atomic and health-checked. Pre-migration failures MAY roll back the executable. Post-migration automatic executable rollback is allowed only when the prior binary supports the resulting schema. Data restore is always a separate previewed, confirmed offline recovery. Structured stderr logs go only to journald and follow diagnostics redaction.
+Only daemon migrates catalogue after complete verified backup. Bootstrap observes health only. Config migration previews exact fields/restart, retains versioned backup, temporary validate/atomic replace/sync, fails unknown fields, retains config on remove/uninstall.
+
+Executable rollback is automatic only before migration commit or when prior binary supports resulting schema. Uncertain/incompatible post-migration failure keeps candidate selected/prior executable+backup, sets `automaticRollbackAllowed:false`, and directs daemon diagnostics/recovery. Bootstrap never restores data.
+
+`setup remove` locks/rechecks, refuses drifted root, removes exact owned root, stops/disables unit, removes matching unit/reloads/verifies, and retains versions/current/stable command/config/all data plus tombstone receipt. `setup uninstall` first removes, then deletes only verified stable symlink/current/version/receipts while retaining config and full data root. Neither opens/purges data; foreign nominal path is conflict. Repeated remove is verified unchanged success.
 
 ## 16. Configuration, defaults, errors, and health
 
-Configuration precedence is field-by-field: CLI, environment, `config.toml`, built-in default. Configuration is secret-free and does not live-reload; changes require restart. `SIGHUP` reports reload unsupported and changes nothing.
+Configuration precedence is CLI, environment, `config.toml`, built-in default per field. Secret-free; no live reload; restart required; SIGHUP states unsupported.
 
-### Paths and configuration
+```toml
+[server]
+listen = "127.0.0.1:3773"
+canonical_origin = "https://desktop.greyhound-chinstrap.ts.net/"
+[storage]
+path = "/home/will/.local/share/observatory"
+max_stored_bytes = 0
+max_live_artifacts = 0
+[service]
+teardown_timeout_ms = 30000
+[client]
+server = "http://127.0.0.1:3773"
+timeout_ms = 30000
+```
 
-| Purpose | Exact value/default |
+| Field | Type | Unit/range |
+| --- | --- | --- |
+| `server.listen` | string | loopback socket only |
+| `server.canonical_origin` | string | absolute HTTPS origin, trailing `/` |
+| `storage.path` | string | absolute supported local path |
+| `storage.max_stored_bytes` | unsigned integer | bytes; 0 unlimited |
+| `storage.max_live_artifacts` | unsigned integer | count; 0 unlimited |
+| `service.teardown_timeout_ms` | unsigned integer | 1000..300000 ms |
+| `client.server` | string | absolute HTTP(S), no credentials/fragment |
+| `client.timeout_ms` | unsigned integer | 1..3600000 ms |
+
+Environment is exactly `OBS_LISTEN`, `OBS_CANONICAL_ORIGIN`, `OBS_STORAGE`, `OBS_MAX_STORED_BYTES`, `OBS_MAX_LIVE_ARTIFACTS`, `OBS_TEARDOWN_TIMEOUT_MS`, `OBS_SERVER`, `OBS_CLIENT_TIMEOUT_MS`. Serve flags map to daemon fields. Client endpoint precedence is `--server`, `OBS_SERVER`, `client.server`, default.
+
+Paths:
+
+| Purpose | Path |
 | --- | --- |
 | Config | `${XDG_CONFIG_HOME:-$HOME/.config}/observatory/config.toml` |
-| Data root | `${XDG_DATA_HOME:-$HOME/.local/share}/observatory/` |
-| Runtime | `$XDG_RUNTIME_DIR/observatory/` (`0700`; XDG runtime must be absolute, user-owned, protected) |
-| Daemon lock | `$XDG_RUNTIME_DIR/observatory/daemon.lock` |
-| Versions | `$HOME/.local/lib/observatory/versions/<version>/obs` |
-| Active selector | `$HOME/.local/lib/observatory/current` |
-| User command | `$HOME/.local/bin/obs` |
-| systemd unit | `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/observatory.service` |
-| Daemon fields | `OBS_LISTEN`, `OBS_CANONICAL_ORIGIN`, `OBS_STORAGE` |
-| Client endpoint precedence | `--server`, `OBS_SERVER`, `client.server`, `http://127.0.0.1:3773` |
+| Data | `${XDG_DATA_HOME:-$HOME/.local/share}/observatory/` |
+| Runtime/locks | `$XDG_RUNTIME_DIR/observatory/` |
+| Versions/current | `$HOME/.local/lib/observatory/{versions,current}` |
+| Stable command | `$HOME/.local/bin/obs` |
+| Unit | `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/observatory.service` |
 
-Relative XDG/storage paths and non-loopback listeners are invalid. Storage directories are `0700` with no group/other access.
+Behavioral defaults: Artifact 30 days; recovery seven days; normal history older than seven days and outside five newest; no ceilings; reserve greater of 1 GiB/5%; probes 60 seconds ±10%, deadline five seconds/no retry/no redirect/current two minutes; Service grace seven days/cleanup hourly; probe concurrency 16/2/1; teardown 30 seconds; client wait 30 seconds; systemd 5 seconds/max five per 60/grace 30; static cache one year immutable, shell/API no-store.
 
-### Behavioral defaults
+CLI exits are 0 success/replay/cancelled; 2 usage/validation/confirmation; 3 not-found/gone; 4 conflict/precondition; 5 daemon/destination unavailable/client timeout; 6 contention/maintenance/queue; 7 source changed; 8 trustworthy partial or zero-success fan-out; 9 trustworthy teardown failure/timeout; 10 capacity/unhealthy/internal/verification.
 
-| Setting | Default/required value |
-| --- | --- |
-| Canonical origin | `https://desktop.greyhound-chinstrap.ts.net/` |
-| Backend/listen | `http://127.0.0.1:3773` / `127.0.0.1:3773` |
-| CLI client timeout | 30 seconds |
-| Artifact retention | 30 days |
-| Artifact recovery window | 7 days |
-| Normal superseded history | older than 7 days and outside 5 newest superseded Revisions |
-| Size/file/Artifact ceiling | none by default |
-| Free-space reserve | greater of 1 GiB or 5% filesystem |
-| Probe schedule | every 60 seconds, up to 10% jitter |
-| Probe deadline/retry/redirect | 5 seconds / none / do not follow |
-| Current observation age | at most 2 minutes |
-| Service all-offline grace | 7 days |
-| Service cleanup | at least hourly |
-| Probe concurrency | 16 global, 2/destination host, 1/Target |
-| Tokio concurrency | 4 workers, at most 4 blocking threads |
-| systemd restart | 5 seconds; max 5 starts/60 seconds |
-| Graceful stop | 30 seconds |
-| UI static cache | 1 year, immutable; shell/API `no-store` |
+Stable errors include `already_exists`, `confirmation_required`, `precondition_required`, `changed_record`, `idempotency_conflict`, `idempotency_in_progress`, `client_timeout`, `contention`, `source_changed`, `teardown_failed`, `capacity`, `not_found`, `gone`, plus backup `unsafe_destination`, `unsupported_destination`, `capability_failed`, `destination_exists`, `staging_collision`, `destination_changed`, `destination_unavailable`, `verification_failed`, `backup_incomplete`, `catalogue_only`, `backup_completed`, `cancelled`, and setup `setup_precondition`, `provenance_invalid`, `ownership_conflict`, `unit_failed`, `health_timeout`, `daemon_identity_mismatch`, `schema_rollback_unsafe`, `tailscale_unavailable`, `serve_conflict`.
 
-### CLI exit and error categories
-
-| Exit | Stable meaning/examples |
-| ---: | --- |
-| 0 | success, including unchanged idempotent replay |
-| 2 | usage, validation, unsafe input, `confirmation_required` |
-| 3 | `not_found` or `gone` |
-| 4 | strict-create/idempotency/record `conflict`, including `already_exists` or `changed_record` |
-| 5 | daemon `unavailable` or `client_timeout` |
-| 6 | bounded `contention` exhausted |
-| 7 | `source_changed` |
-| 8 | ordered `partial` batch/probe/diagnostic result |
-| 9 | `teardown_failed` or teardown timeout; Service preserved |
-| 10 | `capacity`, unhealthy storage, or completed diagnostics reporting unhealthy |
-
-Errors MUST keep stable code, human message, retryable boolean, and structured details. At minimum, settled codes include `already_exists`, `confirmation_required`, `client_timeout`, `contention`, `source_changed`, `teardown_failed`, `capacity`, `not_found`, `gone`, and `changed_record`.
-
-Storage health is exactly `healthy`, `degraded`, `unhealthy`, or `offline`, separate from command `ok`. Service reachability is exactly `online`, `offline`, `unknown`, or `stale` and MUST NOT be conflated with storage health or application health.
+Storage health is `healthy|degraded|unhealthy|offline`; Service reachability is `online|offline|unknown|stale`; setup local health additionally may be `unavailable`. These do not conflate with command `ok`.
 
 ## 17. Implementation acceptance criteria
 
-Implementation acceptance requires all rows below. Each test MUST exercise human and JSON behavior where applicable, assert server-returned URLs, and verify no settled authority boundary is crossed.
+Implementation MUST ship shared fixtures through application service, HTTP API, CLI adapter, and applicable UI/local bootstrap adapter.
 
-| Contract | Required acceptance evidence |
-| --- | --- |
-| Domain/Project/identity | Canonical-path equivalence, Project creation/move/tombstone, Service name NFC/case rules, 26-character random IDs, non-reuse, slug normalization/collision/rename redirects, `404` versus `410`. |
-| Artifact Publish | Single-file/directory entry precedence, `.obs.json`, MIME/nosniff, byte identity, dotfiles, relative assets, no fallback/listing, warning/block split, strict create/replace, immutable/stable URLs. |
-| Filesystem safety/import | Every rejected inode/path form, no-follow traversal, source-race detection, explicit ordered import, no discovery/live link/path persistence, advisory duplicates, per-entry atomic partial retry. |
-| Service | Strict registration/update, one primary Target, atomic primary replacement, direct Open, alternatives only in details, removal without process effect, teardown success/failure/timeout/concurrent-change safeguards. |
-| Routes/API | All six namespaces, absolute redirect/canonicalization/query rules, hostile encoding/traversal corpus, arbitrary bundle segments, API v1 exactness/no unversioned redirect, cache headers, URL fields never client-derived. |
-| CLI | Complete B help tree including recovery extensions, project resolution, human stdout/stderr, one-value JSON envelopes, exits 0/2–10, non-TTY confirmation, idempotent replay/conflict/unknown commit retry, ordered partials, daemon unavailable/second-daemon behavior. |
-| Ledger/browser | Approved Project-first hierarchy and orders/filters/search; all Artifact/Service states; direct Service Open; separate details; no embedded preview; no-JavaScript core flow. Test Chromium, keyboard-only, screen-reader semantics, reduced motion, contrast, 200% zoom/reflow, and mobile cards/navigation on phone viewport and real tailnet phone. |
-| Artifact lifecycle | All retention modes/deadline transitions, recovery/restore/early purge, `410`, Revision age+count rule, pressure order, reserve/limits, pin/current protection, preview, per-candidate failures, audit completeness. |
-| Service liveness | Host-vantage method/status semantics, startup/scheduled/immediate/manual probes, exact state ages, version invalidation/late discard, all-offline grace/reset/keep/pin/unpin, fresh cleanup confirmation, shared bounds/coalescing/partial isolation. |
-| Persistence | SQLite constraints/policy, exact layout/permissions, manifest digest, same-filesystem enforcement, Publish and cleanup visibility ordering, intent recovery/quarantine, backup leases and complete backup, migration gates/candidates/authority cutover. |
-| Diagnostics/recovery | Every profile/check/state/category; health versus ok; redaction; availability gates; partial order; preview fingerprint expiry/change; apply/resume idempotency; reconcile limits; candidate loss reports; activate/restore/discard/rollback locks, confirmations, audit, and crash boundaries. |
-| Security/network | Loopback-only rejection, Host/same-origin browser mutation checks, explicit Tailscale grant from host and remote intended client, denied ungranted/LAN/public client, no Funnel, Serve conflict/preservation/ownership, no Service proxy, direct Target authorization independence. |
-| Deployment | XDG precedence/invalid paths/no reload, embedded assets, release contents/activation, setup/linger/unit, startup/readiness/degraded modes, SIGTERM/restart limits, update/migration/rollback/logging/Tailscale outage. |
+### Public control-plane fixtures
 
-The six stack spike gates are mandatory:
+1. **Identity/URLs:** uppercase ID API `422`; stale browser slug/ID one `308`; unknown `404`; tombstone `410`; canonical-directory equivalence; only server-returned URLs; no client construction.
+2. **Project lifecycle:** resolve unregistered allocates nothing; register once/conflict; move incomplete/changed enumeration atomic failure; successful new Project/Service IDs, old `410`, observations unknown, no teardown, Artifact association/URL unchanged; nonempty tombstone conflict; empty permanent gone.
+3. **ETag/idempotency:** GET ETag; mutation missing `428`, stale `412`; new key once; same exact replay + header; changed fingerprint conflict; disconnect retry one effect; concurrent duplicate no duplicate.
+4. **Batch:** mixed and zero-success both HTTP 200/`ok:true`/stdout/ordered, exact overall/partial/counts/exit 8; successful sibling remains; empty malformed is `ok:false` stderr/422/exit 2; per-entry import fields/retention override/warnings/duplicate/error/cleanup error asserted.
+5. **Target URL corpus:** accept `https://host.example/`, loopback port/path, bracketed IPv6+ordinary query, encoded space; reject ftp, relative, userinfo including empty, fragment, every forbidden credential query case/encoding, invalid escape, raw backslash, control/CRLF/NUL, ports 0/65536, malformed host. Assert no rejected credential reaches probe/log/diagnostic.
+6. **Teardown:** unavailable/missing directory/launch/nonzero/signal/default+override timeout/concurrent update preserve; only unchanged exit 0 tombstones; output bound/escape/truncation; known failure `ok:true` exit 9.
+7. **Artifact lifecycle/capacity:** every retention transition/recovery/410/restore/early plan; live ceiling blocks create not replace; stored ceiling counts every defined Revision/staging state; reserve boundary; pressure protections; every capacity field.
+8. **Browser security:** every allowed mutation with no-JS and JS parity; excluded mutations absent; GET inert; exact confirmation tier; stale ETag/token, wrong Host/Origin/Referer/Fetch Metadata, missing/expired/replay CSRF fail; success 303 canonical; Open distinctions; keyboard/focus/announcement/reflow/mobile/reduced-motion.
+9. **Diagnostics/recovery:** unhealthy complete `ok:true` exit10; skipped partial exit8; no trustworthy context `ok:false`; preview changes no authority/bytes but writes plan/audit; stale/broadened apply rejects; one-intent resume; repair readable known schema gate; salvage record-validation outcomes; rebuild unrecoverable fields; full candidate validation; exact activate/restore/discard confirmations/loss/conflict/capacity/reference boundaries; backup normal/deep/catalogue-only.
+10. **Adapter parity:** every multi-adapter mutation has same normalized operation/IDs/version/fingerprint/validation/audit/resource/URLs/error; no adapter-specific lifecycle.
+11. **API inventory:** exercise every listed method/path, media/cache/schema/ETag/status/exit/pagination/cursor/filter/order; assert Artifact byte GET excluded; assert no setup/service-manager remote endpoint or alias. Configuration validation accepts TOML content, returns ordered parse/schema/semantic checks, mutates nothing, and rejects accidental precondition/idempotency requirements.
+12. **CLI inventory:** snapshot every leaf/option/help/global selector/stdout/stderr/envelope/exit/confirmation/key behavior; exactly eight local leaves; all others daemon-only; `--server` rejected locally. Config validation requires a safe local regular FILE, sends no path, has no stdin mode, never activates, and fails exit 5 without daemon.
 
-1. **Adversarial walker races:** symlink swaps, renamed parents/children, mount crossings, unusual inode types, and concurrent source changes prove no escape, follow, unsafe copy, descriptor leak, or overwrite.
-2. **Crash and fault injection:** fail after every transaction, sync, rename, WAL, migration, backup, cleanup, activation, and shutdown boundary; inject partial writes, I/O/full-disk/busy/checkpoint failures; restart reaches only a valid settled state or specified gate.
-3. **Every-connection SQLite policy:** every connection creation/reuse/failure/replacement proves pinned engine, application/schema identity, foreign keys, WAL, `synchronous=FULL`, and bounded busy behavior before use.
-4. **Tokio thread policy and load:** prove four-worker/four-blocking limits and bounded queues under reads, streaming, Publish, cleanup, probes, cancellation, and shutdown; record CPU/RSS/thread/latency evidence.
-5. **systemd/package/Serve integration:** test real user-manager setup, linger, lifecycle, SIGTERM/SIGKILL recovery, restart limits, journald, activation, health, migration backup, compatible/incompatible rollback, unrelated Serve preservation, root conflict, tailnet outage, and deployed Tailscale behavior.
-6. **Target ABI/static options:** test the released glibc binary on declared baseline and desktop, inspect linkage, and prove bundled SQLite and rustls. Other targets remain unsupported pending equivalent matrices.
+### Persistence, backup, and bootstrap fixtures
 
-A failed acceptance test is implementation work under this specification. It becomes a new planning decision only when satisfying the test requires changing a fixed contract.
+- Fault Publish/cleanup after every intent/transaction/copy/digest/sync/rename/visibility/tombstone phase and prove only complete bytes or explicit unavailable state.
+- Backup accepts only btrfs/ext4/XFS after every probe step; rejects every listed unsupported class; races mount/parent/symlink/bind/final leaf; proves no-replace/no overwrite and 0700/0600.
+- Concurrent Publish/replace/quarantine/cleanup during snapshot proves snapshot=lease=manifest=destination set; leased cleanup blocked exactly; corrupt workspace receipts never override SQLite.
+- Fault backup after every snapshot/lease/create/write/digest/file sync/directory sync/manifest/marker/rename/parent sync/SQLite-completion boundary; inject short writes/EINTR/ENOSPC/quota/EIO/removal; only absent or one valid final bundle.
+- Independently corrupt catalogue/Revision manifest/content/top manifest/marker, add/remove/link members, and require creation deep rehash. Freeze byte-identical format-v1 fixtures.
+- Replay/cancel/resume at every backup phase; require ETag cancel, completed race semantics, 24-hour abandonment, exact evidence rehash, ambiguous staging no deletion, final backup no retention cleanup.
+- Exhaust source/destination/restore capacity around exact reserves; budget live+candidates+rollback; reject unsupported/incomplete/changed/overlap restore; reverify private copy; detect loss/ID conflicts; crash before/after authority selection; explicit rollback only.
+- Privacy snapshots assert no prohibited absolute path/metadata/content in remote API, manifest, audit, logs, diagnostics, errors; local CLI echoes only own destination.
+- Empty-machine setup check creates nothing; invalid provenance/XDG/runtime/linger/foreign unit/port/root fails before effects; matching-unowned root not adopted; missing linger command not executed.
+- First apply requires confirmation/key, bounded setup lock, exact staged/synced activation/config/unit/enable/start/health/Serve-last order; daemon alone creates data; repeated unchanged; changed key conflicts.
+- External trust fixtures reject bare/substituted release and prove external verification plus self-check, checksum/provenance, target, link/digest activation, rollback version retention.
+- Capability/dependency tests prove bootstrap cannot link/call/open domain/storage modules/files and queries only loopback health.
+- Remote intended grant succeeds; ungranted tailnet, LAN, public fail; loopback unreachable; no Funnel; unrelated Serve unchanged.
+- Service stop/start/restart/status semantics, SIGKILL startup phases, five/60 limit, bounded reset, unrelated unit behavior.
+- Upgrade covers no migration, compatible migration, incompatible/uncertain rollback, daemon-only backup+migration, prior retained, no unsupported old binary.
+- Foreign/partial states are never killed/adopted/overwritten. Remove/uninstall retain exact data/config sets, block drift, preserve unrelated handlers, and permit verified reinstall.
+
+### Six implementation gates
+
+1. **Adversarial walker races:** symlink swaps, renamed parents/children, mount crossings, unusual inode types, concurrent source changes; no escape/follow/unsafe copy/descriptor leak/overwrite.
+2. **Crash/fault injection:** fail every transaction, sync, rename, WAL, migration, backup, cleanup, activation, shutdown; partial writes, I/O/full disk/busy/checkpoint; restart reaches valid state/gate.
+3. **Every-connection SQLite policy:** every create/reuse/failure/replacement proves pinned engine, application/schema, foreign keys, WAL, FULL sync, bounded busy before use.
+4. **Tokio load policy:** test initial four/four and evidence-approved reductions, bounded queues under reads/stream/Publish/cleanup/probes/cancel/shutdown; record CPU/RSS/threads/latency; never host defaults.
+5. **systemd/package/Serve:** real user manager, linger, lifecycle, SIGTERM/SIGKILL, limits, journal, activation, health, migration backup, rollback, Serve preservation/conflict, tailnet outage, pinned Tailscale schema.
+6. **Target ABI/static options:** released glibc binary on baseline/desktop, linkage, bundled SQLite/rustls; every other target unsupported pending equivalent matrix.
+
+Failed gate is implementation work under this contract unless satisfying it requires changing a fixed decision.
 
 ## 18. Deferred work and unsupported configurations
 
-Explicitly deferred:
+Deferred: production implementation/install/deployment/current AGENTS onboarding; Sideshow bind/origin fix; producer adapters; application-specific Service release work; multi-user roles/auth; distributed storage; old-origin redirects; incompatible API v2; external release-signing identity/tooling execution; proof gates in section 17.
 
-- production implementation, installation, deployment, and current `AGENTS.md` onboarding;
-- fixing Sideshow loopback/public-origin behavior;
-- producer-specific conversion/snapshot adapters;
-- application-specific Service release checks beyond Observatory's generic contract;
-- multi-user authorization, roles, and separate application authentication;
-- multi-host replication/distributed storage;
-- old-origin redirects after deployment migration; and
-- new incompatible API versions.
-
-Unsupported:
-
-- public internet/Funnel and LAN-only/non-tailnet clients;
-- backend listeners outside loopback;
-- remote/network or cross-mount storage where the atomic protocol applies;
-- filesystem discovery, source links, project-root crawling, live imports, or move/delete-source import;
-- Service proxying, automatic Target fallback, automatic external runtime action, or Service health claims;
-- generic file browsing, directory listing, SPA fallback, and embedded catalogue previews;
-- unmodified Sideshow 0.7.0 as a canonical Service;
-- musl, non-x86-64, other Linux distributions without the full declared matrix, macOS, and Windows;
-- containers, Arch/Debian/RPM packages, Node/Bun/npm runtime, external database/search, or filesystem-only authority; and
-- storage rebuild that silently treats manifests/filesystem bytes as authority.
+Unsupported: public/Funnel/LAN-only/non-tailnet; non-loopback backend; remote/cross-mount private storage; backup destinations outside probed btrfs/ext4/XFS; discovery/source links/crawls/live/move import; Service proxy/fallback/automatic runtime action/health claim; file browser/listing/SPA fallback/embedded previews; unmodified Sideshow 0.7.0 canonical use; musl/non-x86-64/untested Linux/macOS/Windows; containers/distro packages/Node/Bun/npm/external database/search/filesystem authority; manifests/workspaces/external backup as authority.
 
 ## 19. Install-time agent onboarding text
 
@@ -713,25 +999,28 @@ The deployed Observatory service is the front door for browser-based agent work 
 - Register separately running interactive browser apps as Services with `obs service register`. A Service keeps its own behavior, state, runtime, exposure, and authorization.
 - Use canonical URLs returned by the server. Never construct Observatory URLs from an origin, ID, slug, title, Project key, path, or Service name.
 - Always pass a unique `--idempotency-key` for every mutation. Retry an uncertain request with the same key and identical arguments.
-- Never proxy, embed, absorb, copy, or manage Service state through Observatory. Service Open uses the server-returned direct primary Target; `service remove` changes only the catalogue, and explicit `service teardown` is the sole optional external runtime action.
+- Never proxy, embed, absorb, copy, or manage Service state through Observatory. Service Open uses the server-returned direct primary Target; `obs service remove` changes only the catalogue, and explicit `obs service teardown` is the sole optional external runtime action.
 ```
 
 ## 20. Decision traceability
 
-| Decision | Specification coverage | Durable rationale/evidence |
+| Decision | Coverage | Durable note/evidence |
 | --- | --- | --- |
-| [#2 Artifact contract](https://github.com/Whamp/observatory/issues/2) | §§3, 5, 7, 10 | `CONTEXT.md`; Artifact resolution |
+| [#2 Artifact contract](https://github.com/Whamp/observatory/issues/2) | §§3, 5, 7, 10 | Artifact resolution; `CONTEXT.md` |
 | [#3 Service contract](https://github.com/Whamp/observatory/issues/3) | §§3–4, 6, 11 | Service resolution |
-| [#4 Tailscale Service validation](https://github.com/Whamp/observatory/issues/4) | §§6, 14, 17–18 | [Serve report](docs/research/2026-07-09-tailscale-serve-live-services.md); [probe transcript](docs/research/evidence/2026-07-09-tailscale-serve-probe.md) |
-| [#5 canonical address/trust](https://github.com/Whamp/observatory/issues/5) | §§1, 7, 14, 16 | Tailscale primary-source links in issue resolution and Serve report |
+| [#4 Service transport validation](https://github.com/Whamp/observatory/issues/4) | §§6, 14, 17–18 | [Serve note](docs/research/2026-07-09-tailscale-serve-live-services.md); [probe](docs/research/evidence/2026-07-09-tailscale-serve-probe.md) |
+| [#5 canonical address/trust](https://github.com/Whamp/observatory/issues/5) | §§1, 7, 14–16 | Trust resolution |
 | [#6 routes/namespaces/slugs](https://github.com/Whamp/observatory/issues/6) | §§4, 7 | Route resolution |
-| [#7 Artifact retention](https://github.com/Whamp/observatory/issues/7) | §§10, 12–13, 16–17 | Retention resolution; [persistence note](docs/research/2026-07-09-observatory-persistence-architecture.md) |
+| [#7 Artifact retention](https://github.com/Whamp/observatory/issues/7) | §§10, 12–13, 16–17 | Retention resolution; [persistence](docs/research/2026-07-09-observatory-persistence-architecture.md) |
 | [#8 Service liveness](https://github.com/Whamp/observatory/issues/8) | §§6, 9, 11, 16–17 | Liveness resolution |
-| [#9 CLI contract](https://github.com/Whamp/observatory/issues/9) | §§8, 13, 16–17, 19 | [approved B CLI artifact](docs/prototypes/observatory-cli-contract.html) at [committed decision artifact](https://github.com/Whamp/observatory/blob/1bf95af1d41e98450b09a4eb1e81846915459e9c/docs/prototypes/observatory-cli-contract.html?variant=B) |
-| [#10 index/navigation](https://github.com/Whamp/observatory/issues/10) | §§9, 15, 17 | [approved B index artifact](docs/prototypes/observatory-index-navigation.html) at [commit `6362d84`](https://github.com/Whamp/observatory/commit/6362d84c2f8508234968e7deb2c91a8cc090c0bd) |
-| [#11 persistence/indexing](https://github.com/Whamp/observatory/issues/11) | §§12–13, 15–17 | [persistence architecture](docs/research/2026-07-09-observatory-persistence-architecture.md) |
-| [#12 stack/packaging/supervision](https://github.com/Whamp/observatory/issues/12) | §§15–18 | [stack decision note](docs/research/2026-07-09-observatory-implementation-stack.md) at [commit `f4263ec`](https://github.com/Whamp/observatory/commit/f4263ecd3782c73f002799b36da24df498ad074c) |
-| [#15 import](https://github.com/Whamp/observatory/issues/15) | §§5, 8, 12, 17–18 | Import resolution; persistence architecture |
-| [#16 diagnostics/recovery](https://github.com/Whamp/observatory/issues/16) | §§8, 12–13, 16–17 | [diagnostics/recovery note](docs/research/2026-07-09-observatory-storage-diagnostics-recovery.md) at [commit `4ba5504`](https://github.com/Whamp/observatory/commit/4ba55043feb77b58decf906900c96ee0755759eb) |
+| [#9 CLI](https://github.com/Whamp/observatory/issues/9) | §§7–9, 16–17, 19 | [approved CLI artifact](docs/prototypes/observatory-cli-contract.html) |
+| [#10 index/navigation](https://github.com/Whamp/observatory/issues/10) | §§9, 15, 17 | [approved ledger artifact](docs/prototypes/observatory-index-navigation.html) |
+| [#11 persistence](https://github.com/Whamp/observatory/issues/11) | §§12–13, 15–17 | [persistence architecture](docs/research/2026-07-09-observatory-persistence-architecture.md) |
+| [#12 stack/package/supervision](https://github.com/Whamp/observatory/issues/12) | §§15–18 | [stack note](docs/research/2026-07-09-observatory-implementation-stack.md) |
+| [#15 import](https://github.com/Whamp/observatory/issues/15) | §§5, 7–8, 10, 12, 17–18 | Import resolution |
+| [#16 diagnostics/recovery](https://github.com/Whamp/observatory/issues/16) | §§7–8, 12–13, 16–17 | [diagnostics/recovery](docs/research/2026-07-09-observatory-storage-diagnostics-recovery.md) |
+| [#17 public control plane](https://github.com/Whamp/observatory/issues/17) | §§4–9, 16–17 | [public control plane](docs/research/2026-07-09-observatory-public-control-plane.md) |
+| [#18 backup topology](https://github.com/Whamp/observatory/issues/18) | §§7–8, 12–13, 16–18 | [backup topology](docs/research/2026-07-09-observatory-backup-topology.md) |
+| [#19 bootstrap authority](https://github.com/Whamp/observatory/issues/19) | §§3, 7–8, 14–18 | [bootstrap authority](docs/research/2026-07-09-observatory-bootstrap-authority.md) |
 
-The [map](https://github.com/Whamp/observatory/issues/1), [`CONTEXT.md`](CONTEXT.md), all linked closed resolutions, all four research notes, the probe transcript, and both committed prototypes are the complete durable source set used for this synthesis. No settled decision was reopened.
+The map, glossary, every linked resolution, seven linked research notes, probe transcript, and two committed human-review artifacts are the durable source set. The first specification draft was superseded after independent handoff review; this revision incorporates all three reviews and closed decisions #17–#19 without reopening settled behavior.

@@ -461,6 +461,7 @@ Target names are NFC-normalized, nonempty after trimming, control-free, case-sen
 | `POST` | `/api/v1/system/backups` | Create complete backup |
 | `POST` | `/api/v1/system/backups/verify` | Verify named backup |
 | `GET` | `/api/v1/system/configuration` | Redacted effective configuration and restart-required status |
+| `POST` | `/api/v1/system/configuration/validate` | Validate proposed TOML content without installing or activating it |
 | `GET` | `/api/v1/system/audit` | Paginated audit events |
 `POST /system/diagnostics` is used because deep diagnostics acquire a maintenance gate and perform the settled disposable filesystem capability probe, even though they do not mutate catalogue authority.
 No remote API installs, updates, removes, or uninstalls binaries, units, stable command links, or Tailscale handlers. [Issue #19](https://github.com/Whamp/observatory/issues/19) owns the local bootstrap implementation internals, but it cannot change the setup or service leaf meanings fixed here.
@@ -889,13 +890,13 @@ obs system setup apply --yes
 obs system setup remove --yes
 obs system setup uninstall --yes
 obs system config show
-obs system config validate [FILE]
+obs system config validate FILE
 obs system service status
 obs system service start
 obs system service stop --yes
 obs system service restart --yes
 ```
-`system config show` reads the daemon’s redacted effective configuration. `system config validate` validates a proposed file without installing or activating it.
+`system config show` reads the daemon’s redacted effective configuration. `system config validate FILE` requires FILE. The CLI opens that local regular file through the safe no-follow input boundary, reads its TOML contents, and sends the content—not the client path—to `POST /api/v1/system/configuration/validate`. There is no stdin mode. The daemon returns ordered parse, schema, and semantic checks and never installs or activates the proposed configuration. The endpoint is non-mutating, requires neither `If-Match` nor `Idempotency-Key`, and a missing daemon returns the normal exit `5`. `setup check` may reuse the same pure parser/schema module locally, but that module has no SQLite, storage, or domain dependency and does not add a local-authority leaf.
 
 The `system setup` and `system service` leaves are local bootstrap authority, not daemon API operations. They still emit the common `schemaVersion`/`ok` result or error envelope and follow the same stdout, stderr, idempotency, timeout, and exit rules. [Issue #19](https://github.com/Whamp/observatory/issues/19) owns their crash-safe implementation internals but cannot change these meanings:
 
@@ -1251,6 +1252,8 @@ No adapter-specific lifecycle branch is permitted.
 - `setup uninstall` additionally removes only verified Observatory-owned executable integration and setup receipts, retaining configuration and authoritative data.
 - Both removal leaves reject foreign or drifted paths and never purge catalogue or Artifact data.
 - Service status/start/stop/restart preserve their fixed read, start-only, clean-stop, and verified-restart meanings without implicit installation.
+- `system config validate FILE` rejects a missing, non-regular, or symlinked local FILE; sends only its TOML bytes to the daemon; has no stdin mode; returns ordered parse/schema/semantic checks; needs no mutation headers; never writes configuration; and returns daemon-unavailable exit `5` when appropriate.
+- The configuration-validation API receives no client path and has no installation or activation effect.
 
 ---
 ## 11. Resolved source conflicts
