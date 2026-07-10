@@ -1,5 +1,6 @@
-# Generated code index (codegraph)
+# Generated agent and code indexes
 .codegraph/
+.pi-subagents/
 
 # Obsidian app state (machine-local)
 .obsidian/
