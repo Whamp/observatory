@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>PROTOTYPE — throw away after decision — Observatory CLI Contract</title>
+<title>APPROVED DECISION — B Resource namespaces — Observatory CLI Contract</title>
 <style>
 :root{--ink:#e9eadf;--muted:#9da397;--dim:#666d64;--paper:#101310;--panel:#171b17;--line:#394138;--hot:#ffb000;--cool:#6ee7b7;--bad:#ff6b5f;--blue:#8ab4f8;--shadow:#050705;--measure:1180px;--mono:"IBM Plex Mono","Cascadia Code","SFMono-Regular",Consolas,"Liberation Mono",monospace;--sans:"Avenir Next Condensed","DIN Condensed","Arial Narrow",sans-serif}
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 var(--mono);background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:100% 28px}a{color:var(--cool)}button,input,textarea{font:inherit}button{cursor:pointer}.mast{border-bottom:1px solid var(--line);background:#0b0e0b;position:relative;overflow:hidden}.mast:after{content:"OBS / 009";position:absolute;right:-.04em;top:-.32em;color:#151a15;font:900 clamp(80px,17vw,230px)/1 var(--sans);letter-spacing:-.07em;pointer-events:none}.mast-inner{max-width:var(--measure);margin:auto;padding:36px 24px 28px;position:relative;z-index:1}.kicker{color:var(--bad);font-weight:800;letter-spacing:.09em;text-transform:uppercase}.mast h1{font:900 clamp(38px,7vw,88px)/.88 var(--sans);letter-spacing:-.035em;text-transform:uppercase;max-width:850px;margin:20px 0}.dek{max-width:760px;color:#c4c8bd;font-size:17px}.question{display:inline-block;border:1px solid var(--hot);color:var(--hot);padding:6px 10px;margin-top:16px}.statebar{border-bottom:1px solid var(--line);background:#151915;position:sticky;top:0;z-index:20}.statebar-inner{max-width:var(--measure);margin:auto;padding:9px 24px;display:flex;gap:20px;align-items:center;overflow:auto;white-space:nowrap}.statebar b{color:var(--hot)}.statebar span{color:var(--muted)}main{max-width:var(--measure);margin:auto;padding:0 24px 150px}.variant{display:none}.variant.active{display:block}.variant.design-b.active{display:grid}.variant-head{padding:44px 0 28px;border-bottom:3px double var(--line)}.variant-mark{font:900 96px/.7 var(--sans);color:var(--line);float:right}.variant-head h2{font:900 clamp(32px,5vw,64px)/1 var(--sans);text-transform:uppercase;margin:0 0 14px}.variant-head p{max-width:800px;color:#c8ccc1}.recommend{border-left:7px solid var(--hot);background:#201b0d;padding:18px 20px;margin:26px 0}.recommend strong{display:block;color:var(--hot);text-transform:uppercase;letter-spacing:.08em}.section{padding:34px 0;border-bottom:1px solid var(--line)}.section h3{font:800 26px/1.1 var(--sans);text-transform:uppercase;letter-spacing:.03em;margin:0 0 18px}.section h4{font-size:14px;color:var(--hot);text-transform:uppercase;letter-spacing:.1em;margin:24px 0 8px}.note{color:var(--muted);max-width:860px}.terminal{background:#080a08;border:1px solid #303730;box-shadow:8px 8px 0 var(--shadow);margin:14px 0 24px;overflow:hidden}.terminal-label{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #303730;padding:6px 10px;color:var(--dim);font-size:12px;text-transform:uppercase}.terminal pre{margin:0;padding:16px;overflow:auto;color:#dde1d6;font:13px/1.55 var(--mono);white-space:pre}.terminal .cmd{color:var(--cool)}.terminal .err{color:var(--bad)}.terminal .warn{color:var(--hot)}code{color:#d9e7d6}.tree{columns:2;column-gap:20px}.tree .terminal{break-inside:avoid}.matrix{width:100%;border-collapse:collapse;margin:15px 0;font-size:13px}.matrix th,.matrix td{text-align:left;vertical-align:top;padding:9px 10px;border:1px solid var(--line)}.matrix th{color:var(--hot);background:#1c201b;text-transform:uppercase;letter-spacing:.05em}.matrix td:first-child{white-space:nowrap;color:var(--cool)}.rules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line);border-left:1px solid var(--line)}.rule{padding:16px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.rule b{display:block;color:var(--cool);margin-bottom:5px}.flow{display:flex;align-items:stretch;gap:0;overflow:auto;margin:20px 0}.flow div{min-width:170px;padding:16px;border:1px solid var(--line);background:var(--panel)}.flow i{display:flex;align-items:center;padding:8px;color:var(--hot);font-style:normal}.callout{border:1px solid var(--bad);padding:16px;margin:20px 0}.callout b{color:var(--bad)}
@@ -23,14 +23,14 @@
   <div class="kicker">Wayfinder ticket 009 · decision artifact</div>
   <h1>Agent-facing CLI contract</h1>
   <p class="dek">Three command structures for the same settled Observatory behavior. Judge which one lets an agent act correctly after reading only <code>obs --help</code>.</p>
-  <div class="question">PROTOTYPE — throw away after decision.</div>
+  <div class="question">HISTORICAL DECISION ARTIFACT — B APPROVED.</div>
  </div>
 </header>
-<div class="statebar" aria-live="polite"><div class="statebar-inner"><b id="stateVariant">A / Workflow verbs</b><span id="stateGrammar">Grammar: intent → resource</span><span>Transport: daemon client</span><span>Authority: one backend writer</span><span>Review state: awaiting one choice</span></div></div>
+<div class="statebar" aria-live="polite"><div class="statebar-inner"><b id="stateVariant">B / Resource namespaces · approved</b><span id="stateGrammar">Grammar: resource → action</span><span>Transport: daemon client</span><span>Authority: one backend writer</span><span>Decision: B approved for issue #9</span></div></div>
 <main>
 <!-- VARIANT A -->
 <article class="variant design-a" data-variant="A">
- <header class="variant-head"><span class="variant-mark">A</span><h2>Workflow verbs</h2><p>Start with what the agent wants to do, then name the resource. This reads like imperative prose: <code>obs publish create</code>, <code>obs register service</code>, <code>obs remove artifact</code>.</p><div class="recommend"><strong>Tradeoff</strong>Excellent for the first publish. Weak for discovery: an agent must search several verb families to learn everything it can do to one resource.</div></header>
+ <header class="variant-head"><span class="variant-mark">A</span><h2>Workflow verbs · superseded</h2><p>Start with what the agent wants to do, then name the resource. This reads like imperative prose: <code>obs publish create</code>, <code>obs register service</code>, <code>obs remove artifact</code>.</p><div class="recommend"><strong>Tradeoff</strong>Excellent for the first publish. Weak for discovery: an agent must search several verb families to learn everything it can do to one resource.</div></header>
  <section class="section chapter"><div class="chapter-no">01</div><div><h3>Complete help tree</h3><p class="note">Every leaf below is a runnable command. Parent nodes print their child commands and examples, then exit 0.</p><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — catalogue browser work
 
 USAGE  obs [GLOBAL OPTIONS] &lt;COMMAND&gt;
@@ -177,8 +177,8 @@ review   offline timeout   5000ms</pre></div></div></section>
 
 <!-- VARIANT B -->
 <article class="variant design-b" data-variant="B">
- <header class="variant-head"><span class="variant-mark">B</span><h2>Resource namespaces</h2><p>Choose a noun, then see every legal operation on it: <code>obs artifact publish</code>, <code>obs service register</code>, <code>obs service target add</code>. The hierarchy mirrors the domain language and keeps strict create/update intent visible.</p><div class="recommend"><strong>Recommended</strong>This is the smallest self-documenting interface for agents. Six top-level nouns expose the whole model; each noun’s help is a complete capability inventory. No generic CRUD hides Publish, teardown, restore, refresh, or keep.</div></header>
- <nav aria-label="Variant B sections"><a href="#b-tree">Help tree</a><a href="#b-artifact">Artifact / import</a><a href="#b-service">Service / Targets</a><a href="#b-ops">Operations</a><a href="#b-machine">Machine contract</a><a href="#approval">Choose</a></nav>
+ <header class="variant-head"><span class="variant-mark">B</span><h2>Resource namespaces · approved</h2><p>Choose a noun, then see every legal operation on it: <code>obs artifact publish</code>, <code>obs service register</code>, <code>obs service target add</code>. The hierarchy mirrors the domain language and keeps strict create/update intent visible.</p><div class="recommend"><strong>Approved</strong>This is the smallest self-documenting interface for agents. Six top-level nouns expose the whole model; each noun’s help is a complete capability inventory. No generic CRUD hides Publish, teardown, restore, refresh, or keep.</div></header>
+ <nav aria-label="Variant B sections"><a href="#b-tree">Help tree</a><a href="#b-artifact">Artifact / import</a><a href="#b-service">Service / Targets</a><a href="#b-ops">Operations</a><a href="#b-machine">Machine contract</a><a href="#approval">Decision</a></nav>
  <div class="content">
  <section class="section" id="b-tree"><h3>Complete help tree</h3><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — publish Artifacts; catalogue externally owned Services
 
@@ -397,7 +397,7 @@ Write authority active; scheduled probes and cleanup active</pre></div><p class=
 
 <!-- VARIANT C -->
 <article class="variant design-c" data-variant="C">
- <header class="variant-head"><span class="variant-mark">C</span><h2>Intent commands</h2><p>Put lifecycle intent at the root: <code>obs create artifact</code>, <code>obs replace artifact</code>, <code>obs update service</code>. Reads use <code>get</code>; operational actions use <code>act</code>. The grammar is compact and maps cleanly to request objects.</p><div class="recommend"><strong>Tradeoff</strong>Best for generated clients and request manifests. Worst at the terminal: domain-specific operations hide behind <code>act</code>, and <code>get</code> reduces the visibility of Artifact versus Service capabilities.</div></header>
+ <header class="variant-head"><span class="variant-mark">C</span><h2>Intent commands · superseded</h2><p>Put lifecycle intent at the root: <code>obs create artifact</code>, <code>obs replace artifact</code>, <code>obs update service</code>. Reads use <code>get</code>; operational actions use <code>act</code>. The grammar is compact and maps cleanly to request objects.</p><div class="recommend"><strong>Tradeoff</strong>Best for generated clients and request manifests. Worst at the terminal: domain-specific operations hide behind <code>act</code>, and <code>get</code> reduces the visibility of Artifact versus Service capabilities.</div></header>
  <div class="ledger"><div class="ledger-key">Grammar</div><div class="ledger-body"><code>obs &lt;intent&gt; &lt;kind&gt; [identity] [fields]</code>. The help system is organized around mutation semantics rather than resources.</div>
  <div class="ledger-key">Complete tree</div><div class="ledger-body"><div class="terminal"><div class="terminal-label"><span>obs --help</span><span>exit 0</span></div><pre>obs — send explicit intents to the Observatory daemon
 
@@ -512,46 +512,36 @@ Observatory listening; sole write authority active</pre></div><p class="note">Th
 </article>
 
 <section class="approval" id="approval">
- <header><h2>Human decision boundary</h2><span>One choice · ticket stays open</span></header>
- <form id="decisionForm" data-lavish-question="observatory-cli-contract">
-  <fieldset><legend>Which CLI structure should become the contract?</legend><div class="choices">
-   <label class="choice"><input type="radio" name="decision" value="A — Workflow verbs" required><b>A — Workflow verbs</b><span>Imperative, approachable, scattered by resource.</span></label>
-   <label class="choice"><input type="radio" name="decision" value="B — Resource namespaces"><b>B — Resource namespaces</b><span>Recommended: complete capability inventory per noun.</span></label>
-   <label class="choice"><input type="radio" name="decision" value="C — Intent commands"><b>C — Intent commands</b><span>Request-oriented, compact root, hidden special actions.</span></label>
-   <label class="choice"><input type="radio" name="decision" value="Recommended B with changes"><b>Recommended with changes</b><span>Keep B’s structure; specify edits below.</span></label>
-  </div></fieldset>
-  <label for="changes">Required changes or rationale</label>
-  <textarea id="changes" name="changes" placeholder="Example: Choose B, but rename ‘system setup’ to ‘system expose’…"></textarea>
-  <div class="submit"><button type="submit">Queue Lavish decision</button><span class="status" id="formStatus" role="status"></span></div>
- </form>
+ <header><h2>Decision recorded</h2><span>Issue #9 · approved 2026-07-09</span></header>
+ <div style="padding:22px"><p><strong>B — Resource namespaces</strong> is the approved CLI structure. Each noun-scoped help page is the complete capability inventory for that domain. Variants A and C remain visible only as superseded comparison evidence.</p><p class="note">The normative command contract is in <code>SPEC.md</code> and the public-control-plane decision note; this historical artifact does not override them.</p></div>
 </section>
 </main>
-<div class="switcher" aria-label="Prototype variant switcher"><button type="button" id="prev" aria-label="Previous variant">←</button><div class="switch-label" id="switchLabel">A — Workflow verbs<small>Use ← → · URL stores selection</small></div><button type="button" id="next" aria-label="Next variant">→</button></div>
+<div class="switcher" aria-label="Historical variant switcher"><button type="button" id="prev" aria-label="Previous variant">←</button><div class="switch-label" id="switchLabel">B — Resource namespaces · approved<small>Use ← → · alternatives are superseded</small></div><button type="button" id="next" aria-label="Next variant">→</button></div>
 <script>
 (() => {
   const variants = [
     {key:'A', name:'Workflow verbs', grammar:'intent → resource'},
-    {key:'B', name:'Resource namespaces · recommended', grammar:'resource → action'},
+    {key:'B', name:'Resource namespaces · approved', grammar:'resource → action'},
     {key:'C', name:'Intent commands', grammar:'lifecycle intent → kind'}
   ];
   const sections = [...document.querySelectorAll('[data-variant]')];
   const label = document.getElementById('switchLabel');
   const stateVariant = document.getElementById('stateVariant');
   const stateGrammar = document.getElementById('stateGrammar');
-  function valid(raw){ return variants.some(v => v.key === raw) ? raw : 'A'; }
+  function valid(raw){ return variants.some(v => v.key === raw) ? raw : 'B'; }
   function show(key, push=true){
     key = valid(key);
     sections.forEach(section => section.classList.toggle('active', section.dataset.variant === key));
     const v = variants.find(item => item.key === key);
-    label.innerHTML = `${v.key} — ${v.name}<small>Use ← → · URL stores selection</small>`;
+    label.innerHTML = `${v.key} — ${v.name}<small>Use ← → · alternatives are superseded</small>`;
     stateVariant.textContent = `${v.key} / ${v.name}`;
     stateGrammar.textContent = `Grammar: ${v.grammar}`;
-    document.title = `PROTOTYPE — ${v.key} ${v.name} — Observatory CLI Contract`;
+    document.title = `HISTORICAL DECISION — ${v.key} ${v.name} — Observatory CLI Contract`;
     if(push){ const url = new URL(location.href); url.searchParams.set('variant', key); history.replaceState({},'',url); }
     window.scrollTo({top:0,behavior:'instant'});
   }
   function cycle(delta){
-    const current = valid(new URL(location.href).searchParams.get('variant') || 'A');
+    const current = valid(new URL(location.href).searchParams.get('variant') || 'B');
     const index = variants.findIndex(v => v.key === current);
     show(variants[(index + delta + variants.length) % variants.length].key);
   }
@@ -563,21 +553,7 @@ Observatory listening; sole write authority active</pre></div><p class="note">Th
     if(event.key === 'ArrowLeft'){ event.preventDefault(); cycle(-1); }
     if(event.key === 'ArrowRight'){ event.preventDefault(); cycle(1); }
   });
-  document.getElementById('decisionForm').addEventListener('submit', event => {
-    event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const decision = data.get('decision');
-    const changes = String(data.get('changes') || '').trim();
-    const prompt = `Observatory CLI contract decision for issue #9: ${decision}. Required changes: ${changes || 'none'}. Apply this human decision to the specification, then remove the throwaway prototype when its answer is captured.`;
-    const status = document.getElementById('formStatus');
-    if(window.lavish && typeof window.lavish.queuePrompt === 'function'){
-      window.lavish.queuePrompt(prompt, {tag:'observatory-cli-contract', text:String(decision), element:event.currentTarget, data:{decision,changes}, queueKey:'observatory-cli-contract-issue-9'});
-      status.textContent = 'Decision queued in Lavish.';
-    } else {
-      status.textContent = 'Lavish SDK unavailable. Open this artifact in Lavish to queue the decision.';
-    }
-  });
-  show(valid(new URL(location.href).searchParams.get('variant') || 'A'), false);
+  show(valid(new URL(location.href).searchParams.get('variant') || 'B'), false);
 })();
 </script>
 </body>

@@ -555,7 +555,7 @@ Recovery operations are exactly `reconcile`, `quarantine`, `repair_catalogue_can
 
 Human results use stdout; warnings/progress/log guidance use stderr. JSON success/trustworthy outcomes emit one stdout value. Command inability emits one stderr error with empty stdout. Existing-resource CLI mutations translate record version into API `If-Match`; selectors follow Project ID/key/path, Artifact ID/key, Revision ID, Service ID/key or Project-scoped name, and exact Target name rules. Ambiguous Service name is rejected.
 
-TTY destructive calls may prompt once. Non-TTY calls never prompt and require `--yes`. Idempotency follows [section 7](#common-api-contract): non-TTY/automation mutation requires a supplied key; interactive TTY may generate/display one. Future agents must always supply one.
+TTY destructive calls may prompt once. Non-TTY calls never prompt and require `--yes`. Idempotency follows [section 7](#common-api-contract): non-TTY/automation mutation requires a supplied key; interactive TTY may generate/display one. Future agents MUST always supply one.
 
 `system config show` returns the daemon's redacted active effective configuration. `system config validate FILE` requires FILE: the CLI opens that local regular file through the safe no-follow input boundary, reads its TOML contents, and sends content—not a path—to `POST /api/v1/system/configuration/validate`. There is no stdin mode. The daemon returns ordered parse, schema, and semantic checks and never installs or activates the proposal. This POST is non-mutating and needs neither `If-Match` nor `Idempotency-Key`; daemon absence exits `5`.
 
@@ -655,7 +655,7 @@ Cleanup transactionally rechecks/marks unavailable/audits; atomically renames co
 
 `obs system backup create DESTINATION` names one exact absolute host-local final directory. Parent exists/accessibly; leaf is absent; no ancestors are created; relative/root/empty/dot/dotdot/symlinked/ambiguous paths fail. Backup gets never-reused 26-character ID. Destination sibling staging is `.<leaf>.observatory-<backup-id>.incomplete`, mode `0700`, no-follow/no-replace. Unknown collision is untouched. Finalization never overwrites, merges, deduplicates, or forces.
 
-Write-capable destination filesystem is only Linux btrfs, ext4, or XFS **and** must pass an active disposable probe proving exclusive/no-follow file create, write/read, file+directory sync, `RENAME_NOREPLACE` success/collision, child-directory rename, cleanup, stable mount/parent identity. Network/FUSE/9p/virtiofs/overlay/tmpfs/read-only/unknown fails. `statfs`, mountinfo, and `statx` mount identity are rechecked through finalization.
+Write-capable destination filesystem is only Linux btrfs, ext4, or XFS **and** MUST pass an active disposable probe proving exclusive/no-follow file create, write/read, file+directory sync, `RENAME_NOREPLACE` success/collision, child-directory rename, cleanup, stable mount/parent identity. Network/FUSE/9p/virtiofs/overlay/tmpfs/read-only/unknown fails. `statfs`, mountinfo, and `statx` mount identity are rechecked through finalization.
 
 Destination bundle is:
 
@@ -666,7 +666,7 @@ backup-manifest.json
 .observatory-complete
 ```
 
-The manifest binds format/backup/build/API/schema, instants, catalogue length/digest, exact ordered leased Revision set and every member path/size/digest, totals, verification. It excludes private paths, mount/inode/owner/mode, teardown argv, and secret URLs. Format v1 must freeze one canonical serialization/digest fixture before emission. Completion marker is written last and binds backup ID plus manifest/catalogue digests; it is evidence only. A backup is valid only at final name with exact marker/manifest/catalogue/Revision inventory.
+The manifest binds format/backup/build/API/schema, instants, catalogue length/digest, exact ordered leased Revision set and every member path/size/digest, totals, verification. It excludes private paths, mount/inode/owner/mode, teardown argv, and secret URLs. Format v1 MUST freeze one canonical serialization/digest fixture before emission. Completion marker is written last and binds backup ID plus manifest/catalogue digests; it is evidence only. A backup is valid only at final name with exact marker/manifest/catalogue/Revision inventory.
 
 Creation order is authoritative intent; Online Backup snapshot; exact Revision-set lease under short availability barrier; source/destination capacity; destination classification/probe; hidden stage; copy/hash/sync/reopen catalogue; copy/hash/sync exact Revisions; bottom-up directory sync; write/sync manifest; deep reread verification; write/sync marker; recheck parent/final absence; `renameat2(..., RENAME_NOREPLACE)`; sync destination parent; mark completed/audit/release lease in SQLite; asynchronously clean source evidence. Cross-filesystem transport is verified copy, never rename. Success returns only after SQLite completion.
 
@@ -745,7 +745,7 @@ Every diagnostic gate change, plan, operation phase, reconciliation, quarantine,
 
 ## 14. Network and security boundary
 
-Observatory is private/tailnet-only. Canonical HTTPS origin defaults to `https://desktop.greyhound-chinstrap.ts.net/`; 443 is recommended/omitted. Another MagicDNS host/port is explicit migration and old-origin redirects are not required. Backend binds loopback only; local port is independently configurable and absent from public links. Exact origin must match active Serve host/port or setup blocks/diagnoses without guessing.
+Observatory is private/tailnet-only. Canonical HTTPS origin defaults to `https://desktop.greyhound-chinstrap.ts.net/`; 443 is recommended/omitted. Another MagicDNS host/port is explicit migration and old-origin redirects are not required. Backend binds loopback only; local port is independently configurable and absent from public links. Exact origin MUST match active Serve host/port or setup blocks/diagnoses without guessing.
 
 Deployment owns only canonical host/port root Serve handler to loopback. Setup inspects, refuses conflicts/matching-unowned adoption, preserves unrelated handlers, and verifies exact post-state. Ordinary daemon startup is Serve-read-only. Remove only receipt/live-tuple proven ownership. Observatory never owns Service handlers.
 
@@ -1013,8 +1013,8 @@ The deployed Observatory service is the front door for browser-based agent work 
 | [#6 routes/namespaces/slugs](https://github.com/Whamp/observatory/issues/6) | §§4, 7 | Route resolution |
 | [#7 Artifact retention](https://github.com/Whamp/observatory/issues/7) | §§10, 12–13, 16–17 | Retention resolution; [persistence](docs/research/2026-07-09-observatory-persistence-architecture.md) |
 | [#8 Service liveness](https://github.com/Whamp/observatory/issues/8) | §§6, 9, 11, 16–17 | Liveness resolution |
-| [#9 CLI](https://github.com/Whamp/observatory/issues/9) | §§7–9, 16–17, 19 | [approved CLI artifact](docs/prototypes/observatory-cli-contract.html) |
-| [#10 index/navigation](https://github.com/Whamp/observatory/issues/10) | §§9, 15, 17 | [approved ledger artifact](docs/prototypes/observatory-index-navigation.html) |
+| [#9 CLI](https://github.com/Whamp/observatory/issues/9) | §§7–9, 16–17, 19 | [approved B CLI artifact](docs/prototypes/observatory-cli-contract.html?variant=B) |
+| [#10 index/navigation](https://github.com/Whamp/observatory/issues/10) | §§9, 15, 17 | [approved B ledger artifact](docs/prototypes/observatory-index-navigation.html?variant=B) |
 | [#11 persistence](https://github.com/Whamp/observatory/issues/11) | §§12–13, 15–17 | [persistence architecture](docs/research/2026-07-09-observatory-persistence-architecture.md) |
 | [#12 stack/package/supervision](https://github.com/Whamp/observatory/issues/12) | §§15–18 | [stack note](docs/research/2026-07-09-observatory-implementation-stack.md) |
 | [#15 import](https://github.com/Whamp/observatory/issues/15) | §§5, 7–8, 10, 12, 17–18 | Import resolution |
