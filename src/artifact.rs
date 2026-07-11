@@ -48,6 +48,107 @@ pub(crate) struct ReplaceArtifactRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportArtifactsRequest {
+    project_id: String,
+    #[serde(default)]
+    defaults: ImportOptions,
+    items: Vec<ImportItem>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportOptions {
+    project_id: Option<String>,
+    entry: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    slug: Option<String>,
+    retention: Option<PublishRetention>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportItem {
+    source: PublishSource,
+    label: Option<String>,
+    options: Option<ImportOptions>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportResult {
+    operation: String,
+    overall: ImportOverall,
+    partial: bool,
+    counts: ImportCounts,
+    items: Vec<ImportItemOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImportCounts {
+    requested: u64,
+    succeeded: u64,
+    failed: u64,
+    skipped: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportItemOutcome {
+    index: u64,
+    label: String,
+    status: ImportItemStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ImportItemResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleanup_error: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportOverall {
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportItemStatus {
+    Committed,
+    Failed,
+    UnchangedReplay,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportItemResult {
+    artifact_id: String,
+    artifact_key: String,
+    artifact_record_version: u64,
+    artifact_api_url: String,
+    revision_id: String,
+    revision_api_url: String,
+    revision_open_url: String,
+    open_url: String,
+    detail_url: String,
+    files: u64,
+    logical_bytes: u64,
+    retention: Retention,
+    warnings: Vec<PublishWarning>,
+    duplicate_candidates: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportOutcome {
+    result: ImportResult,
+    replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PublishSource {
     path: String,
     caller_working_directory: String,
@@ -200,9 +301,15 @@ struct PublishIntent {
     revision: Revision,
     payload_digest: Option<String>,
     source_snapshot_digest: String,
+    #[serde(default)]
+    source_root_snapshot_digest: Option<String>,
     capacity_reservation_bytes: u64,
     idempotency_key: String,
     fingerprint: String,
+    #[serde(default)]
+    publication_method: Option<PublicationMethod>,
+    #[serde(default)]
+    request_identity: Option<String>,
     #[serde(default)]
     warnings: Vec<PublishWarning>,
     #[serde(default)]
@@ -222,6 +329,37 @@ enum PublishPhase {
     IntentRecorded,
     Staged,
     Renamed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicationMethod {
+    #[default]
+    Publish,
+    Import,
+    Replace,
+}
+
+impl PublicationMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Import => "import",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+impl PublishIntent {
+    fn publication_method(&self) -> PublicationMethod {
+        self.publication_method.unwrap_or_else(|| {
+            if self.replacement.is_some() {
+                PublicationMethod::Replace
+            } else {
+                PublicationMethod::Publish
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -365,6 +503,14 @@ struct PreparedPublish {
     entry_media_type: String,
     published_at: String,
     intent: PublishIntent,
+}
+
+#[derive(Clone, Copy)]
+struct PublishPreparation<'a> {
+    idempotency_key: &'a str,
+    fingerprint: &'a str,
+    replacement: Option<&'a ReplacementState>,
+    publication_method: PublicationMethod,
 }
 
 #[derive(Clone, Copy)]
@@ -575,6 +721,15 @@ impl ArtifactService {
         request: &PublishArtifactRequest,
         idempotency_key: &str,
     ) -> Result<PublishOutcome, AppError> {
+        self.publish_with_method(request, idempotency_key, PublicationMethod::Publish)
+    }
+
+    fn publish_with_method(
+        &self,
+        request: &PublishArtifactRequest,
+        idempotency_key: &str,
+        publication_method: PublicationMethod,
+    ) -> Result<PublishOutcome, AppError> {
         validate_idempotency_key(idempotency_key)?;
         validate_publish_paths(request)?;
         let normalized_source = normalized_source_selection(&request.source.path)?;
@@ -593,11 +748,121 @@ impl ArtifactService {
         let prepared = self.prepare_publish(
             &mut connection,
             request,
-            idempotency_key,
-            &fingerprint,
-            None,
+            PublishPreparation {
+                idempotency_key,
+                fingerprint: &fingerprint,
+                replacement: None,
+                publication_method,
+            },
         )?;
         self.persist_publish(&mut connection, prepared, idempotency_key)
+    }
+
+    pub(crate) fn import(
+        &self,
+        request: &ImportArtifactsRequest,
+        idempotency_key: &str,
+    ) -> Result<ImportOutcome, AppError> {
+        validate_idempotency_key(idempotency_key)?;
+        if request.items.is_empty() {
+            return Err(AppError::invalid(
+                "invalid_import",
+                "Artifact import requires at least one source",
+            ));
+        }
+        let selections = request
+            .items
+            .iter()
+            .map(|item| normalized_import_selection(&item.source))
+            .collect::<Vec<_>>();
+        let fingerprint = import_fingerprint(request, &selections)?;
+        let _guard = self.begin_mutation(idempotency_key, &fingerprint)?;
+        if let Some(outcome) =
+            completed_import_batch(&self.catalogue.connection()?, idempotency_key, &fingerprint)?
+        {
+            return Ok(outcome);
+        }
+        record_import_batch(
+            &mut self.catalogue.connection()?,
+            idempotency_key,
+            &fingerprint,
+        )?;
+
+        let mut selection_counts = HashMap::new();
+        for selection in selections.iter().flatten() {
+            *selection_counts.entry(selection.clone()).or_insert(0_u64) += 1;
+        }
+        let mut items = Vec::with_capacity(request.items.len());
+        for (index, item) in request.items.iter().enumerate() {
+            let label = match import_label(item, index) {
+                Ok(label) => label,
+                Err(error) => {
+                    items.push(import_failure(
+                        index,
+                        import_fallback_label(item, index),
+                        &error,
+                    )?);
+                    continue;
+                }
+            };
+            let duplicate = selections[index]
+                .as_ref()
+                .is_some_and(|selection| selection_counts.get(selection).copied().unwrap_or(0) > 1);
+            if duplicate {
+                items.push(import_failure(
+                    index,
+                    label,
+                    &AppError::invalid(
+                        "duplicate_selection",
+                        "source selection occurs more than once in this import request",
+                    ),
+                )?);
+                continue;
+            }
+            let publish_request =
+                match import_publish_request(request, item, selections[index].as_ref()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        items.push(import_failure(index, label, &error)?);
+                        continue;
+                    }
+                };
+            let item_key = import_item_key(idempotency_key, index);
+            let outcome =
+                self.publish_with_method(&publish_request, &item_key, PublicationMethod::Import);
+            match outcome {
+                Ok(outcome) => {
+                    let duplicate_candidates = import_duplicate_candidates(
+                        &self.catalogue.connection()?,
+                        &item_key,
+                        &outcome.result().artifact.id,
+                    )?;
+                    items.push(import_success(
+                        index,
+                        label,
+                        &outcome,
+                        duplicate_candidates,
+                    )?);
+                }
+                Err(error) => {
+                    if !import_failure_is_trustworthy(&self.catalogue.connection()?, &item_key)? {
+                        return Err(error);
+                    }
+                    items.push(import_failure(index, label, &error)?);
+                }
+            }
+        }
+        let result = aggregate_import_items(items)?;
+        complete_import_batch(
+            &mut self.catalogue.connection()?,
+            idempotency_key,
+            &fingerprint,
+            &result,
+        )?;
+        Ok(ImportOutcome {
+            result,
+            replayed: false,
+        })
     }
 
     pub(crate) fn replace(
@@ -637,15 +902,19 @@ impl ArtifactService {
             return self.persist_publish(&mut connection, prepared, idempotency_key);
         }
         let expected_record_version = current.record_version;
+        let replacement = ReplacementState {
+            artifact: current,
+            expected_record_version,
+        };
         let prepared = self.prepare_publish(
             &mut connection,
             &publish_request,
-            idempotency_key,
-            &fingerprint,
-            Some(&ReplacementState {
-                artifact: current,
-                expected_record_version,
-            }),
+            PublishPreparation {
+                idempotency_key,
+                fingerprint: &fingerprint,
+                replacement: Some(&replacement),
+                publication_method: PublicationMethod::Replace,
+            },
         )?;
         self.persist_publish(&mut connection, prepared, idempotency_key)
     }
@@ -654,9 +923,7 @@ impl ArtifactService {
         &self,
         connection: &mut Connection,
         request: &PublishArtifactRequest,
-        idempotency_key: &str,
-        fingerprint: &str,
-        replacement: Option<&ReplacementState>,
+        preparation: PublishPreparation<'_>,
     ) -> Result<PreparedPublish, AppError> {
         let project = project_reference(connection, &request.project_id)?;
         let normalized_source = normalized_source_selection(&request.source.path)?;
@@ -669,14 +936,14 @@ impl ArtifactService {
             .clone()
             .or_else(|| source.portable_description().map(str::to_owned))
             .unwrap_or_default();
-        let slug = replacement_slug(request.slug.as_deref(), &title, replacement)?;
+        let slug = replacement_slug(request.slug.as_deref(), &title, preparation.replacement)?;
         let published = observed_instant()?;
         let published_at = format_instant(published)?;
         let retention = retention(&request.retention, published)?;
         let warnings = publish_warnings(&mut source)?;
         let filesystem_capacity = filesystem_capacity(self.catalogue.root())?;
         let operation_id = allocate_id(connection, "operation_intents")?;
-        let artifact_id = match replacement {
+        let artifact_id = match preparation.replacement {
             Some(replacement) => replacement.artifact.id.clone(),
             None => allocate_id(connection, "artifacts")?,
         };
@@ -693,7 +960,7 @@ impl ArtifactService {
             logical_bytes: source.logical_bytes(),
             published_at: &published_at,
         });
-        let artifact = replacement_artifact_representation(artifact, replacement);
+        let artifact = replacement_artifact_representation(artifact, preparation.replacement);
         let revision = self.revision_representation(NewRevision {
             revision_id: &revision_id,
             artifact_id: &artifact_id,
@@ -704,7 +971,6 @@ impl ArtifactService {
             manifest_digest: "",
             published_at: &published_at,
         });
-        let replacement_intent = replacement.map(replacement_intent);
         let intent = PublishIntent {
             protocol: "publish_artifact_v2".into(),
             operation_id: operation_id.clone(),
@@ -713,18 +979,22 @@ impl ArtifactService {
             revision,
             payload_digest: None,
             source_snapshot_digest: source.snapshot_digest(),
+            source_root_snapshot_digest: source.root_snapshot_digest(),
             capacity_reservation_bytes: source.logical_bytes(),
-            idempotency_key: idempotency_key.to_owned(),
-            fingerprint: fingerprint.to_owned(),
+            idempotency_key: preparation.idempotency_key.to_owned(),
+            fingerprint: preparation.fingerprint.to_owned(),
+            publication_method: Some(preparation.publication_method),
+            request_identity: (preparation.publication_method == PublicationMethod::Import)
+                .then(|| import_request_identity(preparation.idempotency_key)),
             warnings,
-            replacement: replacement_intent,
+            replacement: preparation.replacement.map(replacement_intent),
         };
         record_publish_intent(
             connection,
             &intent,
             PublishReservation {
-                idempotency_key,
-                fingerprint,
+                idempotency_key: preparation.idempotency_key,
+                fingerprint: preparation.fingerprint,
                 project_id: &request.project_id,
                 required_bytes: source.logical_bytes(),
                 capacity: CapacityPolicy {
@@ -733,7 +1003,7 @@ impl ArtifactService {
                     filesystem_available_bytes: filesystem_capacity.0,
                     reserve_bytes: filesystem_capacity.1,
                 },
-                kind: if replacement.is_some() {
+                kind: if preparation.replacement.is_some() {
                     ReservationKind::Replace
                 } else {
                     ReservationKind::Publish
@@ -776,8 +1046,12 @@ impl ArtifactService {
         ) {
             Ok(staged) => staged,
             Err(error) => {
-                self.fail_prepared_publish(connection, &prepared, idempotency_key, &error)?;
-                return Err(error);
+                return Err(self.record_publish_failure(
+                    connection,
+                    &prepared,
+                    idempotency_key,
+                    error,
+                ));
             }
         };
         publish_fault(
@@ -790,10 +1064,17 @@ impl ArtifactService {
         let finalized = match self.storage.finalize(staged) {
             Ok(finalized) => finalized,
             Err(error) => {
-                self.fail_prepared_publish(connection, &prepared, idempotency_key, &error)?;
-                return Err(error);
+                return Err(self.record_publish_failure(
+                    connection,
+                    &prepared,
+                    idempotency_key,
+                    error,
+                ));
             }
         };
+        if let Err(error) = prepared.source.verify_unchanged() {
+            return Err(self.record_publish_failure(connection, &prepared, idempotency_key, error));
+        }
         let completed = completed_intent(staged_intent, &finalized);
         publish_fault(
             "OBS_TEST_FAIL_PUBLISH_AFTER_FINALIZE",
@@ -807,22 +1088,39 @@ impl ArtifactService {
         commit_publish_visibility(connection, &completed, idempotency_key)
     }
 
-    fn fail_prepared_publish(
+    fn record_publish_failure(
         &self,
         connection: &Connection,
         prepared: &PreparedPublish,
         idempotency_key: &str,
-        error: &AppError,
-    ) -> Result<(), AppError> {
-        self.storage
-            .quarantine_interrupted(&prepared.operation_id, &prepared.revision_id)?;
-        fail_publish_intent(
+        error: AppError,
+    ) -> AppError {
+        let quarantine_error = self
+            .storage
+            .quarantine_interrupted(&prepared.operation_id, &prepared.revision_id)
+            .err();
+        let recorded_error = match quarantine_error.as_ref() {
+            Some(cleanup_error) => error.with_cleanup_error(cleanup_error),
+            None => error,
+        };
+        match fail_publish_intent(
             connection,
             &prepared.operation_id,
             idempotency_key,
-            error,
+            &recorded_error,
             true,
-        )
+        ) {
+            Ok(()) => recorded_error,
+            Err(persistence_error) => {
+                let cleanup_error = match quarantine_error {
+                    Some(quarantine_error) => AppError::internal(format!(
+                        "Publish quarantine and failure persistence both failed: {quarantine_error}; {persistence_error}"
+                    )),
+                    None => persistence_error,
+                };
+                recorded_error.with_cleanup_error(&cleanup_error)
+            }
+        }
     }
 
     pub(crate) fn show_artifact(&self, id: &str) -> Result<Artifact, AppError> {
@@ -1534,6 +1832,16 @@ impl Artifact {
     }
 }
 
+impl ImportOutcome {
+    pub(crate) const fn result(&self) -> &ImportResult {
+        &self.result
+    }
+
+    pub(crate) const fn replayed(&self) -> bool {
+        self.replayed
+    }
+}
+
 impl PublishOutcome {
     pub(crate) const fn result(&self) -> &PublishResult {
         &self.result
@@ -1830,7 +2138,12 @@ fn resumable_publish(
     }
     let normalized_source = normalized_source_selection(&request.source.path)?;
     let source = ArtifactSource::open(Path::new(&normalized_source))?;
-    if source.snapshot_digest() != intent.source_snapshot_digest {
+    if source.snapshot_digest() != intent.source_snapshot_digest
+        || intent
+            .source_root_snapshot_digest
+            .as_ref()
+            .is_some_and(|expected| source.root_snapshot_digest().as_ref() != Some(expected))
+    {
         let error = AppError::source_changed();
         fail_publish_intent(
             connection,
@@ -1960,6 +2273,340 @@ fn publish_fault(variable: &str, phase: &str) -> Result<(), AppError> {
 
 #[cfg(not(feature = "test-faults"))]
 fn publish_fault(_variable: &str, _phase: &str) -> Result<(), AppError> {
+    Ok(())
+}
+
+fn normalized_import_selection(source: &PublishSource) -> Option<String> {
+    let selected = Path::new(&source.path);
+    let absolute = if selected.is_absolute() {
+        selected.to_path_buf()
+    } else {
+        Path::new(&source.caller_working_directory).join(selected)
+    };
+    normalized_source_selection(&absolute.to_string_lossy()).ok()
+}
+
+fn import_publish_request(
+    request: &ImportArtifactsRequest,
+    item: &ImportItem,
+    normalized_selection: Option<&String>,
+) -> Result<PublishArtifactRequest, AppError> {
+    let source_path = normalized_selection
+        .cloned()
+        .ok_or_else(|| AppError::invalid("invalid_source", "source selection is invalid"))?;
+    let options = item.options.as_ref().unwrap_or(&request.defaults);
+    let default = &request.defaults;
+    Ok(PublishArtifactRequest {
+        source: PublishSource {
+            path: source_path,
+            caller_working_directory: item.source.caller_working_directory.clone(),
+        },
+        project_id: options
+            .project_id
+            .clone()
+            .or_else(|| default.project_id.clone())
+            .unwrap_or_else(|| request.project_id.clone()),
+        entry: options.entry.clone().or_else(|| default.entry.clone()),
+        title: options.title.clone().or_else(|| default.title.clone()),
+        description: options
+            .description
+            .clone()
+            .or_else(|| default.description.clone()),
+        slug: options.slug.clone().or_else(|| default.slug.clone()),
+        retention: options
+            .retention
+            .clone()
+            .or_else(|| default.retention.clone())
+            .unwrap_or_default(),
+    })
+}
+
+fn import_fallback_label(item: &ImportItem, index: usize) -> String {
+    Path::new(&item.source.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 200
+                && !name.chars().any(char::is_control)
+                && !name.contains(['/', '\\'])
+        })
+        .map_or_else(|| format!("item-{index}"), str::to_owned)
+}
+
+fn import_label(item: &ImportItem, index: usize) -> Result<String, AppError> {
+    let label = item
+        .label
+        .clone()
+        .unwrap_or_else(|| import_fallback_label(item, index));
+    if label.trim().is_empty()
+        || label.len() > 200
+        || label.chars().any(char::is_control)
+        || label.contains('/')
+        || label.contains('\\')
+    {
+        return Err(AppError::invalid(
+            "invalid_import_label",
+            "import label must be a nonempty safe label of at most 200 characters",
+        ));
+    }
+    Ok(label)
+}
+
+fn aggregate_import_items(items: Vec<ImportItemOutcome>) -> Result<ImportResult, AppError> {
+    let succeeded = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                ImportItemStatus::Committed | ImportItemStatus::UnchangedReplay
+            )
+        })
+        .count();
+    let failed = items.len().saturating_sub(succeeded);
+    let overall = if failed == 0 {
+        ImportOverall::Complete
+    } else if succeeded == 0 {
+        ImportOverall::Failed
+    } else {
+        ImportOverall::Partial
+    };
+    Ok(ImportResult {
+        operation: "import".into(),
+        overall,
+        partial: overall == ImportOverall::Partial,
+        counts: ImportCounts {
+            requested: u64::try_from(items.len())
+                .map_err(|_| AppError::internal("import item count overflow"))?,
+            succeeded: u64::try_from(succeeded)
+                .map_err(|_| AppError::internal("import success count overflow"))?,
+            failed: u64::try_from(failed)
+                .map_err(|_| AppError::internal("import failure count overflow"))?,
+            skipped: 0,
+        },
+        items,
+    })
+}
+
+fn import_success(
+    index: usize,
+    label: String,
+    outcome: &PublishOutcome,
+    duplicate_candidates: Vec<String>,
+) -> Result<ImportItemOutcome, AppError> {
+    let published = outcome.result();
+    Ok(ImportItemOutcome {
+        index: u64::try_from(index).map_err(|_| AppError::internal("import index overflow"))?,
+        label,
+        status: if outcome.replayed() {
+            ImportItemStatus::UnchangedReplay
+        } else {
+            ImportItemStatus::Committed
+        },
+        result: Some(ImportItemResult {
+            artifact_id: published.artifact.id.clone(),
+            artifact_key: published.artifact.key.clone(),
+            artifact_record_version: published.artifact.record_version,
+            artifact_api_url: published.artifact.api_url.clone(),
+            revision_id: published.revision.id.clone(),
+            revision_api_url: published.revision.api_url.clone(),
+            revision_open_url: published.revision.open_url.clone(),
+            open_url: published.artifact.open_url.clone(),
+            detail_url: published.artifact.detail_url.clone(),
+            files: published.artifact.files,
+            logical_bytes: published.artifact.logical_bytes,
+            retention: published.artifact.retention.clone(),
+            warnings: published.warnings.clone(),
+            duplicate_candidates,
+        }),
+        error: None,
+        cleanup_error: None,
+    })
+}
+
+fn import_failure(
+    index: usize,
+    label: String,
+    error: &AppError,
+) -> Result<ImportItemOutcome, AppError> {
+    let failure = error.envelope().get("error").cloned();
+    Ok(ImportItemOutcome {
+        index: u64::try_from(index).map_err(|_| AppError::internal("import index overflow"))?,
+        label,
+        status: ImportItemStatus::Failed,
+        result: None,
+        error: failure,
+        cleanup_error: error.cleanup_error(),
+    })
+}
+
+fn import_item_key(request_key: &str, index: usize) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"observatory-import-v1");
+    digest.update([0]);
+    digest.update(request_key.as_bytes());
+    digest.update([0]);
+    digest.update(index.to_string().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn import_failure_is_trustworthy(
+    connection: &Connection,
+    item_key: &str,
+) -> Result<bool, AppError> {
+    let state = connection
+        .query_row(
+            "SELECT state FROM idempotency_requests WHERE key=?1",
+            [item_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(state
+        .as_deref()
+        .is_none_or(|state| state == "failed_terminal"))
+}
+
+fn import_request_identity(item_key: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(item_key.as_bytes()))
+}
+
+fn import_duplicate_candidates(
+    connection: &Connection,
+    item_key: &str,
+    artifact_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let content_fingerprint = connection
+        .query_row(
+            "SELECT json_extract(details_json,'$.payloadDigest')
+             FROM operation_intents
+             WHERE kind='artifact_publish' AND state='completed'
+               AND json_extract(details_json,'$.idempotencyKey')=?1
+               AND json_extract(details_json,'$.artifact.id')=?2",
+            params![item_key, artifact_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(database_error)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT a.id
+             FROM operation_intents AS operation
+             JOIN artifacts AS a
+               ON a.id=json_extract(operation.details_json,'$.artifact.id')
+             WHERE operation.kind='artifact_publish' AND operation.state='completed'
+               AND a.state='live' AND a.id<>?1
+               AND json_extract(operation.details_json,'$.payloadDigest')=?2
+             ORDER BY a.published_at,a.id",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_map(params![artifact_id, content_fingerprint], |row| row.get(0))
+        .map_err(database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)
+}
+
+fn import_fingerprint(
+    request: &ImportArtifactsRequest,
+    selections: &[Option<String>],
+) -> Result<String, AppError> {
+    let canonical = serde_jcs::to_vec(&serde_json::json!({
+        "apiVersion": 1,
+        "method": "POST",
+        "route": "/api/v1/artifact-imports",
+        "body": request,
+        "normalizedSelections": selections,
+    }))
+    .map_err(|error| AppError::internal(format!("cannot fingerprint import: {error}")))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+fn completed_import_batch(
+    connection: &Connection,
+    batch_key: &str,
+    fingerprint: &str,
+) -> Result<Option<ImportOutcome>, AppError> {
+    let stored = connection
+        .query_row(
+            "SELECT fingerprint,state,response_json FROM idempotency_requests WHERE key=?1",
+            [batch_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error)?;
+    let Some((stored_fingerprint, state, response)) = stored else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint {
+        return Err(AppError::conflict(
+            "idempotency_conflict",
+            "Idempotency-Key was reused with a different import request",
+        ));
+    }
+    if state != "completed" {
+        return Ok(None);
+    }
+    let mut result: ImportResult = serde_json::from_str(
+        response
+            .as_deref()
+            .ok_or_else(|| AppError::internal("completed import has no stored result"))?,
+    )
+    .map_err(|error| AppError::internal(format!("stored import result is invalid: {error}")))?;
+    for item in &mut result.items {
+        if item.status == ImportItemStatus::Committed {
+            item.status = ImportItemStatus::UnchangedReplay;
+        }
+    }
+    Ok(Some(ImportOutcome {
+        result,
+        replayed: true,
+    }))
+}
+
+fn record_import_batch(
+    connection: &mut Connection,
+    batch_key: &str,
+    fingerprint: &str,
+) -> Result<(), AppError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO idempotency_requests(key,fingerprint,state) VALUES (?1,?2,'in_progress')",
+            params![batch_key, fingerprint],
+        )
+        .map_err(database_error)?;
+    transaction.commit().map_err(database_error)
+}
+
+fn complete_import_batch(
+    connection: &mut Connection,
+    batch_key: &str,
+    fingerprint: &str,
+    result: &ImportResult,
+) -> Result<(), AppError> {
+    let encoded = serde_json::to_string(result)
+        .map_err(|error| AppError::internal(format!("cannot store import result: {error}")))?;
+    let changed = connection
+        .execute(
+            "UPDATE idempotency_requests SET state='completed',status_code=200,response_json=?3,completed_at=?4
+             WHERE key=?1 AND fingerprint=?2 AND state='in_progress'",
+            params![batch_key, fingerprint, encoded, format_instant(observed_instant()?)?],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(AppError::conflict(
+            "idempotency_conflict",
+            "import batch idempotency state changed",
+        ));
+    }
     Ok(())
 }
 
@@ -2256,6 +2903,10 @@ fn insert_publish_audit(
     intent: &PublishIntent,
 ) -> Result<(), AppError> {
     let replacing = intent.replacement.is_some();
+    let content_fingerprint = intent
+        .payload_digest
+        .as_deref()
+        .ok_or_else(|| AppError::internal("completed Publish has no content fingerprint"))?;
     transaction
         .execute(
             "INSERT INTO audit_events(kind,details_json,at,actor,cause,resource_type,resource_id)
@@ -2273,11 +2924,14 @@ fn insert_publish_audit(
                         .replacement
                         .as_ref()
                         .map(|replacement| replacement.previous_revision_id.as_str()),
-                    "logicalBytes": intent.artifact.logical_bytes
+                    "logicalBytes": intent.artifact.logical_bytes,
+                    "method": intent.publication_method().as_str(),
+                    "contentFingerprint": content_fingerprint,
+                    "requestIdentity": intent.request_identity
                 })
                 .to_string(),
                 intent.artifact.published_at,
-                if replacing { "replace" } else { "publish" },
+                intent.publication_method().as_str(),
                 intent.artifact.id,
             ],
         )

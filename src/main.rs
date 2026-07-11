@@ -177,12 +177,35 @@ enum ArtifactLeaf {
         #[arg(long)]
         record_version: Option<u64>,
     },
+    Import(ArtifactImportCommand),
     List(ArtifactListCommand),
     Show {
         selector: String,
         #[arg(long)]
         revisions: bool,
     },
+}
+
+#[derive(Debug, Args)]
+struct ArtifactImportCommand {
+    #[arg(required = true)]
+    sources: Vec<PathBuf>,
+    #[arg(long)]
+    entry: Option<String>,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    slug: Option<String>,
+    #[arg(long, value_parser = parse_duration, conflicts_with = "pin")]
+    ttl: Option<u64>,
+    #[arg(long, conflicts_with = "ttl")]
+    pin: bool,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    options: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -400,6 +423,7 @@ async fn run_artifact(
             publish,
             record_version,
         } => run_artifact_replace(context, &artifact, publish, record_version).await,
+        ArtifactLeaf::Import(import) => run_artifact_import(context, import).await,
         ArtifactLeaf::List(list) => run_artifact_list(context, list).await,
         ArtifactLeaf::Show {
             selector,
@@ -500,6 +524,101 @@ async fn run_artifact_replace(
         context.client.json,
     )
     .await
+}
+
+async fn run_artifact_import(
+    context: ProjectClientContext,
+    command: ArtifactImportCommand,
+) -> Result<(), AppError> {
+    let idempotency_key = mutation_idempotency_key(context.idempotency_key)?;
+    if command.reason.is_some() && !command.pin {
+        return Err(AppError::invalid(
+            "invalid_retention",
+            "--reason requires --pin",
+        ));
+    }
+    let project_path = absolute_project_selection(context.selected_project)?;
+    let project_id = resolve_project_selector(
+        &project_path,
+        context.client.server.clone(),
+        context.client.timeout,
+    )
+    .await?;
+    let caller_working_directory = absolute_project_selection(None)?;
+    let options = match command.options {
+        Some(path) => {
+            let path = absolute_source_selection(path)?;
+            let options_json = safe_file::read_regular_utf8(
+                std::path::Path::new(&path),
+                "Artifact import options",
+            )?;
+            let options = serde_json::from_str::<Vec<Option<serde_json::Value>>>(&options_json)
+                .map_err(|error| {
+                    AppError::invalid(
+                        "invalid_import_options",
+                        format!("Artifact import options are invalid JSON: {error}"),
+                    )
+                })?;
+            if options.len() != command.sources.len() {
+                return Err(AppError::invalid(
+                    "invalid_import_options",
+                    "--options must contain one nullable object per source",
+                ));
+            }
+            options
+        }
+        None => vec![None; command.sources.len()],
+    };
+    let retention = if command.pin {
+        serde_json::json!({"mode": "pinned", "pinReason": command.reason})
+    } else if let Some(ttl_ms) = command.ttl {
+        serde_json::json!({"mode": "ttl", "ttlMs": ttl_ms})
+    } else {
+        serde_json::json!({"mode": "default"})
+    };
+    let defaults = serde_json::json!({
+        "entry": command.entry,
+        "title": command.title,
+        "description": command.description,
+        "slug": command.slug,
+        "retention": retention,
+    });
+    let items = command
+        .sources
+        .into_iter()
+        .zip(options)
+        .map(|(source, options)| {
+            absolute_source_selection(source).map(|source| {
+                serde_json::json!({
+                    "source": {
+                        "path": source,
+                        "callerWorkingDirectory": caller_working_directory,
+                    },
+                    "label": serde_json::Value::Null,
+                    "options": options,
+                })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let request = serde_json::json!({
+        "projectId": project_id,
+        "defaults": defaults,
+        "items": items,
+    });
+    let complete = cli::post_batch(
+        context.client.server,
+        context.client.timeout,
+        "/api/v1/artifact-imports",
+        &idempotency_key,
+        &request,
+        context.client.json,
+    )
+    .await?;
+    if complete {
+        Ok(())
+    } else {
+        Err(AppError::batch_result())
+    }
 }
 
 async fn run_artifact_list(
@@ -868,6 +987,9 @@ fn is_project_id(value: &str) -> bool {
 }
 
 fn report(error: &AppError, json_output: bool) -> ExitCode {
+    if error.code() == "batch_result" {
+        return ExitCode::from(error.exit_code());
+    }
     let mut stderr = std::io::stderr().lock();
     if json_output {
         let _ = serde_json::to_writer(&mut stderr, &error.envelope());

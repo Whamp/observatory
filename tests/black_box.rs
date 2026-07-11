@@ -1523,6 +1523,818 @@ fn assert_directory_tree_race(mutation: &str) {
 }
 
 #[test]
+fn artifact_import_commits_independently_and_replays_ordered_outcomes() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("import-project");
+    fs::create_dir(&project_directory).expect("import Project");
+    let bundle = harness._root.path().join("import-bundle");
+    fs::create_dir(&bundle).expect("import bundle");
+    fs::write(bundle.join("index.html"), "<h1>Imported</h1>").expect("import entry");
+    fs::write(bundle.join("notes.txt"), "migration notes").expect("import support");
+    let private_fragment = harness
+        ._root
+        .path()
+        .file_name()
+        .expect("private root name")
+        .to_string_lossy()
+        .into_owned();
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-import-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Import Project"}))
+        .send()
+        .expect("register import Project")
+        .json::<Value>()
+        .expect("import Project JSON");
+    let request = serde_json::json!({
+        "projectId": project["result"]["id"],
+        "defaults": {
+            "retention": {"mode": "default"},
+            "entry": null,
+            "title": null,
+            "description": null,
+            "slug": null
+        },
+        "items": [
+            {
+                "source": {"path": bundle, "callerWorkingDirectory": harness._root.path()},
+                "label": "portable-baseline",
+                "options": {"title": "Imported Baseline"}
+            },
+            {
+                "source": {"path": harness._root.path().join("missing-private-source"), "callerWorkingDirectory": harness._root.path()},
+                "label": null,
+                "options": null
+            }
+        ]
+    });
+    let import = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-import-batch")
+        .json(&request)
+        .send()
+        .expect("import batch");
+    assert_eq!(import.status(), 200);
+    let import = import.json::<Value>().expect("import JSON");
+    assert_eq!(import["ok"], true);
+    assert_eq!(import["result"]["operation"], "import");
+    assert_eq!(import["result"]["overall"], "partial");
+    assert_eq!(import["result"]["partial"], true);
+    assert_eq!(
+        import["result"]["counts"],
+        serde_json::json!({
+            "requested": 2, "succeeded": 1, "failed": 1, "skipped": 0
+        })
+    );
+    assert_eq!(import["result"]["items"][0]["index"], 0);
+    assert_eq!(import["result"]["items"][0]["label"], "portable-baseline");
+    assert_eq!(import["result"]["items"][0]["status"], "committed");
+    assert_eq!(import["result"]["items"][0]["result"]["files"], 2);
+    assert_eq!(
+        import["result"]["items"][0]["result"]["duplicateCandidates"],
+        serde_json::json!([])
+    );
+    assert!(import["result"]["items"][0]["result"]["artifactId"].is_string());
+    assert!(import["result"]["items"][0]["result"]["artifactKey"].is_string());
+    assert_eq!(
+        import["result"]["items"][0]["result"]["artifactRecordVersion"],
+        1
+    );
+    assert!(import["result"]["items"][0]["result"]["artifactApiUrl"].is_string());
+    assert!(import["result"]["items"][0]["result"]["revisionId"].is_string());
+    assert!(import["result"]["items"][0]["result"]["revisionApiUrl"].is_string());
+    assert!(import["result"]["items"][0]["result"]["revisionOpenUrl"].is_string());
+    assert!(import["result"]["items"][0].get("error").is_none());
+    assert_eq!(import["result"]["items"][1]["index"], 1);
+    assert_eq!(
+        import["result"]["items"][1]["label"],
+        "missing-private-source"
+    );
+    assert_eq!(import["result"]["items"][1]["status"], "failed");
+    assert!(import["result"]["items"][1].get("result").is_none());
+    assert_eq!(
+        import["result"]["items"][1]["error"]["code"],
+        "invalid_source"
+    );
+    assert!(!import.to_string().contains(&private_fragment));
+
+    let replay = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-import-batch")
+        .json(&request)
+        .send()
+        .expect("replay import batch");
+    assert_eq!(replay.status(), 200);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let replay = replay.json::<Value>().expect("replay import JSON");
+    assert_eq!(replay["result"]["items"][0]["status"], "unchanged_replay");
+    let conflicting_project_directory = harness._root.path().join("conflicting-key-project");
+    fs::create_dir(&conflicting_project_directory).expect("conflicting key Project");
+    let conflicting_key = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-import-batch")
+        .json(&serde_json::json!({"path": conflicting_project_directory}))
+        .send()
+        .expect("deployment-wide import key conflict");
+    assert_eq!(conflicting_key.status(), 409);
+    assert_eq!(
+        conflicting_key
+            .json::<Value>()
+            .expect("deployment-wide key conflict JSON")["error"]["code"],
+        "idempotency_conflict"
+    );
+
+    let artifacts = client
+        .get(harness.url("/api/v1/artifacts?limit=50"))
+        .send()
+        .expect("list imported Artifacts")
+        .json::<Value>()
+        .expect("Artifact list JSON");
+    assert_eq!(
+        artifacts["result"]["items"]
+            .as_array()
+            .expect("Artifact items")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn artifact_import_rejects_every_duplicate_selection_and_binds_the_batch_key() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("duplicate-import-project");
+    fs::create_dir(&project_directory).expect("duplicate import Project");
+    let source = harness._root.path().join("duplicate.html");
+    fs::write(&source, "<h1>Duplicate</h1>").expect("duplicate source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-duplicate-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register duplicate Project")
+        .json::<Value>()
+        .expect("duplicate Project JSON");
+    let request = serde_json::json!({
+        "projectId": project["result"]["id"],
+        "items": [
+            {"source": {"path": source, "callerWorkingDirectory": harness._root.path()}, "label": "first", "options": null},
+            {"source": {"path": harness._root.path().join("folder/../duplicate.html"), "callerWorkingDirectory": harness._root.path()}, "label": "second", "options": null}
+        ]
+    });
+    let response = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-duplicate-batch")
+        .json(&request)
+        .send()
+        .expect("duplicate import");
+    assert_eq!(response.status(), 200);
+    let response = response.json::<Value>().expect("duplicate import JSON");
+    assert_eq!(response["result"]["overall"], "failed");
+    assert_eq!(response["result"]["partial"], false);
+    assert_eq!(response["result"]["counts"]["succeeded"], 0);
+    assert_eq!(response["result"]["counts"]["failed"], 2);
+    for item in response["result"]["items"]
+        .as_array()
+        .expect("duplicate items")
+    {
+        assert_eq!(item["status"], "failed");
+        assert_eq!(item["error"]["code"], "duplicate_selection");
+    }
+    let changed = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-duplicate-batch")
+        .json(&serde_json::json!({
+            "projectId": project["result"]["id"],
+            "items": [{"source": {"path": source, "callerWorkingDirectory": harness._root.path()}, "label": "changed", "options": null}]
+        }))
+        .send()
+        .expect("changed import retry");
+    assert_eq!(changed.status(), 409);
+    assert_eq!(
+        changed.json::<Value>().expect("changed retry JSON")["error"]["code"],
+        "idempotency_conflict"
+    );
+    let artifacts = client
+        .get(harness.url("/api/v1/artifacts?limit=50"))
+        .send()
+        .expect("list after duplicates")
+        .json::<Value>()
+        .expect("list after duplicates JSON");
+    assert!(
+        artifacts["result"]["items"]
+            .as_array()
+            .expect("Artifact items")
+            .is_empty()
+    );
+}
+
+#[test]
+fn artifact_import_keeps_invalid_labels_as_trustworthy_item_failures() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("invalid-label-project");
+    fs::create_dir(&project_directory).expect("invalid label Project");
+    let source = harness._root.path().join("safe-source.html");
+    fs::write(&source, "<h1>Safe source</h1>").expect("invalid label source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-invalid-label-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register invalid label Project")
+        .json::<Value>()
+        .expect("invalid label Project JSON");
+    let response = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-invalid-label-batch")
+        .json(&serde_json::json!({
+            "projectId": project["result"]["id"],
+            "items": [{
+                "source": {
+                    "path": source,
+                    "callerWorkingDirectory": harness._root.path()
+                },
+                "label": "private/path",
+                "options": null
+            }]
+        }))
+        .send()
+        .expect("invalid label import");
+    assert_eq!(response.status(), 200);
+    let response = response.json::<Value>().expect("invalid label import JSON");
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["overall"], "failed");
+    assert_eq!(response["result"]["items"][0]["label"], "safe-source.html");
+    assert_eq!(response["result"]["items"][0]["status"], "failed");
+    assert_eq!(
+        response["result"]["items"][0]["error"]["code"],
+        "invalid_import_label"
+    );
+}
+
+#[test]
+fn artifact_import_retries_after_batch_persistence_without_recreating_artifacts() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("retry-import-project");
+    fs::create_dir(&project_directory).expect("retry import Project");
+    let first_source = harness._root.path().join("retry-first.html");
+    let second_source = harness._root.path().join("retry-second.html");
+    fs::write(&first_source, "<h1>First retry item</h1>").expect("first retry source");
+    fs::write(&second_source, "<h1>Second retry item</h1>").expect("second retry source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-retry-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register retry Project")
+        .json::<Value>()
+        .expect("retry Project JSON");
+    let items = [first_source, second_source]
+        .into_iter()
+        .map(|source| {
+            serde_json::json!({
+                "source": {
+                    "path": source,
+                    "callerWorkingDirectory": harness._root.path()
+                },
+                "label": null,
+                "options": null
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = serde_json::json!({
+        "projectId": project["result"]["id"],
+        "items": items
+    });
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("retry import catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER reject_import_batch_completion
+             BEFORE UPDATE OF response_json ON idempotency_requests
+             WHEN NEW.response_json LIKE '%\"operation\":\"import\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected import batch completion failure'); END;",
+        )
+        .expect("inject import batch completion failure");
+    let first_attempt = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-retry-batch")
+        .json(&request)
+        .send()
+        .expect("first retry import attempt");
+    assert_eq!(first_attempt.status(), 500);
+    let committed_before_retry: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("Artifacts committed before retry");
+    assert_eq!(committed_before_retry, 2);
+    catalogue
+        .execute_batch("DROP TRIGGER reject_import_batch_completion;")
+        .expect("remove import batch completion failure");
+
+    let retry = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-retry-batch")
+        .json(&request)
+        .send()
+        .expect("retry import batch");
+    assert_eq!(retry.status(), 200);
+    let retry = retry.json::<Value>().expect("retry import JSON");
+    assert_eq!(retry["result"]["overall"], "complete");
+    for item in retry["result"]["items"].as_array().expect("retry items") {
+        assert_eq!(item["status"], "unchanged_replay");
+    }
+    let committed_after_retry: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("Artifacts committed after retry");
+    assert_eq!(committed_after_retry, 2);
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn artifact_import_detects_tree_mutation_after_item_acceptance() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS", "400");
+        },
+    );
+    let project_directory = harness._root.path().join("mutating-import-project");
+    fs::create_dir(&project_directory).expect("mutating import Project");
+    let bundle = harness._root.path().join("mutating-import-bundle");
+    fs::create_dir(&bundle).expect("mutating import bundle");
+    fs::write(bundle.join("index.html"), "<h1>Original import</h1>")
+        .expect("mutating import entry");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-mutation-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register mutating import Project")
+        .json::<Value>()
+        .expect("mutating import Project JSON");
+    let request = serde_json::json!({
+        "projectId": project["result"]["id"],
+        "items": [{
+            "source": {
+                "path": bundle,
+                "callerWorkingDirectory": harness._root.path()
+            },
+            "label": null,
+            "options": null
+        }]
+    });
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("mutating import catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER reject_mutation_batch_completion
+             BEFORE UPDATE OF response_json ON idempotency_requests
+             WHEN NEW.response_json LIKE '%\"operation\":\"import\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected mutation batch completion failure'); END;",
+        )
+        .expect("inject mutation batch completion failure");
+    let import_client = client.clone();
+    let import_url = harness.url("/api/v1/artifact-imports");
+    let import_request = request.clone();
+    let importing = thread::spawn(move || {
+        import_client
+            .post(import_url)
+            .header("Idempotency-Key", "issue-26-mutation-batch")
+            .json(&import_request)
+            .send()
+            .expect("mutating import")
+    });
+    for _ in 0..100 {
+        let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+            .expect("mutating import catalogue");
+        let accepted: bool = catalogue
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_intents WHERE kind='artifact_publish')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mutating import intent state");
+        if accepted {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o750))
+        .expect("mutate imported root metadata");
+    let quarantine = harness.storage.join("quarantine");
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o500))
+        .expect("block import quarantine");
+    let first_attempt = importing.join().expect("mutating import worker");
+    fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))
+        .expect("restore import quarantine");
+    assert_eq!(first_attempt.status(), 500);
+    catalogue
+        .execute_batch("DROP TRIGGER reject_mutation_batch_completion;")
+        .expect("remove mutation batch completion failure");
+    let changed = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-mutation-batch")
+        .json(&request)
+        .send()
+        .expect("replay mutating import");
+    assert_eq!(changed.status(), 200);
+    let changed = changed.json::<Value>().expect("mutating import JSON");
+    assert_eq!(changed["result"]["overall"], "failed");
+    assert_eq!(changed["result"]["items"][0]["status"], "failed");
+    assert_eq!(
+        changed["result"]["items"][0]["error"]["code"],
+        "source_changed"
+    );
+    assert_eq!(
+        changed["result"]["items"][0]["cleanupError"]["code"],
+        "internal"
+    );
+    let visible: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("mutating import visible Artifacts");
+    assert_eq!(visible, 0);
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn artifact_import_does_not_complete_a_batch_with_nonterminal_item_state() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS", "400");
+        },
+    );
+    let project_directory = harness._root.path().join("nonterminal-import-project");
+    fs::create_dir(&project_directory).expect("nonterminal import Project");
+    let bundle = harness._root.path().join("nonterminal-import-bundle");
+    fs::create_dir(&bundle).expect("nonterminal import bundle");
+    fs::write(bundle.join("index.html"), "<h1>Nonterminal import</h1>")
+        .expect("nonterminal import entry");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-nonterminal-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register nonterminal import Project")
+        .json::<Value>()
+        .expect("nonterminal import Project JSON");
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("nonterminal import catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER reject_import_item_failure
+             BEFORE UPDATE OF state ON operation_intents
+             WHEN NEW.state='failed_terminal'
+             BEGIN SELECT RAISE(ABORT, 'injected item failure persistence error'); END;",
+        )
+        .expect("inject item failure persistence error");
+    let import_client = client.clone();
+    let import_url = harness.url("/api/v1/artifact-imports");
+    let caller = harness._root.path().to_path_buf();
+    let import_bundle = bundle.clone();
+    let project_id = project["result"]["id"].clone();
+    let importing = thread::spawn(move || {
+        import_client
+            .post(import_url)
+            .header("Idempotency-Key", "issue-26-nonterminal-batch")
+            .json(&serde_json::json!({
+                "projectId": project_id,
+                "items": [{
+                    "source": {
+                        "path": import_bundle,
+                        "callerWorkingDirectory": caller
+                    },
+                    "label": null,
+                    "options": null
+                }]
+            }))
+            .send()
+            .expect("nonterminal import")
+    });
+    for _ in 0..100 {
+        let accepted: bool = catalogue
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_intents WHERE kind='artifact_publish')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("nonterminal import intent state");
+        if accepted {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o750))
+        .expect("mutate nonterminal import root");
+    let response = importing.join().expect("nonterminal import worker");
+    assert_eq!(response.status(), 422);
+    let response = response.json::<Value>().expect("nonterminal import JSON");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "source_changed");
+    let batch_state: String = catalogue
+        .query_row(
+            "SELECT state FROM idempotency_requests WHERE key='issue-26-nonterminal-batch'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("nonterminal batch state");
+    assert_eq!(batch_state, "in_progress");
+    let visible: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("nonterminal visible Artifacts");
+    assert_eq!(visible, 0);
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn artifact_import_retry_detects_changed_root_metadata_after_restart() {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_FAIL_PUBLISH_AFTER_INTENT", "1");
+        },
+    );
+    let project_directory = harness._root.path().join("restart-root-import-project");
+    fs::create_dir(&project_directory).expect("restart root import Project");
+    let bundle = harness._root.path().join("restart-root-import-bundle");
+    fs::create_dir(&bundle).expect("restart root import bundle");
+    fs::write(bundle.join("index.html"), "<h1>Restart root</h1>")
+        .expect("restart root import entry");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-restart-root-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register restart root Project")
+        .json::<Value>()
+        .expect("restart root Project JSON");
+    let request = serde_json::json!({
+        "projectId": project["result"]["id"],
+        "items": [{
+            "source": {
+                "path": bundle,
+                "callerWorkingDirectory": harness._root.path()
+            },
+            "label": null,
+            "options": null
+        }]
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-restart-root-batch")
+        .json(&request)
+        .send()
+        .expect("interrupt restart root import");
+    assert_eq!(interrupted.status(), 500);
+    harness.restart_configured(|_| {});
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o750))
+        .expect("change restart root metadata");
+    let changed = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-restart-root-batch")
+        .json(&request)
+        .send()
+        .expect("retry restart root import");
+    assert_eq!(changed.status(), 200);
+    let changed = changed.json::<Value>().expect("restart root import JSON");
+    assert_eq!(changed["result"]["overall"], "failed");
+    assert_eq!(
+        changed["result"]["items"][0]["error"]["code"],
+        "source_changed"
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("restart root import catalogue");
+    let visible: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("restart root visible Artifacts");
+    assert_eq!(visible, 0);
+}
+
+#[test]
+fn artifact_import_reports_duplicate_candidates_and_redacted_provenance() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("provenance-import-project");
+    fs::create_dir(&project_directory).expect("provenance import Project");
+    let first_source = harness._root.path().join("first-copy");
+    let second_source = harness._root.path().join("second-copy");
+    fs::create_dir(&first_source).expect("first import directory");
+    fs::create_dir(&second_source).expect("second import directory");
+    fs::write(
+        first_source.join("index.html"),
+        "<h1>Same imported bytes</h1>",
+    )
+    .expect("first import source");
+    fs::copy(
+        first_source.join("index.html"),
+        second_source.join("index.html"),
+    )
+    .expect("second import source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-26-provenance-project")
+        .json(&serde_json::json!({"path": project_directory}))
+        .send()
+        .expect("register provenance Project")
+        .json::<Value>()
+        .expect("provenance Project JSON");
+    let import_source = |source: &Path, key: &str| {
+        client
+            .post(harness.url("/api/v1/artifact-imports"))
+            .header("Idempotency-Key", key)
+            .json(&serde_json::json!({
+                "projectId": project["result"]["id"],
+                "items": [{
+                    "source": {
+                        "path": source,
+                        "callerWorkingDirectory": harness._root.path()
+                    },
+                    "label": null,
+                    "options": null
+                }]
+            }))
+            .send()
+            .expect("import matching source")
+            .json::<Value>()
+            .expect("matching import JSON")
+    };
+    let first = import_source(&first_source, "issue-26-provenance-first");
+    let first_artifact_id = first["result"]["items"][0]["result"]["artifactId"]
+        .as_str()
+        .expect("first imported Artifact ID");
+    assert_eq!(
+        first["result"]["items"][0]["result"]["duplicateCandidates"],
+        serde_json::json!([])
+    );
+    let second = import_source(&second_source, "issue-26-provenance-second");
+    assert_eq!(
+        second["result"]["items"][0]["result"]["duplicateCandidates"],
+        serde_json::json!([first_artifact_id])
+    );
+
+    let replacement_shape = client
+        .post(harness.url("/api/v1/artifact-imports"))
+        .header("Idempotency-Key", "issue-26-import-replacement-rejected")
+        .json(&serde_json::json!({
+            "projectId": project["result"]["id"],
+            "items": [{
+                "source": {
+                    "path": first_source,
+                    "callerWorkingDirectory": harness._root.path()
+                },
+                "label": null,
+                "options": null,
+                "artifactId": first_artifact_id
+            }]
+        }))
+        .send()
+        .expect("reject replacement-shaped import");
+    assert_eq!(replacement_shape.status(), 422);
+
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("import provenance catalogue");
+    let provenance = catalogue
+        .prepare(
+            "SELECT details_json FROM audit_events
+             WHERE kind='artifact_published' AND cause='import' ORDER BY sequence",
+        )
+        .expect("prepare import provenance query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query import provenance")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect import provenance");
+    assert_eq!(provenance.len(), 2);
+    for details in provenance {
+        let details = serde_json::from_str::<Value>(&details).expect("import provenance JSON");
+        assert_eq!(details["method"], "import");
+        assert!(
+            details["contentFingerprint"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+        assert!(
+            details["requestIdentity"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+        let encoded = details.to_string();
+        assert!(!encoded.contains(harness._root.path().to_str().expect("private root")));
+        for private_field in ["device", "inode", "owner", "permissions"] {
+            assert!(!encoded.contains(private_field));
+        }
+    }
+}
+
+#[test]
+fn artifact_import_cli_reports_complete_and_partial_batches() {
+    let harness = Harness::start();
+    let server = format!("http://{}", harness.address);
+    let project_directory = harness._root.path().join("import-cli-project");
+    fs::create_dir(&project_directory).expect("import CLI Project");
+    let project_path = project_directory.to_str().expect("import CLI Project path");
+    let registered = cli(
+        &server,
+        &[
+            "--idempotency-key",
+            "issue-26-import-cli-project",
+            "project",
+            "register",
+            project_path,
+        ],
+    );
+    assert!(registered.status.success(), "{registered:?}");
+    let source = harness._root.path().join("import-cli.html");
+    fs::write(&source, "<h1>CLI import</h1>").expect("import CLI source");
+    let complete = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-26-import-cli-complete",
+            "artifact",
+            "import",
+            source.to_str().expect("import CLI source path"),
+            "--title",
+            "CLI Imported",
+        ],
+    );
+    assert!(complete.status.success(), "{complete:?}");
+    assert!(complete.stderr.is_empty());
+    let complete_json =
+        serde_json::from_slice::<Value>(&complete.stdout).expect("complete CLI JSON");
+    assert_eq!(complete_json["result"]["overall"], "complete");
+    assert_eq!(complete_json["result"]["items"][0]["status"], "committed");
+
+    let missing = harness._root.path().join("missing-cli-import");
+    let partial = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-26-import-cli-partial",
+            "artifact",
+            "import",
+            source.to_str().expect("import CLI source path"),
+            missing.to_str().expect("missing CLI source path"),
+        ],
+    );
+    assert_eq!(partial.status.code(), Some(8), "{partial:?}");
+    assert!(partial.stderr.is_empty());
+    let partial_json = serde_json::from_slice::<Value>(&partial.stdout).expect("partial CLI JSON");
+    assert_eq!(partial_json["ok"], true);
+    assert_eq!(partial_json["result"]["overall"], "partial");
+
+    let bad_options_path = harness._root.path().join("bad-import-options.json");
+    fs::write(&bad_options_path, "[]").expect("bad import options");
+    let bad_options = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-26-import-cli-options",
+            "artifact",
+            "import",
+            source.to_str().expect("import CLI source path"),
+            "--options",
+            bad_options_path.to_str().expect("bad options path"),
+        ],
+    );
+    assert_eq!(bad_options.status.code(), Some(2));
+    assert!(bad_options.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bad_options.stderr).expect("bad options JSON")["error"]["code"],
+        "invalid_import_options"
+    );
+    let help = obs()
+        .args(["artifact", "import", "--help"])
+        .output()
+        .expect("Artifact import help");
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    for option in [
+        "--entry",
+        "--title",
+        "--description",
+        "--slug",
+        "--ttl",
+        "--pin",
+        "--reason",
+        "--options",
+    ] {
+        assert!(help.contains(option), "missing {option}: {help}");
+    }
+}
+
+#[test]
 fn artifact_replacement_preserves_identity_and_immutable_revision_history() {
     let harness = Harness::start_configured(
         |_| {},
@@ -2411,7 +3223,7 @@ fn artifact_publish_rejects_unsafe_or_unsupported_sources_without_path_disclosur
 
     for (ordinal, source, expected_status, expected_code) in [
         ("unsupported", &unsupported, 415, "unsupported_entry_media"),
-        ("symlink", &symlink, 422, "invalid_input"),
+        ("symlink", &symlink, 422, "invalid_source"),
         ("hardlink", &hard_link, 422, "unsafe_source"),
         ("backslash", &backslash, 422, "invalid_source"),
         ("double-decode", &double_decode, 422, "invalid_source"),

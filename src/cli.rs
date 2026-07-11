@@ -205,6 +205,32 @@ pub async fn post<T: Serialize>(
     emit_response(response, json_output, Some(idempotency_key)).await
 }
 
+pub async fn post_batch<T: Serialize>(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    path: &str,
+    idempotency_key: &str,
+    body: &T,
+    json_output: bool,
+) -> Result<bool, AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .post(endpoint(&server, path))
+        .header("accept", "application/json")
+        .header("idempotency-key", idempotency_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, Some(idempotency_key)))?;
+    let envelope = decode_response(response, Some(idempotency_key)).await?;
+    let complete = envelope
+        .pointer("/result/overall")
+        .and_then(Value::as_str)
+        .is_some_and(|overall| overall == "complete");
+    emit_envelope(&envelope, json_output)?;
+    Ok(complete)
+}
+
 pub async fn validate(
     server_override: Option<String>,
     timeout_override_ms: Option<u64>,
@@ -251,8 +277,12 @@ async fn emit_response(
     idempotency_key: Option<&str>,
 ) -> Result<(), AppError> {
     let envelope = decode_response(response, idempotency_key).await?;
+    emit_envelope(&envelope, json_output)
+}
+
+fn emit_envelope(envelope: &Value, json_output: bool) -> Result<(), AppError> {
     let rendered = if json_output {
-        serde_json::to_vec(&envelope)
+        serde_json::to_vec(envelope)
     } else {
         let result = envelope.get("result").cloned().unwrap_or(Value::Null);
         serde_json::to_vec_pretty(&result).map(|mut rendered| {

@@ -14,8 +14,8 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::{
-    ArtifactService, ListArtifactsQuery, ListRevisionsQuery, PublishArtifactRequest,
-    PublishOutcome, ReplaceArtifactRequest, ServedRevision,
+    ArtifactService, ImportArtifactsRequest, ImportOutcome, ListArtifactsQuery, ListRevisionsQuery,
+    PublishArtifactRequest, PublishOutcome, ReplaceArtifactRequest, ServedRevision,
 };
 use crate::catalogue::{Catalogue, CatalogueCounts, CataloguePolicy};
 use crate::config::{EffectiveConfiguration, validate_proposal};
@@ -217,6 +217,7 @@ pub fn router(state: ApplicationState) -> Router {
             "/api/v1/artifacts",
             get(list_artifacts).post(publish_artifact),
         )
+        .route("/api/v1/artifact-imports", post(import_artifacts))
         .route("/api/v1/artifacts/{artifact_id}", get(show_artifact))
         .route(
             "/api/v1/artifacts/{artifact_id}/replace",
@@ -1144,6 +1145,40 @@ async fn publish_artifact(
     }
 }
 
+async fn import_artifacts(
+    State(state): State<ApplicationState>,
+    headers: HeaderMap,
+    request: Result<Json<ImportArtifactsRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return api_failure(rejection.status(), &AppError::usage(rejection.body_text()));
+        }
+    };
+    if let Err(error) = authorize_api_browser_mutation(&state, &headers, "artifact.import") {
+        return api_error(&error);
+    }
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::invalid(
+            "invalid_idempotency_key",
+            "Idempotency-Key is required",
+        ));
+    };
+    let artifacts = state.artifacts.clone();
+    match tokio::task::spawn_blocking(move || artifacts.import(&request, &idempotency_key)).await {
+        Ok(Ok(outcome)) => artifact_import_response(&outcome),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Artifact import worker failed: {error}"
+        ))),
+    }
+}
+
 async fn replace_artifact(
     State(state): State<ApplicationState>,
     AxumPath(artifact_id): AxumPath<String>,
@@ -1451,6 +1486,16 @@ fn canonical_byte_url(
     }
     url.set_query(query);
     Ok(url)
+}
+
+fn artifact_import_response(outcome: &ImportOutcome) -> Response {
+    let mut response = (StatusCode::OK, Json(Success::new(outcome.result()))).into_response();
+    if outcome.replayed() {
+        response
+            .headers_mut()
+            .insert("idempotency-replayed", HeaderValue::from_static("true"));
+    }
+    no_store(response)
 }
 
 fn artifact_publish_response(outcome: &PublishOutcome) -> Response {

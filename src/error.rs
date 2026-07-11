@@ -44,6 +44,7 @@ pub enum CliExit {
     Unavailable,
     Contention,
     SourceChanged,
+    BatchResult,
     Internal,
 }
 
@@ -56,6 +57,7 @@ impl CliExit {
             Self::Unavailable => 5,
             Self::Contention => 6,
             Self::SourceChanged => 7,
+            Self::BatchResult => 8,
             Self::Internal => 10,
         }
     }
@@ -118,6 +120,8 @@ pub(crate) struct StoredError {
     details: Value,
     exit: CliExit,
     api_status: ApiStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_error: Option<Box<StoredError>>,
 }
 
 #[derive(Debug)]
@@ -129,6 +133,7 @@ pub struct AppError {
     exit: CliExit,
     api_status: ApiStatus,
     replayed: bool,
+    cleanup_error: Option<Box<StoredError>>,
 }
 
 impl AppError {
@@ -209,6 +214,16 @@ impl AppError {
             Retryability::Retryable,
             CliExit::Contention,
             ApiStatus::Locked,
+        )
+    }
+
+    pub fn batch_result() -> Self {
+        Self::new(
+            "batch_result",
+            "batch completed with unsuccessful items",
+            Retryability::Terminal,
+            CliExit::BatchResult,
+            ApiStatus::Internal,
         )
     }
 
@@ -349,6 +364,7 @@ impl AppError {
             exit,
             api_status: ApiStatus::Internal,
             replayed: false,
+            cleanup_error: None,
         }
     }
 
@@ -360,6 +376,7 @@ impl AppError {
             details: self.details.clone(),
             exit: self.exit,
             api_status: self.api_status,
+            cleanup_error: self.cleanup_error.clone(),
         }
     }
 
@@ -372,11 +389,28 @@ impl AppError {
             exit: stored.exit,
             api_status: stored.api_status,
             replayed: true,
+            cleanup_error: stored.cleanup_error,
         }
     }
 
     pub const fn replayed(&self) -> bool {
         self.replayed
+    }
+
+    pub(crate) fn with_cleanup_error(mut self, cleanup_error: &Self) -> Self {
+        self.cleanup_error = Some(Box::new(cleanup_error.stored()));
+        self
+    }
+
+    pub(crate) fn cleanup_error(&self) -> Option<Value> {
+        self.cleanup_error.as_deref().map(|error| {
+            json!({
+                "code": error.code,
+                "message": error.message,
+                "retryable": error.retryability.as_bool(),
+                "details": error.details
+            })
+        })
     }
 
     pub fn envelope(&self) -> Value {
@@ -419,6 +453,7 @@ impl AppError {
             exit,
             api_status,
             replayed: false,
+            cleanup_error: None,
         }
     }
 }

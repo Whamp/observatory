@@ -247,5 +247,8 @@ fn split_path(path: &Path) -> Result<(&Path, Vec<OsString>), AppError> {
 }
 
 fn safe_open_error(_path: &Path, error: rustix::io::Errno) -> AppError {
-    AppError::usage(format!("cannot safely open selected path: {error}"))
+    AppError::invalid(
+        "invalid_source",
+        format!("cannot safely open selected path: {error}"),
+    )
 }

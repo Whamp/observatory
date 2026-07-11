@@ -22,6 +22,7 @@ pub(crate) enum ArtifactSource {
 
 pub(crate) struct DirectorySource {
     root: File,
+    root_snapshot: SourceSnapshot,
     basename: String,
     members: Vec<SourceMember>,
     files: u64,
@@ -122,6 +123,20 @@ impl ArtifactSource {
         }
     }
 
+    pub(crate) fn root_snapshot_digest(&self) -> Option<String> {
+        match self {
+            Self::File(_) => None,
+            Self::Directory(source) => Some(source.root_snapshot_digest()),
+        }
+    }
+
+    pub(crate) fn verify_unchanged(&self) -> Result<(), AppError> {
+        match self {
+            Self::File(source) => source.verify_unchanged(),
+            Self::Directory(source) => source.verify_unchanged(),
+        }
+    }
+
     pub(crate) fn portable_title(&self) -> Option<&str> {
         match self {
             Self::File(_) => None,
@@ -194,7 +209,9 @@ impl ArtifactSource {
 
 impl DirectorySource {
     fn open(root: File, basename: &str) -> Result<Self, AppError> {
-        let root_device = root.metadata().map_err(|error| source_error(&error))?.dev();
+        let root_metadata = root.metadata().map_err(|error| source_error(&error))?;
+        let root_device = root_metadata.dev();
+        let root_snapshot = snapshot_from_metadata(&root_metadata, true)?;
         let mut members = Vec::new();
         let mut inventory = BTreeMap::new();
         walk_directory(&root, "", root_device, &mut members, &mut inventory)?;
@@ -215,6 +232,7 @@ impl DirectorySource {
         })?;
         Ok(Self {
             root,
+            root_snapshot,
             basename: basename.to_owned(),
             members,
             files,
@@ -286,30 +304,27 @@ impl DirectorySource {
         for (path, snapshot) in &self.inventory {
             digest.update(path.as_bytes());
             digest.update([0]);
-            for value in [
-                snapshot.device,
-                snapshot.inode,
-                snapshot.links,
-                snapshot.size,
-                snapshot.modified_seconds.cast_unsigned(),
-                snapshot.modified_nanoseconds,
-                snapshot.changed_seconds.cast_unsigned(),
-                snapshot.changed_nanoseconds,
-            ] {
-                digest.update(value.to_be_bytes());
-            }
+            update_snapshot_digest(&mut digest, snapshot);
         }
+        format!("sha256:{:x}", digest.finalize())
+    }
+
+    fn root_snapshot_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"observatory-directory-root-snapshot-v1\0");
+        update_snapshot_digest(&mut digest, &self.root_snapshot);
         format!("sha256:{:x}", digest.finalize())
     }
 
     pub(crate) fn verify_unchanged(&self) -> Result<(), AppError> {
         let mut members = Vec::new();
         let mut inventory = BTreeMap::new();
-        let root_device = self
-            .root
-            .metadata()
-            .map_err(|error| source_error(&error))?
-            .dev();
+        let root_metadata = self.root.metadata().map_err(|error| source_error(&error))?;
+        let root_snapshot = snapshot_from_metadata(&root_metadata, true)?;
+        if root_snapshot != self.root_snapshot {
+            return Err(AppError::source_changed());
+        }
+        let root_device = root_metadata.dev();
         if walk_directory(&self.root, "", root_device, &mut members, &mut inventory).is_err() {
             return Err(AppError::source_changed());
         }
@@ -493,6 +508,40 @@ fn read_portable_metadata(
     Ok(Some(metadata))
 }
 
+fn update_snapshot_digest(digest: &mut Sha256, snapshot: &SourceSnapshot) {
+    for value in [
+        snapshot.device,
+        snapshot.inode,
+        snapshot.links,
+        snapshot.size,
+        snapshot.modified_seconds.cast_unsigned(),
+        snapshot.modified_nanoseconds,
+        snapshot.changed_seconds.cast_unsigned(),
+        snapshot.changed_nanoseconds,
+    ] {
+        digest.update(value.to_be_bytes());
+    }
+}
+
+fn snapshot_from_metadata(
+    metadata: &std::fs::Metadata,
+    directory: bool,
+) -> Result<SourceSnapshot, AppError> {
+    if metadata.file_type().is_dir() != directory {
+        return Err(AppError::source_changed());
+    }
+    Ok(SourceSnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec().cast_unsigned(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec().cast_unsigned(),
+    })
+}
+
 fn snapshot_from_stat(stat: &rustix::fs::Stat) -> SourceSnapshot {
     SourceSnapshot {
         device: stat.st_dev,
@@ -514,16 +563,7 @@ fn snapshot(file: &File) -> Result<SourceSnapshot, AppError> {
             "Artifact member changed type or link count while opening",
         ));
     }
-    Ok(SourceSnapshot {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        links: metadata.nlink(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec().cast_unsigned(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec().cast_unsigned(),
-    })
+    snapshot_from_metadata(&metadata, false)
 }
 
 pub(crate) fn validate_relative_member_path(path: &str) -> Result<(), AppError> {
