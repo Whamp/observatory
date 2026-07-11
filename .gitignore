@@ -2,6 +2,9 @@
 .codegraph/
 .pi-subagents/
 
+# Rust build output
+target/
+
 # Obsidian app state (machine-local)
 .obsidian/
 
