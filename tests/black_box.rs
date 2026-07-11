@@ -20,11 +20,16 @@ struct Harness {
 
 impl Harness {
     fn start() -> Self {
+        Self::start_with(|_| {})
+    }
+
+    fn start_with(setup: impl FnOnce(&Path)) -> Self {
         let root = supported_tempdir("temporary root");
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).expect("runtime directory");
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
         let storage = root.path().join("data");
+        setup(&storage);
         let address = free_address();
         let child = daemon(&runtime, &storage, address)
             .stdout(Stdio::null())
@@ -109,6 +114,16 @@ fn cli(server: &str, args: &[&str]) -> Output {
         .expect("run obs")
 }
 
+fn hidden_form_value(html: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let value = html
+        .split_once(&marker)
+        .and_then(|(_, remainder)| remainder.split_once('\"'))
+        .map(|(value, _)| value)
+        .expect("hidden form value");
+    value.to_owned()
+}
+
 fn one_response_server(status: &str, body: &str) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("response server");
     let address = listener.local_addr().expect("response server address");
@@ -123,6 +138,955 @@ fn one_response_server(status: &str, body: &str) -> (String, thread::JoinHandle<
         stream.write_all(response.as_bytes()).expect("response");
     });
     (format!("http://{address}"), handle)
+}
+
+#[test]
+fn migrates_empty_v1_catalogue_before_readiness() {
+    let harness = Harness::start_with(|storage| {
+        for directory in [
+            storage.to_path_buf(),
+            storage.join("staging"),
+            storage.join("revisions"),
+            storage.join("quarantine"),
+            storage.join("backups"),
+            storage.join("candidates"),
+        ] {
+            fs::create_dir_all(&directory).expect("v1 private layout");
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("v1 private mode");
+        }
+        let connection =
+            rusqlite::Connection::open(storage.join("catalogue.sqlite")).expect("v1 catalogue");
+        connection
+            .execute_batch(
+                "PRAGMA application_id=1329746774;
+                 PRAGMA user_version=1;
+                 PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=FULL;
+                 CREATE TABLE projects (id TEXT PRIMARY KEY, record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+                 CREATE TABLE artifacts (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+                 CREATE TABLE services (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+                 CREATE TABLE revisions (id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id), state TEXT NOT NULL CHECK(state IN ('available','unavailable'))) STRICT;
+                 CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL) STRICT;
+                 CREATE TABLE backup_leases (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
+                 CREATE TABLE cleanup_runs (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
+                 CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY, kind TEXT NOT NULL, details_json TEXT NOT NULL) STRICT;",
+            )
+            .expect("v1 schema");
+    });
+
+    let status = cli(
+        &format!("http://{}", harness.address),
+        &["system", "status"],
+    );
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["result"]["policy"]["userVersion"], 2);
+    let backup_path = harness
+        .storage
+        .join("backups/schema-v1-pre-migration.sqlite");
+    assert!(backup_path.is_file());
+    let backup = rusqlite::Connection::open_with_flags(
+        backup_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("migration backup");
+    assert_eq!(
+        backup
+            .query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+            .expect("backup application ID"),
+        0x4f42_5356
+    );
+    assert_eq!(
+        backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("backup schema version"),
+        1
+    );
+    assert_eq!(
+        backup
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .expect("backup quick check"),
+        "ok"
+    );
+}
+
+#[test]
+fn project_resolve_register_and_replay_share_one_strict_operation() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("Agent Notes");
+    fs::create_dir(&project_directory).expect("Project directory");
+    let canonical_directory = fs::canonicalize(&project_directory).expect("canonical Project");
+    let client = reqwest::blocking::Client::new();
+
+    let unregistered = client
+        .get(harness.url("/api/v1/projects/resolve"))
+        .query(&[("path", canonical_directory.to_str().expect("UTF-8 Project"))])
+        .send()
+        .expect("resolve unregistered Project");
+    assert_eq!(unregistered.status(), 200);
+    assert_eq!(unregistered.headers()["cache-control"], "no-store");
+    let unregistered: Value = unregistered.json().expect("resolve JSON");
+    assert_eq!(unregistered["result"]["status"], "unregistered");
+    assert!(unregistered["result"]["project"].is_null());
+
+    let request = serde_json::json!({
+        "path": canonical_directory,
+        "title": "Agent Notes",
+        "slug": "Agent Notes"
+    });
+    let missing_key = client
+        .post(harness.url("/api/v1/projects"))
+        .json(&request)
+        .send()
+        .expect("registration without key");
+    assert_eq!(missing_key.status(), 422);
+
+    let created = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-project-register")
+        .json(&request)
+        .send()
+        .expect("register Project");
+    assert_eq!(created.status(), 201);
+    assert_eq!(created.headers()["etag"], "\"rv-1\"");
+    assert_eq!(created.headers()["cache-control"], "no-store");
+    let location = created.headers()["location"]
+        .to_str()
+        .expect("registration Location")
+        .to_owned();
+    let created: Value = created.json().expect("Project JSON");
+    let project = &created["result"];
+    let id = project["id"].as_str().expect("Project ID");
+    assert_eq!(id.len(), 26);
+    assert!(
+        id.bytes()
+            .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&byte))
+    );
+    assert_eq!(project["kind"], "project");
+    assert_eq!(project["state"], "live");
+    assert_eq!(project["recordVersion"], 1);
+    assert_eq!(project["title"], "Agent Notes");
+    assert_eq!(project["slug"], "agent-notes");
+    assert_eq!(project["key"], format!("agent-notes~{id}"));
+    assert_eq!(
+        project["canonicalDirectory"],
+        canonical_directory.to_str().expect("canonical UTF-8 path")
+    );
+    assert_eq!(
+        project["apiUrl"],
+        format!("https://desktop.greyhound-chinstrap.ts.net/api/v1/projects/{id}")
+    );
+    assert_eq!(location, project["apiUrl"]);
+    assert_eq!(
+        project["detailUrl"],
+        format!("https://desktop.greyhound-chinstrap.ts.net/ui/projects/agent-notes~{id}/")
+    );
+
+    let replay = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-project-register")
+        .json(&request)
+        .send()
+        .expect("replay registration");
+    assert_eq!(replay.status(), 201);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(replay.json::<Value>().expect("replay JSON"), created);
+
+    let changed = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-project-register")
+        .json(&serde_json::json!({
+            "path": canonical_directory,
+            "title": "Changed title",
+            "slug": "Agent Notes"
+        }))
+        .send()
+        .expect("changed replay");
+    assert_eq!(changed.status(), 409);
+    let changed: Value = changed.json().expect("changed replay JSON");
+    assert_eq!(changed["error"]["code"], "idempotency_conflict");
+
+    let duplicate = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-project-duplicate")
+        .json(&request)
+        .send()
+        .expect("duplicate registration");
+    assert_eq!(duplicate.status(), 409);
+    let duplicate: Value = duplicate.json().expect("duplicate JSON");
+    assert_eq!(duplicate["error"]["code"], "already_exists");
+
+    let equivalent = project_directory.join("..").join("Agent Notes");
+    let registered = client
+        .get(harness.url("/api/v1/projects/resolve"))
+        .query(&[("path", equivalent.to_str().expect("equivalent path"))])
+        .send()
+        .expect("resolve registered Project");
+    let registered: Value = registered.json().expect("registered resolve JSON");
+    assert_eq!(registered["result"]["status"], "registered");
+    assert_eq!(registered["result"]["project"]["id"], id);
+
+    let audit = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("audit catalogue");
+    let event = audit
+        .query_row(
+            "SELECT actor, cause, resource_type, resource_id, details_json
+             FROM audit_events WHERE cause='project_registered' ORDER BY sequence",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .expect("registration audit event");
+    assert_eq!(event.0, "operator");
+    assert_eq!(event.1, "project_registered");
+    assert_eq!(event.2, "project");
+    assert_eq!(event.3, id);
+    assert!(
+        !event
+            .4
+            .contains(project_directory.to_str().expect("Project path"))
+    );
+    let event_count: i64 = audit
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE cause='project_registered'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("registration audit count");
+    assert_eq!(event_count, 1);
+}
+
+#[test]
+fn project_slugs_follow_normalization_fallback_and_route_grammar() {
+    let harness = Harness::start();
+    let client = reqwest::blocking::Client::new();
+    let cases = [
+        (
+            "accented",
+            serde_json::json!({
+                "title": "Accented",
+                "slug": "Crème 東京 / Résumé"
+            }),
+            "creme-resume".to_owned(),
+        ),
+        (
+            "boundary",
+            serde_json::json!({
+                "title": "Boundary",
+                "slug": format!("{} x", "a".repeat(47))
+            }),
+            "a".repeat(47),
+        ),
+        (
+            "fallback",
+            serde_json::json!({ "title": "東京" }),
+            "project".to_owned(),
+        ),
+    ];
+    for (index, (name, metadata, expected_slug)) in cases.into_iter().enumerate() {
+        let directory = harness._root.path().join(name);
+        fs::create_dir(&directory).expect("slug Project directory");
+        let mut request = metadata;
+        request["path"] = serde_json::json!(directory);
+        let response = client
+            .post(harness.url("/api/v1/projects"))
+            .header("Idempotency-Key", format!("issue-22-slug-case-{index}"))
+            .json(&request)
+            .send()
+            .expect("register slug Project");
+        assert_eq!(response.status(), 201);
+        let project: Value = response.json().expect("slug Project JSON");
+        assert_eq!(project["result"]["slug"], expected_slug);
+        let slug = project["result"]["slug"].as_str().expect("Project slug");
+        assert!(slug.len() <= 48);
+        assert!(!slug.ends_with('-'));
+    }
+
+    let invalid_directory = harness._root.path().join("invalid-slug");
+    fs::create_dir(&invalid_directory).expect("invalid slug Project directory");
+    let invalid = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-invalid-slug")
+        .json(&serde_json::json!({
+            "path": invalid_directory,
+            "title": "Invalid slug",
+            "slug": "東京"
+        }))
+        .send()
+        .expect("register invalid slug Project");
+    assert_eq!(invalid.status(), 422);
+    assert_eq!(
+        invalid.json::<Value>().expect("invalid slug JSON")["error"]["code"],
+        "invalid_project_slug"
+    );
+}
+
+#[test]
+fn project_discovery_paginates_searches_shows_and_reads_empty_ledgers() {
+    let mut harness = Harness::start();
+    let client = reqwest::blocking::Client::new();
+    let mut projects = Vec::new();
+    for (index, title) in ["Zulu", "Straße Atlas", "Alpha"].into_iter().enumerate() {
+        let directory = harness._root.path().join(format!("project-{index}"));
+        fs::create_dir(&directory).expect("Project directory");
+        let response = client
+            .post(harness.url("/api/v1/projects"))
+            .header("Idempotency-Key", format!("issue-22-list-{index}"))
+            .json(&serde_json::json!({ "path": directory, "title": title }))
+            .send()
+            .expect("register listed Project");
+        assert_eq!(response.status(), 201);
+        projects.push(response.json::<Value>().expect("Project JSON")["result"].clone());
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let searched = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[("query", "STRASSE")])
+        .send()
+        .expect("search Projects");
+    assert_eq!(searched.status(), 200);
+    let searched: Value = searched.json().expect("search JSON");
+    assert_eq!(
+        searched["result"]["items"].as_array().expect("items").len(),
+        1
+    );
+    assert_eq!(searched["result"]["items"][0]["title"], "Straße Atlas");
+
+    let first_page = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[
+            ("state", "live"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+        ])
+        .send()
+        .expect("first Project page");
+    assert_eq!(first_page.status(), 200);
+    let link = first_page.headers()["link"]
+        .to_str()
+        .expect("next Link")
+        .to_owned();
+    assert!(link.starts_with("<https://desktop.greyhound-chinstrap.ts.net/api/v1/projects?"));
+    assert!(link.ends_with(">; rel=\"next\""));
+    let first_page: Value = first_page.json().expect("first page JSON");
+    assert_eq!(first_page["result"]["items"][0]["title"], "Alpha");
+    assert_eq!(first_page["result"]["page"]["limit"], 1);
+    assert_eq!(first_page["result"]["page"]["hasMore"], true);
+    let cursor = first_page["result"]["page"]["nextCursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_owned();
+    let mut tampered_cursor = cursor.clone();
+    tampered_cursor.push('x');
+    let tampered = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[("after", tampered_cursor)])
+        .send()
+        .expect("tampered cursor");
+    assert_eq!(tampered.status(), 422);
+    assert_eq!(
+        tampered.json::<Value>().expect("tampered cursor JSON")["error"]["code"],
+        "invalid_cursor"
+    );
+
+    let pid = harness.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("SIGTERM")
+            .success()
+    );
+    assert!(harness.child.wait().expect("stopped daemon").success());
+    harness.child = daemon(&harness.runtime, &harness.storage, harness.address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("restart daemon");
+    harness.wait_ready();
+
+    let second_page = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[
+            ("state", "live"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("second Project page");
+    assert_eq!(second_page.status(), 200);
+    let second_page: Value = second_page.json().expect("second page JSON");
+    assert_eq!(second_page["result"]["items"][0]["title"], "Straße Atlas");
+
+    let mismatched = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[
+            ("query", "different"),
+            ("state", "live"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("mismatched cursor");
+    assert_eq!(mismatched.status(), 422);
+    let mismatched: Value = mismatched.json().expect("cursor error JSON");
+    assert_eq!(mismatched["error"]["code"], "invalid_cursor");
+
+    let id = projects[0]["id"].as_str().expect("Project ID");
+    let shown = client
+        .get(harness.url(&format!("/api/v1/projects/{id}")))
+        .send()
+        .expect("show Project");
+    assert_eq!(shown.status(), 200);
+    assert_eq!(shown.headers()["etag"], "\"rv-1\"");
+    assert_eq!(
+        shown.json::<Value>().expect("show JSON")["result"],
+        projects[0]
+    );
+
+    let malformed = client
+        .get(harness.url(&format!("/api/v1/projects/{}", id.to_ascii_uppercase())))
+        .send()
+        .expect("malformed Project ID");
+    assert_eq!(malformed.status(), 422);
+    let unknown = client
+        .get(harness.url("/api/v1/projects/00000000000000000000000000"))
+        .send()
+        .expect("unknown Project ID");
+    assert_eq!(unknown.status(), 404);
+
+    for path in [
+        "/api/v1/projects/ledger".to_owned(),
+        format!("/api/v1/projects/{id}/ledger"),
+    ] {
+        let ledger = client
+            .get(harness.url(&path))
+            .send()
+            .expect("empty Project ledger");
+        assert_eq!(ledger.status(), 200);
+        assert!(ledger.headers().get("link").is_none());
+        let ledger: Value = ledger.json().expect("ledger JSON");
+        assert_eq!(ledger["result"]["items"], serde_json::json!([]));
+        assert_eq!(ledger["result"]["page"]["hasMore"], false);
+    }
+}
+
+#[test]
+fn project_resolve_and_discovery_distinguish_malformed_unknown_and_gone() {
+    let mut harness = Harness::start();
+    let gone_directory = harness._root.path().join("gone-project");
+    fs::create_dir(&gone_directory).expect("gone Project directory");
+    let canonical_directory = fs::canonicalize(&gone_directory)
+        .expect("canonical gone directory")
+        .to_str()
+        .expect("gone directory UTF-8")
+        .to_owned();
+    let pid = harness.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("SIGTERM")
+            .success()
+    );
+    assert!(harness.child.wait().expect("stopped daemon").success());
+    let connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("gone fixture catalogue");
+    connection
+        .execute(
+            "INSERT INTO projects(
+                 id, record_version, canonical_directory, state, title, slug,
+                 title_fold, search_text, created_at, updated_at,
+                 terminal_state, tombstoned_at, cause
+             ) VALUES (?1, 2, ?2, 'gone', 'Gone Project', 'gone-project',
+                 'gone project', ?3, '2026-01-01T00:00:00.000Z',
+                 '2026-01-02T00:00:00.000Z', 'tombstoned',
+                 '2026-01-02T00:00:00.000Z', 'operator')",
+            rusqlite::params![
+                "00000000000000000000000000",
+                canonical_directory,
+                format!("gone project\ngone-project\n{canonical_directory}"),
+            ],
+        )
+        .expect("gone Project fixture");
+    drop(connection);
+    harness.child = daemon(&harness.runtime, &harness.storage, harness.address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("restart daemon");
+    harness.wait_ready();
+
+    let client = reqwest::blocking::Client::new();
+    let gone = client
+        .get(harness.url("/api/v1/projects/resolve"))
+        .query(&[("path", gone_directory.to_str().expect("gone path"))])
+        .send()
+        .expect("resolve gone Project");
+    assert_eq!(gone.status(), 200);
+    let gone: Value = gone.json().expect("gone resolve JSON");
+    assert_eq!(gone["result"]["status"], "gone");
+    assert_eq!(
+        gone["result"]["project"]["id"],
+        "00000000000000000000000000"
+    );
+
+    let gone_list = client
+        .get(harness.url("/api/v1/projects"))
+        .query(&[("state", "gone")])
+        .send()
+        .expect("list gone Projects");
+    assert_eq!(gone_list.status(), 200);
+    let gone_list: Value = gone_list.json().expect("gone list JSON");
+    assert_eq!(gone_list["result"]["items"][0]["state"], "gone");
+    assert_eq!(
+        gone_list["result"]["items"][0]["terminalState"],
+        "tombstoned"
+    );
+    assert_eq!(gone_list["result"]["items"][0]["cause"], "operator");
+
+    let shown = client
+        .get(harness.url("/api/v1/projects/00000000000000000000000000"))
+        .send()
+        .expect("show gone Project");
+    assert_eq!(shown.status(), 410);
+    assert_eq!(
+        shown.json::<Value>().expect("gone show JSON")["error"]["code"],
+        "project_gone"
+    );
+    let reused = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-gone-reuse")
+        .json(&serde_json::json!({ "path": gone_directory }))
+        .send()
+        .expect("register gone directory");
+    assert_eq!(reused.status(), 410);
+
+    let malformed = client
+        .get(harness.url("/api/v1/projects/resolve"))
+        .query(&[("path", harness._root.path().join("missing"))])
+        .send()
+        .expect("resolve malformed Project path");
+    assert_eq!(malformed.status(), 422);
+    assert_eq!(
+        malformed.json::<Value>().expect("malformed resolve JSON")["error"]["code"],
+        "invalid_project_directory"
+    );
+}
+
+#[test]
+fn project_cli_resolves_registers_lists_and_shows_through_the_daemon() {
+    let harness = Harness::start();
+    let server = format!("http://{}", harness.address);
+    let directory = harness._root.path().join("cli-project");
+    fs::create_dir(&directory).expect("CLI Project directory");
+    let directory = directory.to_str().expect("CLI Project path");
+
+    let unresolved = cli(&server, &["-p", directory, "project", "resolve"]);
+    assert!(unresolved.status.success());
+    let unresolved: Value = serde_json::from_slice(&unresolved.stdout).expect("resolve JSON");
+    assert_eq!(unresolved["result"]["status"], "unregistered");
+
+    let missing_key = cli(
+        &server,
+        &["project", "register", directory, "--title", "CLI Project"],
+    );
+    assert_eq!(missing_key.status.code(), Some(2));
+    assert!(missing_key.stdout.is_empty());
+    let missing_key: Value =
+        serde_json::from_slice(&missing_key.stderr).expect("idempotency error JSON");
+    assert_eq!(missing_key["error"]["code"], "invalid_idempotency_key");
+
+    let registered = cli(
+        &server,
+        &[
+            "--idempotency-key",
+            "issue-22-cli-register",
+            "project",
+            "register",
+            directory,
+            "--title",
+            "CLI Project",
+        ],
+    );
+    assert!(registered.status.success(), "{:?}", registered);
+    let registered: Value = serde_json::from_slice(&registered.stdout).expect("registration JSON");
+    let project = &registered["result"];
+    let id = project["id"].as_str().expect("Project ID");
+    let key = project["key"].as_str().expect("Project key");
+
+    let listed = cli(
+        &server,
+        &["project", "list", "--query", "cli", "--order", "title"],
+    );
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    assert_eq!(listed["result"]["items"][0]["id"], id);
+
+    for selector in [id, key, directory] {
+        let shown = cli(&server, &["project", "show", selector]);
+        assert!(shown.status.success(), "selector={selector}: {shown:?}");
+        let shown: Value = serde_json::from_slice(&shown.stdout).expect("show JSON");
+        assert_eq!(shown["result"]["id"], id);
+    }
+}
+
+#[test]
+fn project_registration_timeout_continues_and_identical_retry_replays() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("timeout-project");
+    fs::create_dir(&directory).expect("timeout Project directory");
+    let body = serde_json::json!({
+        "path": directory,
+        "title": "Timeout Project"
+    });
+
+    let mut lock_connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("lock catalogue");
+    let lock = lock_connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("hold write lock");
+
+    let server = format!("http://{}", harness.address);
+    let mut command = obs();
+    command
+        .args([
+            "--json",
+            "--server",
+            &server,
+            "--timeout",
+            "20ms",
+            "--idempotency-key",
+            "issue-22-timeout-replay",
+            "project",
+            "register",
+            directory.to_str().expect("timeout Project path"),
+            "--title",
+            "Timeout Project",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("timed registration CLI");
+    thread::sleep(Duration::from_millis(100));
+    let timed_out = child.wait_with_output().expect("timed registration output");
+    assert_eq!(timed_out.status.code(), Some(5));
+    assert!(timed_out.stdout.is_empty());
+    let timeout: Value = serde_json::from_slice(&timed_out.stderr).expect("timeout JSON");
+    assert_eq!(timeout["error"]["code"], "client_timeout");
+    assert!(
+        timeout["error"]["message"]
+            .as_str()
+            .expect("timeout message")
+            .contains("same Idempotency-Key")
+    );
+    assert_eq!(
+        timeout["error"]["details"]["idempotencyKey"],
+        "issue-22-timeout-replay"
+    );
+    assert_eq!(
+        timeout["error"]["details"]["retry"],
+        "repeat the identical request with the same key"
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let in_progress = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-timeout-replay")
+        .json(&body)
+        .send()
+        .expect("in-progress retry");
+    assert_eq!(in_progress.status(), 409);
+    assert_eq!(in_progress.headers()["retry-after"], "1");
+    let in_progress: Value = in_progress.json().expect("in-progress JSON");
+    assert_eq!(in_progress["error"]["code"], "idempotency_in_progress");
+
+    lock.rollback().expect("release write lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let replay = client
+            .post(harness.url("/api/v1/projects"))
+            .header("Idempotency-Key", "issue-22-timeout-replay")
+            .json(&body)
+            .send()
+            .expect("retry registration");
+        if replay.status() == 201 {
+            assert_eq!(replay.headers()["idempotency-replayed"], "true");
+            break;
+        }
+        assert_eq!(replay.status(), 409);
+        assert!(Instant::now() < deadline, "registration did not complete");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn project_registration_transaction_failure_rolls_back_and_retries_after_restart() {
+    let mut harness = Harness::start();
+    let directory = harness._root.path().join("rollback-project");
+    fs::create_dir(&directory).expect("rollback Project directory");
+    let connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("fault-injection catalogue");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER inject_project_registration_failure
+             BEFORE INSERT ON audit_events
+             WHEN NEW.cause = 'project_registered'
+             BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END;",
+        )
+        .expect("install registration failure trigger");
+    let client = reqwest::blocking::Client::new();
+    let body = serde_json::json!({
+        "path": directory,
+        "title": "Rollback Project"
+    });
+    let failed = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-rollback-retry")
+        .json(&body)
+        .send()
+        .expect("injected failed registration");
+    assert_eq!(failed.status(), 500);
+
+    let resolved = client
+        .get(harness.url("/api/v1/projects/resolve"))
+        .query(&[("path", directory.to_str().expect("rollback path"))])
+        .send()
+        .expect("resolve after rollback");
+    assert_eq!(resolved.status(), 200);
+    assert_eq!(
+        resolved.json::<Value>().expect("resolve JSON")["result"]["status"],
+        "unregistered"
+    );
+    connection
+        .execute_batch("DROP TRIGGER inject_project_registration_failure;")
+        .expect("remove registration failure trigger");
+    drop(connection);
+
+    let pid = harness.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("SIGTERM")
+            .success()
+    );
+    assert!(harness.child.wait().expect("stopped daemon").success());
+    harness.child = daemon(&harness.runtime, &harness.storage, harness.address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("restart daemon");
+    harness.wait_ready();
+
+    let retried = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-22-rollback-retry")
+        .json(&body)
+        .send()
+        .expect("retry rolled-back registration");
+    assert_eq!(retried.status(), 201);
+    assert!(retried.headers().get("idempotency-replayed").is_none());
+}
+
+#[test]
+fn browser_project_registration_is_same_origin_one_use_and_progressively_enhanced() {
+    let harness = Harness::start();
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("browser client");
+    let form_page = client
+        .get(harness.url("/ui/projects/new/"))
+        .send()
+        .expect("registration form");
+    assert_eq!(form_page.status(), 200);
+    assert_eq!(form_page.headers()["cache-control"], "no-store");
+    let form_page = form_page.text().expect("registration HTML");
+    assert!(form_page.contains("<form"));
+    assert!(form_page.contains("method=\"post\""));
+    assert!(form_page.contains("data-project-registration"));
+    let csrf = hidden_form_value(&form_page, "csrfToken");
+    let idempotency_key = hidden_form_value(&form_page, "idempotencyKey");
+    let directory = harness._root.path().join("browser-project");
+    fs::create_dir(&directory).expect("browser Project directory");
+    let form = [
+        ("path", directory.to_str().expect("browser Project path")),
+        ("title", "Browser Project"),
+        ("slug", ""),
+        ("csrfToken", &csrf),
+        ("idempotencyKey", &idempotency_key),
+    ];
+
+    let rejected = client
+        .post(harness.url("/ui/projects/"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://attacker.example")
+        .header("Sec-Fetch-Site", "cross-site")
+        .form(&form)
+        .send()
+        .expect("cross-origin form");
+    assert_eq!(rejected.status(), 403);
+    assert!(
+        rejected
+            .text()
+            .expect("rejection HTML")
+            .contains("browser_origin_rejected")
+    );
+
+    let conflicting_source = client
+        .post(harness.url("/ui/projects/"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://attacker.example")
+        .header(
+            "Referer",
+            "https://desktop.greyhound-chinstrap.ts.net/ui/projects/new/",
+        )
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&form)
+        .send()
+        .expect("conflicting browser source headers");
+    assert_eq!(conflicting_source.status(), 403);
+    assert!(
+        conflicting_source
+            .text()
+            .expect("conflicting source rejection HTML")
+            .contains("browser_origin_rejected")
+    );
+
+    let api_without_csrf = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("Idempotency-Key", "browser-api-without-csrf")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("browser Project path"),
+            "title": "Browser Project"
+        }))
+        .send()
+        .expect("browser API mutation without CSRF");
+    assert_eq!(api_without_csrf.status(), 403);
+    let api_error: Value = api_without_csrf.json().expect("browser API error envelope");
+    assert_eq!(api_error["error"]["code"], "csrf_rejected");
+
+    let accepted = client
+        .post(harness.url("/ui/projects/"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&form)
+        .send()
+        .expect("same-origin form");
+    assert_eq!(accepted.status(), 303);
+    let location = accepted.headers()["location"]
+        .to_str()
+        .expect("canonical detail Location")
+        .to_owned();
+    assert!(
+        location
+            .starts_with("https://desktop.greyhound-chinstrap.ts.net/ui/projects/browser-project~")
+    );
+    assert!(location.ends_with('/'));
+    let detail_url = url::Url::parse(&location).expect("detail URL");
+    let stale_path = detail_url.path().replacen("browser-project~", "stale~", 1);
+    let stale = client
+        .get(harness.url(&stale_path))
+        .send()
+        .expect("stale Project slug");
+    assert_eq!(stale.status(), 308);
+    assert_eq!(stale.headers()["location"], location);
+    let project_id = detail_url
+        .path()
+        .trim_end_matches('/')
+        .rsplit_once('~')
+        .map(|(_, id)| id)
+        .expect("detail Project ID");
+    let uppercase_path = detail_url
+        .path()
+        .replace(project_id, &project_id.to_ascii_uppercase());
+    let uppercase = client
+        .get(harness.url(&uppercase_path))
+        .send()
+        .expect("uppercase browser Project ID");
+    assert_eq!(uppercase.status(), 308);
+    assert_eq!(uppercase.headers()["location"], location);
+
+    let replayed = client
+        .post(harness.url("/ui/projects/"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header(
+            "Referer",
+            "https://desktop.greyhound-chinstrap.ts.net/ui/projects/new/",
+        )
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&form)
+        .send()
+        .expect("replayed form");
+    assert_eq!(replayed.status(), 403);
+    assert!(replayed.text().expect("replay HTML").contains("replayed"));
+
+    let detail_path = detail_url.path().to_owned();
+    let detail = client
+        .get(harness.url(&detail_path))
+        .send()
+        .expect("Project detail");
+    assert_eq!(detail.status(), 200);
+    let detail = detail.text().expect("detail HTML");
+    assert!(detail.contains("Browser Project"));
+    assert!(detail.contains("No Entries yet"));
+    let index = client
+        .get(harness.url("/ui/"))
+        .send()
+        .expect("Project index")
+        .text()
+        .expect("index HTML");
+    assert!(index.contains("Browser Project"));
+    assert!(!index.contains("No projects yet"));
+
+    let enhanced_form = client
+        .get(harness.url("/ui/projects/new/"))
+        .send()
+        .expect("enhanced registration form")
+        .text()
+        .expect("enhanced form HTML");
+    let enhanced_csrf = hidden_form_value(&enhanced_form, "csrfToken");
+    let enhanced_key = hidden_form_value(&enhanced_form, "idempotencyKey");
+    let enhanced_directory = harness._root.path().join("enhanced-project");
+    fs::create_dir(&enhanced_directory).expect("enhanced Project directory");
+    let enhanced = client
+        .post(harness.url("/ui/projects/"))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header("X-Observatory-CSRF", &enhanced_csrf)
+        .header("X-Observatory-Enhanced", "fetch")
+        .form(&[
+            (
+                "path",
+                enhanced_directory.to_str().expect("enhanced Project path"),
+            ),
+            ("title", "Enhanced Project"),
+            ("slug", ""),
+            ("csrfToken", &enhanced_csrf),
+            ("idempotencyKey", &enhanced_key),
+        ])
+        .send()
+        .expect("enhanced form submission");
+    assert_eq!(enhanced.status(), 303);
 }
 
 #[test]
@@ -252,7 +1216,7 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
         }
     }
     assert_eq!(status["result"]["policy"]["applicationId"], 0x4f42_5356_u64);
-    assert_eq!(status["result"]["policy"]["userVersion"], 1);
+    assert_eq!(status["result"]["policy"]["userVersion"], 2);
     assert_eq!(status["result"]["policy"]["foreignKeys"], true);
     assert_eq!(status["result"]["policy"]["journalMode"], "wal");
     assert_eq!(status["result"]["policy"]["synchronous"], "FULL");
@@ -321,8 +1285,15 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
             .expect("ETag")
             .starts_with('"')
     );
-    let javascript =
-        reqwest::blocking::get(harness.url("/_static/empty-ledger-v1/app.js")).expect("ES module");
+    let javascript_path = html
+        .split("src=\"")
+        .find_map(|part| {
+            part.strip_prefix("/_static/")
+                .and_then(|rest| rest.split('\"').next())
+        })
+        .map(|rest| format!("/_static/{rest}"))
+        .expect("versioned ES module");
+    let javascript = reqwest::blocking::get(harness.url(&javascript_path)).expect("ES module");
     assert_eq!(javascript.status(), 200);
     assert_eq!(
         javascript.headers()["cache-control"],
@@ -336,7 +1307,7 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
     );
     let javascript_etag = javascript.headers()["etag"].clone();
     let not_modified = reqwest::blocking::Client::new()
-        .get(harness.url("/_static/empty-ledger-v1/app.js"))
+        .get(harness.url(&javascript_path))
         .header("if-none-match", javascript_etag)
         .send()
         .expect("conditional ES module");

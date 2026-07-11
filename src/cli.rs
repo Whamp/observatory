@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::EffectiveConfiguration;
@@ -21,8 +22,63 @@ pub async fn get(
         .header("accept", "application/json")
         .send()
         .await
-        .map_err(|_| AppError::unavailable())?;
-    emit_response(response, json_output).await
+        .map_err(|error| request_error(&error, None))?;
+    emit_response(response, json_output, None).await
+}
+
+pub async fn get_with_query(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    path: &str,
+    query: &[(String, String)],
+    json_output: bool,
+) -> Result<(), AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .get(endpoint(&server, path))
+        .header("accept", "application/json")
+        .query(query)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, None))?;
+    emit_response(response, json_output, None).await
+}
+
+pub async fn fetch_with_query(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    path: &str,
+    query: &[(String, String)],
+) -> Result<Value, AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .get(endpoint(&server, path))
+        .header("accept", "application/json")
+        .query(query)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, None))?;
+    decode_response(response, None).await
+}
+
+pub async fn post<T: Serialize>(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    path: &str,
+    idempotency_key: &str,
+    body: &T,
+    json_output: bool,
+) -> Result<(), AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .post(endpoint(&server, path))
+        .header("accept", "application/json")
+        .header("idempotency-key", idempotency_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, Some(idempotency_key)))?;
+    emit_response(response, json_output, Some(idempotency_key)).await
 }
 
 pub async fn validate(
@@ -44,8 +100,8 @@ pub async fn validate(
         .json(&json!({ "content": content }))
         .send()
         .await
-        .map_err(|_| AppError::unavailable())?;
-    emit_response(response, json_output).await
+        .map_err(|error| request_error(&error, None))?;
+    emit_response(response, json_output, None).await
 }
 
 fn client(
@@ -65,32 +121,44 @@ fn client(
     Ok((client, configuration.client.server))
 }
 
-async fn emit_response(response: reqwest::Response, json_output: bool) -> Result<(), AppError> {
+async fn emit_response(
+    response: reqwest::Response,
+    json_output: bool,
+    idempotency_key: Option<&str>,
+) -> Result<(), AppError> {
+    let envelope = decode_response(response, idempotency_key).await?;
+    let rendered = if json_output {
+        serde_json::to_vec(&envelope)
+    } else {
+        let result = envelope.get("result").cloned().unwrap_or(Value::Null);
+        serde_json::to_vec_pretty(&result).map(|mut rendered| {
+            let mut human = b"Observatory result:\n".to_vec();
+            human.append(&mut rendered);
+            human
+        })
+    }
+    .map_err(|error| AppError::internal(format!("cannot render daemon result: {error}")))?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&rendered)
+        .and_then(|()| stdout.write_all(b"\n"))
+        .map_err(|error| AppError::internal(format!("cannot write stdout: {error}")))?;
+    Ok(())
+}
+
+async fn decode_response(
+    response: reqwest::Response,
+    idempotency_key: Option<&str>,
+) -> Result<Value, AppError> {
     let status = response.status();
     let bytes = response
         .bytes()
         .await
-        .map_err(|_| AppError::unavailable())?;
+        .map_err(|error| request_error(&error, idempotency_key))?;
     let envelope = serde_json::from_slice::<Value>(&bytes)
         .map_err(|error| AppError::internal(format!("daemon returned invalid JSON: {error}")))?;
     if status.is_success() {
-        let rendered = if json_output {
-            serde_json::to_vec(&envelope)
-        } else {
-            let result = envelope.get("result").cloned().unwrap_or(Value::Null);
-            serde_json::to_vec_pretty(&result).map(|mut rendered| {
-                let mut human = b"Observatory result:\n".to_vec();
-                human.append(&mut rendered);
-                human
-            })
-        }
-        .map_err(|error| AppError::internal(format!("cannot render daemon result: {error}")))?;
-        let mut stdout = std::io::stdout().lock();
-        stdout
-            .write_all(&rendered)
-            .and_then(|()| stdout.write_all(b"\n"))
-            .map_err(|error| AppError::internal(format!("cannot write stdout: {error}")))?;
-        return Ok(());
+        return Ok(envelope);
     }
     let error = envelope.get("error").ok_or_else(|| {
         AppError::internal(format!("daemon returned HTTP {status} without an error"))
@@ -115,6 +183,14 @@ async fn emit_response(response: reqwest::Response, json_output: bool) -> Result
         error.get("details").cloned().unwrap_or_else(|| json!({})),
         http_exit(status.as_u16()),
     ))
+}
+
+fn request_error(error: &reqwest::Error, idempotency_key: Option<&str>) -> AppError {
+    if error.is_timeout() {
+        AppError::client_timeout(idempotency_key)
+    } else {
+        AppError::unavailable()
+    }
 }
 
 fn endpoint(server: &str, path: &str) -> String {

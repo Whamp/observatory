@@ -13,7 +13,7 @@ use time::macros::format_description;
 use crate::error::AppError;
 
 const APPLICATION_ID: i64 = 0x4f42_5356;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const RESERVED_BYTES: u64 = 1_073_741_824;
 const BTRFS_MAGIC: i64 = 0x9123_683e;
 const EXT_MAGIC: i64 = 0xef53;

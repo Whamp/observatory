@@ -59,6 +59,33 @@ impl CliExit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiStatus {
+    Forbidden,
+    NotFound,
+    Conflict,
+    Gone,
+    Unprocessable,
+    Locked,
+    Internal,
+    Unavailable,
+}
+
+impl ApiStatus {
+    const fn code(self) -> u16 {
+        match self {
+            Self::Forbidden => 403,
+            Self::NotFound => 404,
+            Self::Conflict => 409,
+            Self::Gone => 410,
+            Self::Unprocessable => 422,
+            Self::Locked => 423,
+            Self::Internal => 500,
+            Self::Unavailable => 503,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppError {
     code: ErrorCode,
@@ -66,6 +93,7 @@ pub struct AppError {
     retryability: Retryability,
     details: Value,
     exit: CliExit,
+    api_status: ApiStatus,
 }
 
 impl AppError {
@@ -75,7 +103,88 @@ impl AppError {
             message,
             Retryability::Terminal,
             CliExit::Usage,
+            ApiStatus::Unprocessable,
         )
+    }
+
+    pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Terminal,
+            CliExit::Usage,
+            ApiStatus::Unprocessable,
+        )
+    }
+
+    pub fn forbidden(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Terminal,
+            CliExit::Usage,
+            ApiStatus::Forbidden,
+        )
+    }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Terminal,
+            CliExit::Conflict,
+            ApiStatus::Conflict,
+        )
+    }
+
+    pub fn retryable_conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Retryable,
+            CliExit::Conflict,
+            ApiStatus::Conflict,
+        )
+    }
+
+    pub fn contention(message: impl Into<String>) -> Self {
+        Self::new(
+            "contention",
+            message,
+            Retryability::Retryable,
+            CliExit::Contention,
+            ApiStatus::Locked,
+        )
+    }
+
+    pub fn gone(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Terminal,
+            CliExit::NotFound,
+            ApiStatus::Gone,
+        )
+    }
+
+    pub fn client_timeout(idempotency_key: Option<&str>) -> Self {
+        let mut error = Self::new(
+            "client_timeout",
+            "client wait deadline expired; commit state is unknown; retry the identical request with the same Idempotency-Key",
+            Retryability::Retryable,
+            CliExit::Unavailable,
+            ApiStatus::Unavailable,
+        );
+        error.details = match idempotency_key {
+            Some(key) => json!({
+                "idempotencyKey": key,
+                "retry": "repeat the identical request with the same key"
+            }),
+            None => json!({
+                "retry": "repeat the identical read request"
+            }),
+        };
+        error
     }
 
     pub fn unavailable() -> Self {
@@ -84,6 +193,7 @@ impl AppError {
             "the Observatory daemon is unavailable",
             Retryability::Retryable,
             CliExit::Unavailable,
+            ApiStatus::Unavailable,
         )
     }
 
@@ -93,6 +203,7 @@ impl AppError {
             message,
             Retryability::Retryable,
             CliExit::Unavailable,
+            ApiStatus::Unavailable,
         )
     }
 
@@ -102,6 +213,17 @@ impl AppError {
             "another Observatory daemon holds the authority lock",
             Retryability::Retryable,
             CliExit::Contention,
+            ApiStatus::Locked,
+        )
+    }
+
+    pub fn not_found_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            message,
+            Retryability::Terminal,
+            CliExit::NotFound,
+            ApiStatus::NotFound,
         )
     }
 
@@ -111,6 +233,7 @@ impl AppError {
             message,
             Retryability::Terminal,
             CliExit::NotFound,
+            ApiStatus::NotFound,
         )
     }
 
@@ -120,6 +243,7 @@ impl AppError {
             message,
             Retryability::Terminal,
             CliExit::Internal,
+            ApiStatus::Internal,
         )
     }
 
@@ -136,6 +260,7 @@ impl AppError {
             retryability,
             details,
             exit,
+            api_status: ApiStatus::Internal,
         }
     }
 
@@ -160,11 +285,16 @@ impl AppError {
         self.exit.code()
     }
 
+    pub const fn api_status(&self) -> u16 {
+        self.api_status.code()
+    }
+
     fn new(
         code: &'static str,
         message: impl Into<String>,
         retryability: Retryability,
         exit: CliExit,
+        api_status: ApiStatus,
     ) -> Self {
         Self {
             code: ErrorCode::new(code),
@@ -172,6 +302,7 @@ impl AppError {
             retryability,
             details: json!({}),
             exit,
+            api_status,
         }
     }
 }

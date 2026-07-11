@@ -16,21 +16,26 @@
 mod catalogue;
 mod cli;
 mod config;
+mod crypto;
+mod csrf;
 mod daemon;
 mod error;
+mod project;
 mod runtime_lock;
 mod safe_file;
 mod storage_status;
+mod ui;
 mod web;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use config::ServeOverrides;
 use error::AppError;
+use project::RegisterProjectRequest;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,6 +62,7 @@ struct CommandLine {
 enum Command {
     Serve(ServeCommand),
     System(SystemCommand),
+    Project(ProjectCommand),
 }
 
 #[derive(Debug, Args)]
@@ -99,6 +105,47 @@ enum ConfigLeaf {
     Validate { file: PathBuf },
 }
 
+#[derive(Debug, Args)]
+struct ProjectCommand {
+    #[command(subcommand)]
+    command: ProjectLeaf,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectLeaf {
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, value_enum)]
+        order: Option<ProjectListOrder>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: Option<u16>,
+        #[arg(long)]
+        after: Option<String>,
+    },
+    Show {
+        selector: String,
+    },
+    Resolve {
+        path: Option<PathBuf>,
+    },
+    Register {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        slug: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProjectListOrder {
+    Recent,
+    Title,
+}
+
 fn main() -> ExitCode {
     let command = CommandLine::parse();
     let json_output = command.json;
@@ -122,42 +169,280 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
+struct ClientContext {
+    server: Option<String>,
+    timeout: Option<u64>,
+    json: bool,
+}
+
+struct ProjectClientContext {
+    client: ClientContext,
+    selected_project: Option<PathBuf>,
+    idempotency_key: Option<String>,
+}
+
 async fn run(command: CommandLine) -> Result<(), AppError> {
-    let CommandLine {
-        server,
-        project: _,
-        json,
-        timeout,
-        idempotency_key: _,
-        command,
-    } = command;
-    match command {
-        Command::Serve(serve) => {
-            if server.is_some() || timeout.is_some() {
-                return Err(AppError::usage(
-                    "--server and --timeout do not configure obs serve",
-                ));
-            }
-            daemon::serve(ServeOverrides {
-                listen: serve.listen,
-                canonical_origin: serve.canonical_origin,
-                storage: serve.storage,
-                max_stored_bytes: serve.max_stored_bytes,
-                max_live_artifacts: serve.max_live_artifacts,
-                teardown_timeout_ms: serve.teardown_timeout,
-            })
+    let client = ClientContext {
+        server: command.server,
+        timeout: command.timeout,
+        json: command.json,
+    };
+    match command.command {
+        Command::Serve(serve) => run_serve(serve, client).await,
+        Command::System(system) => run_system(system, client).await,
+        Command::Project(project) => {
+            run_project(
+                project,
+                ProjectClientContext {
+                    client,
+                    selected_project: command.project,
+                    idempotency_key: command.idempotency_key,
+                },
+            )
             .await
         }
-        Command::System(system) => match system.command {
-            SystemLeaf::Status => cli::get(server, timeout, "/api/v1/system/status", json).await,
-            SystemLeaf::Config(config) => match config.command {
-                ConfigLeaf::Show => {
-                    cli::get(server, timeout, "/api/v1/system/configuration", json).await
-                }
-                ConfigLeaf::Validate { file } => cli::validate(server, timeout, &file, json).await,
-            },
-        },
     }
+}
+
+async fn run_serve(command: ServeCommand, client: ClientContext) -> Result<(), AppError> {
+    if client.server.is_some() || client.timeout.is_some() {
+        return Err(AppError::usage(
+            "--server and --timeout do not configure obs serve",
+        ));
+    }
+    daemon::serve(ServeOverrides {
+        listen: command.listen,
+        canonical_origin: command.canonical_origin,
+        storage: command.storage,
+        max_stored_bytes: command.max_stored_bytes,
+        max_live_artifacts: command.max_live_artifacts,
+        teardown_timeout_ms: command.teardown_timeout,
+    })
+    .await
+}
+
+async fn run_system(command: SystemCommand, client: ClientContext) -> Result<(), AppError> {
+    match command.command {
+        SystemLeaf::Status => {
+            cli::get(
+                client.server,
+                client.timeout,
+                "/api/v1/system/status",
+                client.json,
+            )
+            .await
+        }
+        SystemLeaf::Config(config) => run_config(config, client).await,
+    }
+}
+
+async fn run_config(command: ConfigCommand, client: ClientContext) -> Result<(), AppError> {
+    match command.command {
+        ConfigLeaf::Show => {
+            cli::get(
+                client.server,
+                client.timeout,
+                "/api/v1/system/configuration",
+                client.json,
+            )
+            .await
+        }
+        ConfigLeaf::Validate { file } => {
+            cli::validate(client.server, client.timeout, &file, client.json).await
+        }
+    }
+}
+
+async fn run_project(
+    command: ProjectCommand,
+    context: ProjectClientContext,
+) -> Result<(), AppError> {
+    match command.command {
+        ProjectLeaf::List {
+            all,
+            query,
+            order,
+            limit,
+            after,
+        } => run_project_list(context.client, all, query, order, limit, after).await,
+        ProjectLeaf::Resolve { path } => run_project_resolve(context, path).await,
+        ProjectLeaf::Register { path, title, slug } => {
+            run_project_register(context, path, title, slug).await
+        }
+        ProjectLeaf::Show { selector } => run_project_show(context.client, &selector).await,
+    }
+}
+
+async fn run_project_list(
+    client: ClientContext,
+    all: bool,
+    query: Option<String>,
+    order: Option<ProjectListOrder>,
+    limit: Option<u16>,
+    after: Option<String>,
+) -> Result<(), AppError> {
+    let parameters = project_list_parameters(all, query, order, limit, after);
+    cli::get_with_query(
+        client.server,
+        client.timeout,
+        "/api/v1/projects",
+        &parameters,
+        client.json,
+    )
+    .await
+}
+
+fn project_list_parameters(
+    all: bool,
+    query: Option<String>,
+    order: Option<ProjectListOrder>,
+    limit: Option<u16>,
+    after: Option<String>,
+) -> Vec<(String, String)> {
+    let mut parameters = Vec::new();
+    if all {
+        parameters.push(("state".to_owned(), "all".to_owned()));
+    }
+    if let Some(query) = query {
+        parameters.push(("query".to_owned(), query));
+    }
+    if let Some(order) = order {
+        parameters.push(("order".to_owned(), order.as_str().to_owned()));
+    }
+    if let Some(limit) = limit {
+        parameters.push(("limit".to_owned(), limit.to_string()));
+    }
+    if let Some(after) = after {
+        parameters.push(("after".to_owned(), after));
+    }
+    parameters
+}
+
+async fn run_project_resolve(
+    context: ProjectClientContext,
+    path: Option<PathBuf>,
+) -> Result<(), AppError> {
+    let path = absolute_project_selection(path.or(context.selected_project))?;
+    cli::get_with_query(
+        context.client.server,
+        context.client.timeout,
+        "/api/v1/projects/resolve",
+        &[("path".to_owned(), path)],
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_project_register(
+    context: ProjectClientContext,
+    path: Option<PathBuf>,
+    title: Option<String>,
+    slug: Option<String>,
+) -> Result<(), AppError> {
+    let path = absolute_project_selection(path.or(context.selected_project))?;
+    let key = mutation_idempotency_key(context.idempotency_key)?;
+    cli::post(
+        context.client.server,
+        context.client.timeout,
+        "/api/v1/projects",
+        &key,
+        &RegisterProjectRequest { path, title, slug },
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_project_show(client: ClientContext, selector: &str) -> Result<(), AppError> {
+    let id = resolve_project_selector(selector, client.server.clone(), client.timeout).await?;
+    cli::get(
+        client.server,
+        client.timeout,
+        &format!("/api/v1/projects/{id}"),
+        client.json,
+    )
+    .await
+}
+
+impl ProjectListOrder {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Title => "title",
+        }
+    }
+}
+
+fn absolute_project_selection(selection: Option<PathBuf>) -> Result<String, AppError> {
+    let path = match selection {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => std::env::current_dir()
+            .map_err(|error| AppError::usage(format!("cannot read current directory: {error}")))?
+            .join(path),
+        None => std::env::current_dir()
+            .map_err(|error| AppError::usage(format!("cannot read current directory: {error}")))?,
+    };
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| AppError::usage("Project path must be valid UTF-8"))
+}
+
+fn mutation_idempotency_key(key: Option<String>) -> Result<String, AppError> {
+    if let Some(key) = key {
+        return Ok(key);
+    }
+    if !std::io::stderr().is_terminal() {
+        return Err(AppError::invalid(
+            "invalid_idempotency_key",
+            "non-TTY mutations require --idempotency-key",
+        ));
+    }
+    let key = format!("interactive-{}", crypto::random_opaque_id()?);
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "Idempotency-Key: {key}")
+        .map_err(|error| AppError::internal(format!("cannot write stderr: {error}")))?;
+    Ok(key)
+}
+
+async fn resolve_project_selector(
+    selector: &str,
+    server: Option<String>,
+    timeout: Option<u64>,
+) -> Result<String, AppError> {
+    let candidate = selector.rsplit_once('~').map_or(selector, |(_, id)| id);
+    if is_project_id(candidate) {
+        return Ok(candidate.to_owned());
+    }
+    let path = absolute_project_selection(Some(PathBuf::from(selector)))?;
+    let envelope = cli::fetch_with_query(
+        server,
+        timeout,
+        "/api/v1/projects/resolve",
+        &[("path".to_owned(), path)],
+    )
+    .await?;
+    let result = envelope
+        .get("result")
+        .ok_or_else(|| AppError::internal("Project resolve result is missing"))?;
+    result
+        .get("project")
+        .and_then(|project| project.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AppError::not_found_code(
+                "project_not_registered",
+                "Project selector does not resolve to a live Project",
+            )
+        })
+}
+
+fn is_project_id(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&byte))
+        && value.as_bytes()[0] <= b'7'
 }
 
 fn report(error: &AppError, json_output: bool) -> ExitCode {

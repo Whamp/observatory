@@ -7,6 +7,27 @@ use rustix::fs::{Mode, OFlags, open, openat};
 
 use crate::error::AppError;
 
+/// Opens one directory without following any symbolic-link component.
+pub fn open_directory(path: &Path) -> Result<File, AppError> {
+    let (anchor, parts) = split_path(path)?;
+    let mut directory = open(
+        anchor,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| safe_open_error(path, error))?;
+    for part in parts {
+        directory = openat(
+            &directory,
+            part,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| safe_open_error(path, error))?;
+    }
+    Ok(File::from(directory))
+}
+
 /// Reads one regular UTF-8 file without following any symbolic-link component.
 pub fn read_regular_utf8(path: &Path, description: &str) -> Result<String, AppError> {
     let (anchor, parts) = split_path(path)?;
