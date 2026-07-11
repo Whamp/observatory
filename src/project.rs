@@ -28,7 +28,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct ProjectService {
     catalogue: Catalogue,
     canonical_origin: String,
-    in_flight_registrations: Arc<Mutex<HashMap<String, String>>>,
+    in_flight_mutations: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,6 +37,35 @@ pub struct RegisterProjectRequest {
     pub path: String,
     pub title: Option<String>,
     pub slug: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateProjectRequest {
+    title: Option<String>,
+    slug: Option<String>,
+}
+
+impl UpdateProjectRequest {
+    pub(crate) const fn new(title: Option<String>, slug: Option<String>) -> Self {
+        Self { title, slug }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TombstoneProjectRequest {
+    confirmation: String,
+}
+
+impl TombstoneProjectRequest {
+    pub(crate) const fn new(confirmation: String) -> Self {
+        Self { confirmation }
+    }
+
+    pub(crate) fn confirmation(&self) -> &str {
+        &self.confirmation
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,9 +123,17 @@ enum ResolveStatus {
 }
 
 #[derive(Clone, Debug)]
-pub struct RegistrationOutcome {
+pub struct ProjectMutationOutcome {
     project: Project,
     replayed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectTombstonePreview {
+    project: Project,
+    live_services: u64,
+    associated_artifacts: u64,
+    active_operations: u64,
 }
 
 #[derive(Serialize)]
@@ -207,7 +244,7 @@ struct ProjectCursor {
     expires_at_ms: i128,
 }
 
-struct RegistrationGuard {
+struct MutationGuard {
     registrations: Arc<Mutex<HashMap<String, String>>>,
     key: String,
 }
@@ -226,7 +263,7 @@ impl ProjectService {
         Self {
             catalogue,
             canonical_origin,
-            in_flight_registrations: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_mutations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -261,17 +298,17 @@ impl ProjectService {
         &self,
         request: RegisterProjectRequest,
         idempotency_key: &str,
-    ) -> Result<RegistrationOutcome, AppError> {
+    ) -> Result<ProjectMutationOutcome, AppError> {
         validate_idempotency_key(idempotency_key)?;
         let prepared = Self::prepare_registration(request)?;
-        let _registration = self.begin_registration(idempotency_key, &prepared.fingerprint)?;
+        let _mutation = self.begin_mutation(idempotency_key, &prepared.fingerprint)?;
         let mut connection = self.catalogue.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
 
         if let Some(record) = idempotency_record(&transaction, idempotency_key)? {
-            return replay_registration(record, &prepared.fingerprint);
+            return replay_project_mutation(record, &prepared.fingerprint);
         }
         transaction
             .execute(
@@ -308,19 +345,182 @@ impl ProjectService {
             )
             .map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
-        Ok(RegistrationOutcome {
+        Ok(ProjectMutationOutcome {
             project,
             replayed: false,
         })
     }
 
-    fn begin_registration(
+    pub fn validate_update_request(request: &UpdateProjectRequest) -> Result<(), AppError> {
+        validate_project_update(request)
+    }
+
+    pub fn validate_tombstone_constraints(&self, id: &str) -> Result<(), AppError> {
+        validate_project_id(id)?;
+        let connection = self.catalogue.connection()?;
+        require_project_tombstone_preconditions(&connection, id)
+    }
+
+    pub fn update(
+        &self,
+        id: &str,
+        request: UpdateProjectRequest,
+        if_match: &str,
+        idempotency_key: &str,
+    ) -> Result<ProjectMutationOutcome, AppError> {
+        validate_project_id(id)?;
+        validate_idempotency_key(idempotency_key)?;
+        validate_project_update(&request)?;
+        let changed_fields = project_update_fields(&request);
+        let route = format!("/api/v1/projects/{id}");
+        let fingerprint =
+            project_mutation_fingerprint("PATCH", &route, &request, id, if_match, None)?;
+        let _mutation = self.begin_mutation(idempotency_key, &fingerprint)?;
+        let mut connection = self.catalogue.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+
+        if let Some(record) = idempotency_record(&transaction, idempotency_key)? {
+            return replay_project_mutation(record, &fingerprint);
+        }
+        let current = project_by_id(&transaction, id, &self.canonical_origin)?;
+        require_live_project(&current)?;
+        if current.etag() != if_match {
+            return Err(AppError::changed_record());
+        }
+        transaction
+            .execute(
+                "INSERT INTO idempotency_requests(key, fingerprint, state) VALUES (?1, ?2, 'in_progress')",
+                params![idempotency_key, fingerprint],
+            )
+            .map_err(database_error)?;
+        let project =
+            update_project_record(&transaction, current, request, &self.canonical_origin)?;
+        record_project_update(&transaction, idempotency_key, &project, &changed_fields)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(ProjectMutationOutcome {
+            project,
+            replayed: false,
+        })
+    }
+
+    pub fn tombstone(
+        &self,
+        id: &str,
+        request: &TombstoneProjectRequest,
+        if_match: &str,
+        idempotency_key: &str,
+    ) -> Result<ProjectMutationOutcome, AppError> {
+        validate_project_id(id)?;
+        validate_idempotency_key(idempotency_key)?;
+        let route = format!("/api/v1/projects/{id}");
+        let fingerprint = project_mutation_fingerprint(
+            "DELETE",
+            &route,
+            &request,
+            id,
+            if_match,
+            Some(&request.confirmation),
+        )?;
+        let _mutation = self.begin_mutation(idempotency_key, &fingerprint)?;
+        let mut connection = self.catalogue.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+
+        if let Some(record) = idempotency_record(&transaction, idempotency_key)? {
+            return replay_project_mutation(record, &fingerprint);
+        }
+        let current = project_by_id(&transaction, id, &self.canonical_origin)?;
+        require_live_project(&current)?;
+        if current.etag() != if_match {
+            return Err(AppError::changed_record());
+        }
+        if request.confirmation != current.key {
+            return Err(AppError::invalid(
+                "confirmation_required",
+                "confirmation must exactly match the current Project key",
+            ));
+        }
+        require_project_tombstone_preconditions(&transaction, id)?;
+        let tombstoned_at = observed_at()?;
+        let record_version = current.record_version + 1;
+        transaction
+            .execute(
+                "INSERT INTO idempotency_requests(key, fingerprint, state) VALUES (?1, ?2, 'in_progress')",
+                params![idempotency_key, fingerprint],
+            )
+            .map_err(database_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE projects
+                 SET record_version=?2, state='gone', updated_at=?3,
+                     terminal_state='tombstoned', tombstoned_at=?3, cause='operator'
+                 WHERE id=?1 AND record_version=?4 AND state='live'",
+                params![id, record_version, tombstoned_at, current.record_version],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(AppError::changed_record());
+        }
+        let project = Project {
+            kind: current.kind,
+            id: current.id,
+            key: current.key,
+            record_version,
+            state: ProjectState::Gone,
+            title: current.title,
+            slug: current.slug,
+            canonical_directory: current.canonical_directory,
+            created_at: current.created_at,
+            updated_at: tombstoned_at.clone(),
+            api_url: current.api_url,
+            detail_url: current.detail_url,
+            terminal_state: Some("tombstoned".to_owned()),
+            tombstoned_at: Some(tombstoned_at.clone()),
+            cause: Some("operator".to_owned()),
+        };
+        let response_json = serde_json::to_string(&project)
+            .map_err(|error| AppError::internal(format!("cannot store Project result: {error}")))?;
+        transaction
+            .execute(
+                "INSERT INTO audit_events(kind, details_json, at, actor, cause, resource_type, resource_id)
+                 VALUES ('project_tombstoned', ?1, ?2, 'operator', 'project_tombstoned', 'project', ?3)",
+                params![
+                    serde_json::json!({ "projectId": project.id }).to_string(),
+                    tombstoned_at,
+                    project.id,
+                ],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE idempotency_requests
+                 SET state='completed', status_code=200, response_json=?2, etag=?3, completed_at=?4
+                 WHERE key=?1",
+                params![
+                    idempotency_key,
+                    response_json,
+                    project.etag(),
+                    tombstoned_at,
+                ],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(ProjectMutationOutcome {
+            project,
+            replayed: false,
+        })
+    }
+
+    fn begin_mutation(
         &self,
         idempotency_key: &str,
         fingerprint: &str,
-    ) -> Result<RegistrationGuard, AppError> {
+    ) -> Result<MutationGuard, AppError> {
         let mut registrations = self
-            .in_flight_registrations
+            .in_flight_mutations
             .lock()
             .map_err(|_| AppError::internal("registration coordination is unavailable"))?;
         if let Some(active_fingerprint) = registrations.get(idempotency_key) {
@@ -337,8 +537,8 @@ impl ProjectService {
             };
         }
         registrations.insert(idempotency_key.to_owned(), fingerprint.to_owned());
-        Ok(RegistrationGuard {
-            registrations: Arc::clone(&self.in_flight_registrations),
+        Ok(MutationGuard {
+            registrations: Arc::clone(&self.in_flight_mutations),
             key: idempotency_key.to_owned(),
         })
     }
@@ -502,6 +702,40 @@ impl ProjectService {
         })
     }
 
+    pub fn tombstone_preview(&self, id: &str) -> Result<ProjectTombstonePreview, AppError> {
+        let project = self.show(id)?;
+        let connection = self.catalogue.connection()?;
+        let live_services = connection
+            .query_row(
+                "SELECT count(*) FROM services WHERE project_id=?1 AND state='live'",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let associated_artifacts = connection
+            .query_row(
+                "SELECT count(*) FROM artifacts WHERE project_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let active_operations = connection
+            .query_row(
+                "SELECT count(*) FROM operation_intents
+                 WHERE project_id=?1
+                   AND state NOT IN ('completed','cancelled','failed_terminal')",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        Ok(ProjectTombstonePreview {
+            project,
+            live_services,
+            associated_artifacts,
+            active_operations,
+        })
+    }
+
     pub fn show(&self, id: &str) -> Result<Project, AppError> {
         validate_project_id(id)?;
         let connection = self.catalogue.connection()?;
@@ -608,6 +842,10 @@ impl Project {
         &self.title
     }
 
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
     pub fn canonical_directory(&self) -> &str {
         &self.canonical_directory
     }
@@ -617,7 +855,25 @@ impl Project {
     }
 }
 
-impl RegistrationOutcome {
+impl ProjectTombstonePreview {
+    pub fn project(&self) -> &Project {
+        &self.project
+    }
+
+    pub const fn live_services(&self) -> u64 {
+        self.live_services
+    }
+
+    pub const fn associated_artifacts(&self) -> u64 {
+        self.associated_artifacts
+    }
+
+    pub const fn active_operations(&self) -> u64 {
+        self.active_operations
+    }
+}
+
+impl ProjectMutationOutcome {
     pub fn project(&self) -> &Project {
         &self.project
     }
@@ -636,7 +892,7 @@ impl From<&Project> for ProjectReference {
     }
 }
 
-impl Drop for RegistrationGuard {
+impl Drop for MutationGuard {
     fn drop(&mut self) {
         if let Ok(mut registrations) = self.registrations.lock() {
             registrations.remove(&self.key);
@@ -929,6 +1185,137 @@ fn project_title(title: Option<String>, canonical_directory: &str) -> Result<Str
     Ok(title)
 }
 
+fn validated_project_title(title: String) -> Result<String, AppError> {
+    project_title(Some(title), "")
+}
+
+fn validate_project_update(request: &UpdateProjectRequest) -> Result<(), AppError> {
+    if request.title.is_none() && request.slug.is_none() {
+        return Err(AppError::invalid(
+            "invalid_project_update",
+            "Project update requires title or slug",
+        ));
+    }
+    if let Some(title) = &request.title {
+        validated_project_title(title.clone())?;
+    }
+    if let Some(slug) = &request.slug {
+        project_slug(Some(slug), "project")?;
+    }
+    Ok(())
+}
+
+fn project_update_fields(request: &UpdateProjectRequest) -> Vec<&'static str> {
+    let mut fields = Vec::with_capacity(2);
+    if request.title.is_some() {
+        fields.push("title");
+    }
+    if request.slug.is_some() {
+        fields.push("slug");
+    }
+    fields
+}
+
+fn update_project_record(
+    transaction: &Transaction<'_>,
+    current: Project,
+    request: UpdateProjectRequest,
+    canonical_origin: &str,
+) -> Result<Project, AppError> {
+    let title = match request.title {
+        Some(title) => validated_project_title(title)?,
+        None => current.title.clone(),
+    };
+    let slug = match request.slug {
+        Some(slug) => project_slug(Some(&slug), &title)?,
+        None => current.slug.clone(),
+    };
+    let updated_at = observed_at()?;
+    let record_version = current.record_version + 1;
+    let key = format!("{slug}~{}", current.id);
+    let detail_url = format!("{canonical_origin}ui/projects/{key}/");
+    let title_fold = default_case_fold_str(&title);
+    let search_text =
+        default_case_fold_str(&format!("{title}\n{slug}\n{}", current.canonical_directory));
+    let changed = transaction
+        .execute(
+            "UPDATE projects
+             SET record_version=?2, title=?3, slug=?4, title_fold=?5,
+                 search_text=?6, updated_at=?7
+             WHERE id=?1 AND record_version=?8 AND state='live'",
+            params![
+                current.id,
+                record_version,
+                title,
+                slug,
+                title_fold,
+                search_text,
+                updated_at,
+                current.record_version,
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(AppError::changed_record());
+    }
+    Ok(Project {
+        kind: current.kind,
+        id: current.id,
+        key,
+        record_version,
+        state: ProjectState::Live,
+        title,
+        slug,
+        canonical_directory: current.canonical_directory,
+        created_at: current.created_at,
+        updated_at,
+        api_url: current.api_url,
+        detail_url,
+        terminal_state: None,
+        tombstoned_at: None,
+        cause: None,
+    })
+}
+
+fn record_project_update(
+    transaction: &Transaction<'_>,
+    idempotency_key: &str,
+    project: &Project,
+    changed_fields: &[&str],
+) -> Result<(), AppError> {
+    let response_json = serde_json::to_string(project)
+        .map_err(|error| AppError::internal(format!("cannot store Project result: {error}")))?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events(kind, details_json, at, actor, cause, resource_type, resource_id)
+             VALUES ('project_updated', ?1, ?2, 'operator', 'project_updated', 'project', ?3)",
+            params![
+                serde_json::json!({
+                    "projectId": project.id,
+                    "changed": changed_fields,
+                })
+                .to_string(),
+                project.updated_at,
+                project.id,
+            ],
+        )
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "UPDATE idempotency_requests
+             SET state='completed', status_code=200, response_json=?2, etag=?3, completed_at=?4
+             WHERE key=?1",
+            params![
+                idempotency_key,
+                response_json,
+                project.etag(),
+                project.updated_at,
+            ],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn project_slug(slug: Option<&str>, title: &str) -> Result<String, AppError> {
     let supplied = slug.is_some();
     let normalized = normalize_slug(slug.unwrap_or(title));
@@ -986,11 +1373,36 @@ fn registration_fingerprint(
         canonical_directory,
     })
     .map_err(|error| AppError::internal(format!("cannot fingerprint registration: {error}")))?;
+    render_fingerprint(&canonical)
+}
+
+fn project_mutation_fingerprint<T: Serialize>(
+    method: &str,
+    route: &str,
+    body: &T,
+    project_id: &str,
+    if_match: &str,
+    confirmation: Option<&str>,
+) -> Result<String, AppError> {
+    let canonical = serde_jcs::to_vec(&serde_json::json!({
+        "apiVersion": 1,
+        "method": method,
+        "route": route,
+        "body": body,
+        "projectId": project_id,
+        "ifMatch": if_match,
+        "confirmation": confirmation,
+    }))
+    .map_err(|error| AppError::internal(format!("cannot fingerprint Project mutation: {error}")))?;
+    render_fingerprint(&canonical)
+}
+
+fn render_fingerprint(canonical: &[u8]) -> Result<String, AppError> {
     let digest = Sha256::digest(canonical);
     let mut fingerprint = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut fingerprint, "{byte:02x}")
-            .map_err(|_| AppError::internal("cannot render Project registration fingerprint"))?;
+            .map_err(|_| AppError::internal("cannot render Project mutation fingerprint"))?;
     }
     Ok(fingerprint)
 }
@@ -1029,10 +1441,10 @@ fn idempotency_record(
         .map_err(database_error)
 }
 
-fn replay_registration(
+fn replay_project_mutation(
     record: IdempotencyRecord,
     fingerprint: &str,
-) -> Result<RegistrationOutcome, AppError> {
+) -> Result<ProjectMutationOutcome, AppError> {
     if record.fingerprint != fingerprint {
         return Err(AppError::conflict(
             "idempotency_conflict",
@@ -1051,7 +1463,7 @@ fn replay_registration(
     let project = serde_json::from_str(&response).map_err(|error| {
         AppError::internal(format!("stored Project result is invalid: {error}"))
     })?;
-    Ok(RegistrationOutcome {
+    Ok(ProjectMutationOutcome {
         project,
         replayed: true,
     })
@@ -1098,6 +1510,65 @@ fn allocate_project_id(transaction: &Transaction<'_>) -> Result<String, AppError
     Err(AppError::internal(
         "could not allocate a collision-free Project ID",
     ))
+}
+
+fn project_by_id(
+    transaction: &Transaction<'_>,
+    id: &str,
+    canonical_origin: &str,
+) -> Result<Project, AppError> {
+    transaction
+        .query_row(&project_select("WHERE id=?1"), [id], |row| {
+            project_from_row(row, canonical_origin)
+        })
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| AppError::not_found("Project does not exist"))
+}
+
+fn require_project_tombstone_preconditions(
+    transaction: &Connection,
+    project_id: &str,
+) -> Result<(), AppError> {
+    let live_services: u64 = transaction
+        .query_row(
+            "SELECT count(*) FROM services WHERE project_id=?1 AND state='live'",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if live_services != 0 {
+        return Err(AppError::conflict(
+            "project_has_live_services",
+            "Project must have zero live Services before tombstone",
+        ));
+    }
+    let active_operations: u64 = transaction
+        .query_row(
+            "SELECT count(*) FROM operation_intents
+             WHERE project_id=?1
+               AND state NOT IN ('completed','cancelled','failed_terminal')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if active_operations != 0 {
+        return Err(AppError::conflict(
+            "project_operation_in_progress",
+            "Project has a nonterminal scoped operation",
+        ));
+    }
+    Ok(())
+}
+
+fn require_live_project(project: &Project) -> Result<(), AppError> {
+    if project.state == ProjectState::Gone {
+        return Err(AppError::gone(
+            "project_gone",
+            "Project has a terminal identity",
+        ));
+    }
+    Ok(())
 }
 
 fn project_select(suffix: &str) -> String {

@@ -14,7 +14,7 @@ use crate::error::AppError;
 use crate::storage_status::{self, StorageStatus};
 
 pub const APPLICATION_ID: i64 = 0x4f42_5356;
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -235,9 +235,9 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
              ) STRICT;
              CREATE UNIQUE INDEX projects_canonical_directory ON projects(canonical_directory);
              CREATE TABLE artifacts (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
-             CREATE TABLE services (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+             CREATE TABLE services (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0), state TEXT NOT NULL CHECK(state IN ('live','gone'))) STRICT;
              CREATE TABLE revisions (id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id), state TEXT NOT NULL CHECK(state IN ('available','unavailable'))) STRICT;
-             CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL) STRICT;
+             CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL, project_id TEXT REFERENCES projects(id)) STRICT;
              CREATE TABLE backup_leases (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
              CREATE TABLE cleanup_runs (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
              CREATE TABLE audit_events (
@@ -282,7 +282,11 @@ fn migrate(root: &Path, connection: &Connection) -> Result<(), AppError> {
     }
     match pragma_i64(connection, "user_version")? {
         SCHEMA_VERSION => Ok(()),
-        1 => migrate_v1_to_v2(root, connection),
+        1 => {
+            migrate_v1_to_v2(root, connection)?;
+            migrate_v2_to_v3(root, connection)
+        }
+        2 => migrate_v2_to_v3(root, connection),
         _ => Err(AppError::internal("catalogue schema is unsupported")),
     }
 }
@@ -312,7 +316,7 @@ fn migrate_v1_to_v2(root: &Path, connection: &Connection) -> Result<(), AppError
             "schema v1 contains state that its public contract could not create",
         ));
     }
-    backup_before_migration(root, connection)?;
+    backup_before_migration(root, connection, 1)?;
     let cursor_secret = random_bytes::<32>()?;
     connection
         .execute_batch(
@@ -362,13 +366,34 @@ fn migrate_v1_to_v2(root: &Path, connection: &Connection) -> Result<(), AppError
     connection.execute_batch("COMMIT;").map_err(database_error)
 }
 
-fn backup_before_migration(root: &Path, connection: &Connection) -> Result<(), AppError> {
+fn migrate_v2_to_v3(root: &Path, connection: &Connection) -> Result<(), AppError> {
+    backup_before_migration(root, connection, 2)?;
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE services ADD COLUMN state TEXT NOT NULL DEFAULT 'live' CHECK(state IN ('live','gone'));
+             ALTER TABLE operation_intents ADD COLUMN project_id TEXT REFERENCES projects(id);
+             CREATE INDEX services_project_state ON services(project_id, state);
+             CREATE INDEX operation_intents_project_state ON operation_intents(project_id, state);
+             PRAGMA user_version=3;
+             COMMIT;",
+        )
+        .map_err(database_error)
+}
+
+fn backup_before_migration(
+    root: &Path,
+    connection: &Connection,
+    schema_version: i64,
+) -> Result<(), AppError> {
     let backups = root.join("backups");
-    let final_path = backups.join("schema-v1-pre-migration.sqlite");
-    if valid_existing_migration_backup(&final_path)? {
+    let final_path = backups.join(format!("schema-v{schema_version}-pre-migration.sqlite"));
+    if valid_existing_migration_backup(&final_path, schema_version)? {
         return Ok(());
     }
-    let staging = backups.join(".schema-v1-pre-migration.sqlite.staging");
+    let staging = backups.join(format!(
+        ".schema-v{schema_version}-pre-migration.sqlite.staging"
+    ));
     reset_migration_backup_staging(&staging)?;
     OpenOptions::new()
         .write(true)
@@ -403,7 +428,7 @@ fn backup_before_migration(root: &Path, connection: &Connection) -> Result<(), A
         })
 }
 
-fn valid_existing_migration_backup(path: &Path) -> Result<bool, AppError> {
+fn valid_existing_migration_backup(path: &Path, schema_version: i64) -> Result<bool, AppError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -424,11 +449,11 @@ fn valid_existing_migration_backup(path: &Path) -> Result<bool, AppError> {
     )
     .map_err(database_error)?;
     if pragma_i64(&backup, "application_id")? != APPLICATION_ID
-        || pragma_i64(&backup, "user_version")? != 1
+        || pragma_i64(&backup, "user_version")? != schema_version
         || pragma_string(&backup, "quick_check")? != "ok"
     {
         return Err(AppError::internal(
-            "existing migration backup does not match schema v1 authority",
+            "existing migration backup does not match catalogue authority",
         ));
     }
     Ok(true)

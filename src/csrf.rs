@@ -18,13 +18,13 @@ pub struct CsrfStore {
 
 #[derive(Clone, Debug)]
 struct Entry {
-    action: String,
+    scope: String,
     issued_at: Instant,
     expires_at: Instant,
 }
 
 impl CsrfStore {
-    pub fn issue(&self, action: &str) -> Result<String, AppError> {
+    pub fn issue(&self, scope: &str) -> Result<String, AppError> {
         let now = Instant::now();
         let mut entries = self
             .entries
@@ -43,7 +43,7 @@ impl CsrfStore {
         entries.insert(
             token.clone(),
             Entry {
-                action: action.to_owned(),
+                scope: scope.to_owned(),
                 issued_at: now,
                 expires_at: now + TOKEN_LIFETIME,
             },
@@ -51,16 +51,21 @@ impl CsrfStore {
         Ok(token)
     }
 
-    pub fn consume(&self, token: &str, action: &str) -> Result<(), AppError> {
-        let entry = self
+    pub fn consume(&self, token: &str, scope: &str) -> Result<(), AppError> {
+        let now = Instant::now();
+        let mut entries = self
             .entries
             .lock()
-            .map_err(|_| AppError::internal("CSRF token store is unavailable"))?
-            .remove(token)
-            .ok_or_else(csrf_rejected)?;
-        if entry.expires_at <= Instant::now() || entry.action != action {
+            .map_err(|_| AppError::internal("CSRF token store is unavailable"))?;
+        let entry = entries.get(token).ok_or_else(csrf_rejected)?;
+        if entry.expires_at <= now {
+            entries.remove(token);
             return Err(csrf_rejected());
         }
+        if entry.scope != scope {
+            return Err(csrf_rejected());
+        }
+        entries.remove(token);
         Ok(())
     }
 }

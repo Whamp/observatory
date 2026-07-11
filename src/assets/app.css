@@ -177,6 +177,18 @@
   .registration label span { color: var(--faint); font-weight: 400; }
   .registration .primary { justify-self: start; margin-top: 2rem; }
   .form-status { min-height: 1.6rem; margin-top: 1rem; color: var(--amber); font: .78rem/1.4 var(--mono); }
+  .project-controls { border: 1px solid var(--rule); padding: clamp(1.25rem, 3vw, 2rem); background: var(--panel); }
+  .project-controls .section-heading { margin-bottom: 1.5rem; }
+  .registration.compact { max-width: 38rem; }
+  .registration.compact button { justify-self: start; margin-top: 1rem; }
+  .danger-link { display: inline-block; margin-top: 2.5rem; color: #ff8a76; font: 700 .72rem/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+  .eyebrow.danger { color: #ff8a76; }
+  .confirmation-facts { display: grid; grid-template-columns: repeat(3, 1fr); margin: 2rem 0; border-block: 1px solid var(--rule); }
+  .confirmation-facts strong { padding: 1.2rem; color: var(--muted); font: 700 .74rem/1.4 var(--mono); text-align: center; }
+  .confirmation-facts strong + strong { border-left: 1px solid var(--rule); }
+  .danger-zone { border-left: .2rem solid #ff8a76; padding-left: 1.5rem; }
+  .danger-button { justify-self: start; margin-top: 1rem; border-color: #ff8a76; color: var(--night); background: #ff8a76; }
+  .danger-button:hover { color: #ff8a76; }
 
   .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--rule); }
   .facts > div { border-bottom: 1px solid var(--rule); padding: 1.3rem 0; }
@@ -194,6 +206,8 @@
     .state { grid-column: 2; grid-row: 1; }
     .facts { grid-template-columns: 1fr; }
     .facts > div:nth-child(odd), .facts > div:nth-child(even) { border-right: 0; padding-inline: 0; }
+    .confirmation-facts { grid-template-columns: 1fr; }
+    .confirmation-facts strong + strong { border-top: 1px solid var(--rule); border-left: 0; }
   }
 
   @media (max-width: 30rem) {

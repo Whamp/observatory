@@ -35,7 +35,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use config::ServeOverrides;
 use error::AppError;
-use project::RegisterProjectRequest;
+use project::{RegisterProjectRequest, TombstoneProjectRequest, UpdateProjectRequest};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -137,6 +137,18 @@ enum ProjectLeaf {
         title: Option<String>,
         #[arg(long)]
         slug: Option<String>,
+    },
+    Update {
+        selector: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        slug: Option<String>,
+    },
+    Tombstone {
+        selector: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -271,6 +283,14 @@ async fn run_project(
             run_project_register(context, path, title, slug).await
         }
         ProjectLeaf::Show { selector } => run_project_show(context.client, &selector).await,
+        ProjectLeaf::Update {
+            selector,
+            title,
+            slug,
+        } => run_project_update(context, &selector, title, slug).await,
+        ProjectLeaf::Tombstone { selector, yes } => {
+            run_project_tombstone(context, &selector, yes).await
+        }
     }
 }
 
@@ -351,6 +371,97 @@ async fn run_project_register(
         context.client.json,
     )
     .await
+}
+
+struct CurrentProject {
+    key: String,
+    etag: String,
+    api_path: String,
+}
+
+async fn run_project_update(
+    context: ProjectClientContext,
+    selector: &str,
+    title: Option<String>,
+    slug: Option<String>,
+) -> Result<(), AppError> {
+    let idempotency_key = mutation_idempotency_key(context.idempotency_key)?;
+    let project = current_project(&context.client, selector).await?;
+    cli::patch(
+        context.client.server,
+        context.client.timeout,
+        cli::ExistingResourceMutation::new(
+            &project.api_path,
+            &project.etag,
+            &idempotency_key,
+            &UpdateProjectRequest::new(title, slug),
+        ),
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_project_tombstone(
+    context: ProjectClientContext,
+    selector: &str,
+    confirmed: bool,
+) -> Result<(), AppError> {
+    if !confirmed {
+        return Err(AppError::invalid(
+            "confirmation_required",
+            "Project tombstone requires --yes",
+        ));
+    }
+    let idempotency_key = mutation_idempotency_key(context.idempotency_key)?;
+    let project = current_project(&context.client, selector).await?;
+    cli::delete(
+        context.client.server,
+        context.client.timeout,
+        cli::ExistingResourceMutation::new(
+            &project.api_path,
+            &project.etag,
+            &idempotency_key,
+            &TombstoneProjectRequest::new(project.key),
+        ),
+        context.client.json,
+    )
+    .await
+}
+
+async fn current_project(
+    client: &ClientContext,
+    selector: &str,
+) -> Result<CurrentProject, AppError> {
+    let id = resolve_project_selector(selector, client.server.clone(), client.timeout).await?;
+    let resource = cli::fetch_resource(
+        client.server.clone(),
+        client.timeout,
+        &format!("/api/v1/projects/{id}"),
+    )
+    .await?;
+    let project = resource
+        .envelope()
+        .get("result")
+        .ok_or_else(|| AppError::internal("Project response has no result"))?;
+    let key = project
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::internal("Project response has no key"))?
+        .to_owned();
+    let api_url = project
+        .get("apiUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::internal("Project response has no API URL"))?;
+    let api_url = url::Url::parse(api_url)
+        .map_err(|error| AppError::internal(format!("Project API URL is invalid: {error}")))?;
+    if api_url.query().is_some() || api_url.fragment().is_some() {
+        return Err(AppError::internal("Project API URL is not canonical"));
+    }
+    Ok(CurrentProject {
+        key,
+        etag: resource.etag().to_owned(),
+        api_path: api_url.path().to_owned(),
+    })
 }
 
 async fn run_project_show(client: ClientContext, selector: &str) -> Result<(), AppError> {

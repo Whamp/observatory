@@ -1,4 +1,4 @@
-use crate::project::{Project, ProjectList};
+use crate::project::{Project, ProjectList, ProjectTombstonePreview};
 
 pub fn index(projects: &ProjectList, build_id: &str, query: &str) -> String {
     let mut body = String::new();
@@ -39,7 +39,12 @@ pub fn register_form(csrf_token: &str, idempotency_key: &str, build_id: &str) ->
     shell("Register Project", &body, build_id)
 }
 
-pub fn project_detail(project: &Project, build_id: &str) -> String {
+pub fn project_detail(
+    project: &Project,
+    csrf_token: &str,
+    idempotency_key: &str,
+    build_id: &str,
+) -> String {
     let mut body = String::new();
     body.push_str("<nav><a href=\"/ui/\">← Project ledger</a></nav><header><p class=\"eyebrow\">Live Project</p><h1>");
     body.push_str(&text_escape(project.title()));
@@ -51,8 +56,68 @@ pub fn project_detail(project: &Project, build_id: &str) -> String {
     body.push_str(&text_escape(project.canonical_directory()));
     body.push_str("</code></dd></div><div><dt>Project ID</dt><dd><code>");
     body.push_str(&text_escape(project.id()));
-    body.push_str("</code></dd></div></dl><section><div class=\"section-heading\"><h2>Entries</h2><span>0 shown</span></div><div class=\"empty\"><h3>No Entries yet</h3><p>Published Artifacts and registered Services will appear here.</p></div></section>");
+    body.push_str("</code></dd></div></dl><section class=\"project-controls\" aria-labelledby=\"project-settings\"><div class=\"section-heading\"><h2 id=\"project-settings\">Project settings</h2><span>Presentation only</span></div><form class=\"registration compact\" action=\"");
+    body.push_str(&attribute_escape(&format!(
+        "/ui/projects/{}/update/",
+        project.key()
+    )));
+    body.push_str(
+        "\" method=\"post\" data-project-update><input type=\"hidden\" name=\"csrfToken\" value=\"",
+    );
+    body.push_str(&attribute_escape(csrf_token));
+    body.push_str("\"><input type=\"hidden\" name=\"idempotencyKey\" value=\"");
+    body.push_str(&attribute_escape(idempotency_key));
+    body.push_str("\"><input type=\"hidden\" name=\"ifMatch\" value=\"");
+    body.push_str(&attribute_escape(&project.etag()));
+    body.push_str("\"><label for=\"project-title\">Title</label><input id=\"project-title\" name=\"title\" type=\"text\" required value=\"");
+    body.push_str(&attribute_escape(project.title()));
+    body.push_str("\"><label for=\"project-slug\">Route slug</label><input id=\"project-slug\" name=\"slug\" type=\"text\" required pattern=\"[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\" value=\"");
+    body.push_str(&attribute_escape(project.slug()));
+    body.push_str("\"><p class=\"form-status\" role=\"status\" aria-live=\"polite\"></p><button type=\"submit\">Update Project</button></form><a class=\"danger-link\" href=\"");
+    body.push_str(&attribute_escape(&format!(
+        "/ui/projects/{}/tombstone/",
+        project.key()
+    )));
+    body.push_str("\">Tombstone Project</a></section><section><div class=\"section-heading\"><h2>Entries</h2><span>0 shown</span></div><div class=\"empty\"><h3>No Entries yet</h3><p>Published Artifacts and registered Services will appear here.</p></div></section>");
     shell(project.title(), &body, build_id)
+}
+
+pub fn tombstone_review(
+    preview: &ProjectTombstonePreview,
+    csrf_token: &str,
+    idempotency_key: &str,
+    build_id: &str,
+) -> String {
+    let project = preview.project();
+    let mut body = String::new();
+    body.push_str("<nav><a href=\"");
+    body.push_str(&attribute_escape(&format!(
+        "/ui/projects/{}/",
+        project.key()
+    )));
+    body.push_str("\">← Project detail</a></nav><header><p class=\"eyebrow danger\">Permanent identity retirement</p><h1>Tombstone Project</h1><p class=\"lede\">The Project identity becomes permanently gone. Associated Artifacts remain associated and continue their own lifecycle.</p></header><div class=\"confirmation-facts\"><strong>");
+    body.push_str(&preview.live_services().to_string());
+    body.push_str(" live Services</strong><strong>");
+    body.push_str(&preview.associated_artifacts().to_string());
+    body.push_str(" associated Artifacts</strong><strong>");
+    body.push_str(&preview.active_operations().to_string());
+    body.push_str(
+        " active operations</strong></div><form class=\"registration danger-zone\" action=\"",
+    );
+    body.push_str(&attribute_escape(&format!(
+        "/ui/projects/{}/tombstone/",
+        project.key()
+    )));
+    body.push_str("\" method=\"post\" data-project-tombstone><input type=\"hidden\" name=\"csrfToken\" value=\"");
+    body.push_str(&attribute_escape(csrf_token));
+    body.push_str("\"><input type=\"hidden\" name=\"idempotencyKey\" value=\"");
+    body.push_str(&attribute_escape(idempotency_key));
+    body.push_str("\"><input type=\"hidden\" name=\"ifMatch\" value=\"");
+    body.push_str(&attribute_escape(&project.etag()));
+    body.push_str("\"><label for=\"project-confirmation\">Type the exact Project key <code>");
+    body.push_str(&text_escape(project.key()));
+    body.push_str("</code></label><input id=\"project-confirmation\" name=\"confirmation\" type=\"text\" required autocomplete=\"off\"><p class=\"form-status\" role=\"status\" aria-live=\"polite\"></p><button class=\"danger-button\" type=\"submit\">Tombstone Project</button></form>");
+    shell("Tombstone Project", &body, build_id)
 }
 
 pub fn error(title: &str, message: &str, build_id: &str) -> String {

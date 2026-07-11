@@ -1,7 +1,7 @@
 document.documentElement.classList.add('enhanced');
 
 enhanceProjectSearch();
-enhanceProjectRegistration();
+enhanceProjectForms();
 
 function enhanceProjectSearch() {
   const search = document.querySelector('#project-search');
@@ -22,21 +22,29 @@ function filterProjectRows(search, rows, count) {
   if (count) count.textContent = `${visible} shown`;
 }
 
-function enhanceProjectRegistration() {
-  const form = document.querySelector('[data-project-registration]');
-  if (!(form instanceof HTMLFormElement)) return;
-  form.addEventListener('submit', (event) => submitProjectRegistration(event, form));
+function enhanceProjectForms() {
+  const selector = [
+    '[data-project-registration]',
+    '[data-project-update]',
+    '[data-project-tombstone]',
+  ].join(',');
+  for (const form of document.querySelectorAll(selector)) {
+    if (!(form instanceof HTMLFormElement)) continue;
+    form.addEventListener('submit', (event) => submitProjectForm(event, form));
+  }
 }
 
-async function submitProjectRegistration(event, form) {
+async function submitProjectForm(event, form) {
   if (!form.reportValidity()) return;
   event.preventDefault();
   const submit = form.querySelector('button[type="submit"]');
   const status = form.querySelector('[role="status"]');
-  setRegistrationBusy(submit, status, true);
+  setFormBusy(submit, status, true);
   try {
-    const body = new FormData(form);
-    const csrfToken = String(body.get('csrfToken') || '');
+    const formData = new FormData(form);
+    const body = new URLSearchParams();
+    for (const [name, value] of formData) body.append(name, String(value));
+    const csrfToken = String(formData.get('csrfToken') || '');
     const response = await fetch(form.action, {
       method: 'POST',
       body,
@@ -46,28 +54,28 @@ async function submitProjectRegistration(event, form) {
         'X-Observatory-Enhanced': 'fetch',
       },
     });
-    if (response.ok && response.redirected) {
+    if (response.redirected) {
       window.location.assign(response.url);
       return;
     }
-    await showRegistrationError(response, status);
+    await showFormError(response, status);
   } catch {
-    setStatus(status, 'The Observatory daemon could not be reached. Your registration was not confirmed.');
+    setStatus(status, 'The Observatory daemon could not be reached. This change was not confirmed.');
   } finally {
-    setRegistrationBusy(submit, status, false);
+    setFormBusy(submit, status, false);
   }
 }
 
-function setRegistrationBusy(submit, status, busy) {
+function setFormBusy(submit, status, busy) {
   if (submit instanceof HTMLButtonElement) submit.disabled = busy;
-  if (busy) setStatus(status, 'Registering through Observatory…');
+  if (busy) setStatus(status, 'Submitting through Observatory…');
 }
 
-async function showRegistrationError(response, status) {
+async function showFormError(response, status) {
   const documentText = await response.text();
   const parsed = new DOMParser().parseFromString(documentText, 'text/html');
   const message = parsed.querySelector('.lede')?.textContent?.trim();
-  setStatus(status, message || `Registration failed (${response.status}).`);
+  setStatus(status, message || `Project change failed (${response.status}).`);
 }
 
 function setStatus(status, message) {

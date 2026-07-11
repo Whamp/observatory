@@ -61,6 +61,111 @@ pub async fn fetch_with_query(
     decode_response(response, None).await
 }
 
+pub(crate) struct ResourceResponse {
+    envelope: Value,
+    etag: String,
+}
+
+impl ResourceResponse {
+    pub(crate) fn envelope(&self) -> &Value {
+        &self.envelope
+    }
+
+    pub(crate) fn etag(&self) -> &str {
+        &self.etag
+    }
+}
+
+pub async fn fetch_resource(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    path: &str,
+) -> Result<ResourceResponse, AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .get(endpoint(&server, path))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| request_error(&error, None))?;
+    let etag = response
+        .status()
+        .is_success()
+        .then(|| {
+            response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+        .flatten();
+    let envelope = decode_response(response, None).await?;
+    let etag =
+        etag.ok_or_else(|| AppError::internal("daemon resource response has no valid ETag"))?;
+    Ok(ResourceResponse { envelope, etag })
+}
+
+pub(crate) struct ExistingResourceMutation<'a, T> {
+    path: &'a str,
+    if_match: &'a str,
+    idempotency_key: &'a str,
+    body: &'a T,
+}
+
+impl<'a, T> ExistingResourceMutation<'a, T> {
+    pub(crate) const fn new(
+        path: &'a str,
+        if_match: &'a str,
+        idempotency_key: &'a str,
+        body: &'a T,
+    ) -> Self {
+        Self {
+            path,
+            if_match,
+            idempotency_key,
+            body,
+        }
+    }
+}
+
+pub async fn patch<T: Serialize>(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    mutation: ExistingResourceMutation<'_, T>,
+    json_output: bool,
+) -> Result<(), AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .patch(endpoint(&server, mutation.path))
+        .header("accept", "application/json")
+        .header("if-match", mutation.if_match)
+        .header("idempotency-key", mutation.idempotency_key)
+        .json(mutation.body)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, Some(mutation.idempotency_key)))?;
+    emit_response(response, json_output, Some(mutation.idempotency_key)).await
+}
+
+pub async fn delete<T: Serialize>(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    mutation: ExistingResourceMutation<'_, T>,
+    json_output: bool,
+) -> Result<(), AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .delete(endpoint(&server, mutation.path))
+        .header("accept", "application/json")
+        .header("if-match", mutation.if_match)
+        .header("idempotency-key", mutation.idempotency_key)
+        .json(mutation.body)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, Some(mutation.idempotency_key)))?;
+    emit_response(response, json_output, Some(mutation.idempotency_key)).await
+}
+
 pub async fn post<T: Serialize>(
     server_override: Option<String>,
     timeout_override_ms: Option<u64>,

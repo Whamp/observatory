@@ -64,6 +64,8 @@ enum ApiStatus {
     Forbidden,
     NotFound,
     Conflict,
+    PreconditionFailed,
+    PreconditionRequired,
     Gone,
     Unprocessable,
     Locked,
@@ -78,10 +80,19 @@ impl ApiStatus {
             Self::NotFound => 404,
             Self::Conflict => 409,
             Self::Gone => 410,
-            Self::Unprocessable => 422,
-            Self::Locked => 423,
             Self::Internal => 500,
             Self::Unavailable => 503,
+            _ => self.extended_code(),
+        }
+    }
+
+    const fn extended_code(self) -> u16 {
+        match self {
+            Self::PreconditionFailed => 412,
+            Self::Unprocessable => 422,
+            Self::Locked => 423,
+            Self::PreconditionRequired => 428,
+            _ => unreachable!(),
         }
     }
 }
@@ -134,6 +145,26 @@ impl AppError {
             Retryability::Terminal,
             CliExit::Conflict,
             ApiStatus::Conflict,
+        )
+    }
+
+    pub fn changed_record() -> Self {
+        Self::new(
+            "changed_record",
+            "the resource changed",
+            Retryability::Terminal,
+            CliExit::Conflict,
+            ApiStatus::PreconditionFailed,
+        )
+    }
+
+    pub fn precondition_required() -> Self {
+        Self::new(
+            "precondition_required",
+            "If-Match is required",
+            Retryability::Terminal,
+            CliExit::Conflict,
+            ApiStatus::PreconditionRequired,
         )
     }
 

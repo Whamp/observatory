@@ -19,18 +19,18 @@ use crate::crypto::random_opaque_id;
 use crate::csrf::CsrfStore;
 use crate::error::{AppError, Success};
 use crate::project::{
-    LedgerQuery, ListProjectsQuery, ProjectList, ProjectService, RegisterProjectRequest,
-    RegistrationOutcome,
+    LedgerQuery, ListProjectsQuery, Project, ProjectList, ProjectMutationOutcome, ProjectService,
+    ProjectTombstonePreview, RegisterProjectRequest, TombstoneProjectRequest, UpdateProjectRequest,
 };
 use crate::storage_status::StorageStatus;
 use crate::ui;
 
-const BUILD_ID: &str = "project-ledger-v2";
+const BUILD_ID: &str = "project-lifecycle-v3";
 const CSS: &str = include_str!("assets/app.css");
 const JAVASCRIPT: &str = include_str!("assets/app.js");
 const CSS_ETAG: &str =
-    "\"sha256-4b0877d152aee07d74e9d400193509b77a04055c7a34b37bfccae64ce75e2ccb\"";
-const JS_ETAG: &str = "\"sha256-5eca0221a848554e02a81d0f2184acd7928a8593763b8e2ad8ee0e517bf2d131\"";
+    "\"sha256-3c60f9f30cdeb66a7a382adcd786342ee8a4fe5ebcf5e232a5124c3253c7139d\"";
+const JS_ETAG: &str = "\"sha256-a27290f25b511dccc01582d65ff2153b5d47c320ec4f537ae5a8c7ebc78d7f18\"";
 
 #[derive(Clone)]
 pub struct ApplicationState {
@@ -103,6 +103,71 @@ struct ProjectRegistrationForm {
     idempotency_key: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectUpdateForm {
+    title: String,
+    slug: String,
+    csrf_token: String,
+    idempotency_key: String,
+    if_match: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectTombstoneForm {
+    confirmation: String,
+    csrf_token: String,
+    idempotency_key: String,
+    if_match: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectMutationAction {
+    Update,
+    Tombstone,
+}
+
+impl ProjectMutationAction {
+    const fn scope_name(self) -> &'static str {
+        match self {
+            Self::Update => "project.update",
+            Self::Tombstone => "project.tombstone",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectConfirmation<'a> {
+    Ordinary,
+    Exact(&'a str),
+}
+
+impl<'a> ProjectConfirmation<'a> {
+    const fn scope_value(self) -> &'a str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Exact(value) => value,
+        }
+    }
+
+    fn matches(self, project: &Project) -> bool {
+        match self {
+            Self::Ordinary => true,
+            Self::Exact(value) => project.key() == value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectFormAuthorization<'a> {
+    project_key: &'a str,
+    if_match: &'a str,
+    action: ProjectMutationAction,
+    confirmation: ProjectConfirmation<'a>,
+    form_token: &'a str,
+}
+
 pub fn router(state: ApplicationState) -> Router {
     Router::new()
         .route("/", get(root))
@@ -110,6 +175,14 @@ pub fn router(state: ApplicationState) -> Router {
         .route("/ui/projects/new/", get(ui_register_project))
         .route("/ui/projects/", post(ui_submit_project))
         .route("/ui/projects/{project_key}/", get(ui_project_detail))
+        .route(
+            "/ui/projects/{project_key}/update/",
+            post(ui_update_project),
+        )
+        .route(
+            "/ui/projects/{project_key}/tombstone/",
+            get(ui_tombstone_project).post(ui_submit_project_tombstone),
+        )
         .route(&format!("/_static/{BUILD_ID}/app.css"), get(static_css))
         .route(
             &format!("/_static/{BUILD_ID}/app.js"),
@@ -121,7 +194,12 @@ pub fn router(state: ApplicationState) -> Router {
         )
         .route("/api/v1/projects/resolve", get(resolve_project))
         .route("/api/v1/projects/ledger", get(all_projects_ledger))
-        .route("/api/v1/projects/{project_id}", get(show_project))
+        .route(
+            "/api/v1/projects/{project_id}",
+            get(show_project)
+                .patch(update_project)
+                .delete(tombstone_project),
+        )
         .route("/api/v1/projects/{project_id}/ledger", get(project_ledger))
         .route("/api/v1/system/health", get(health))
         .route("/api/v1/system/status", get(status))
@@ -183,30 +261,278 @@ async fn ui_project_detail(
     State(state): State<ApplicationState>,
     AxumPath(project_key): AxumPath<String>,
 ) -> Response {
-    let Some((_, project_id)) = project_key.rsplit_once('~') else {
-        return ui_error_status(
-            StatusCode::NOT_FOUND,
-            "Project not found",
-            "The Project route is malformed or unknown.",
-        );
+    let project_id = match browser_project_id(&project_key) {
+        Ok(id) => id,
+        Err(response) => return *response,
     };
-    let project_id = project_id.to_ascii_lowercase();
     let projects = state.projects.clone();
     match tokio::task::spawn_blocking(move || projects.show(&project_id)).await {
-        Ok(Ok(project)) if project.key() == project_key => {
-            no_store(Html(ui::project_detail(&project, BUILD_ID)).into_response())
-        }
-        Ok(Ok(project)) => {
-            let Ok(location) = HeaderValue::from_str(project.detail_url()) else {
-                return ui_error(&AppError::internal("Project detail URL is invalid"));
-            };
-            let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
-            response.headers_mut().insert(LOCATION, location);
-            no_store(response)
-        }
+        Ok(Ok(project)) if project.key() == project_key => render_project_detail(&state, &project),
+        Ok(Ok(project)) => browser_project_redirect(project.detail_url()),
         Ok(Err(error)) => ui_error(&error),
         Err(error) => ui_error(&AppError::internal(format!(
             "Project detail worker failed: {error}"
+        ))),
+    }
+}
+
+fn render_project_detail(state: &ApplicationState, project: &Project) -> Response {
+    let scope = project_csrf_scope(
+        ProjectMutationAction::Update,
+        project,
+        ProjectConfirmation::Ordinary,
+    );
+    let csrf_token = match state.csrf.issue(&scope) {
+        Ok(token) => token,
+        Err(error) => return ui_error(&error),
+    };
+    let idempotency_key = match browser_idempotency_key("update") {
+        Ok(key) => key,
+        Err(error) => return ui_error(&error),
+    };
+    no_store(
+        Html(ui::project_detail(
+            project,
+            &csrf_token,
+            &idempotency_key,
+            BUILD_ID,
+        ))
+        .into_response(),
+    )
+}
+
+async fn ui_tombstone_project(
+    State(state): State<ApplicationState>,
+    AxumPath(project_key): AxumPath<String>,
+) -> Response {
+    let project_id = match browser_project_id(&project_key) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    let projects = state.projects.clone();
+    match tokio::task::spawn_blocking(move || projects.tombstone_preview(&project_id)).await {
+        Ok(Ok(preview)) if preview.project().key() == project_key => {
+            render_project_tombstone(&state, &preview)
+        }
+        Ok(Ok(preview)) => {
+            browser_project_redirect(&format!("{}tombstone/", preview.project().detail_url()))
+        }
+        Ok(Err(error)) => ui_error(&error),
+        Err(error) => ui_error(&AppError::internal(format!(
+            "Project tombstone preview worker failed: {error}"
+        ))),
+    }
+}
+
+fn render_project_tombstone(
+    state: &ApplicationState,
+    preview: &ProjectTombstonePreview,
+) -> Response {
+    let scope = project_csrf_scope(
+        ProjectMutationAction::Tombstone,
+        preview.project(),
+        ProjectConfirmation::Exact(preview.project().key()),
+    );
+    let csrf_token = match state.csrf.issue(&scope) {
+        Ok(token) => token,
+        Err(error) => return ui_error(&error),
+    };
+    let idempotency_key = match browser_idempotency_key("tombstone") {
+        Ok(key) => key,
+        Err(error) => return ui_error(&error),
+    };
+    no_store(
+        Html(ui::tombstone_review(
+            preview,
+            &csrf_token,
+            &idempotency_key,
+            BUILD_ID,
+        ))
+        .into_response(),
+    )
+}
+
+async fn ui_update_project(
+    State(state): State<ApplicationState>,
+    AxumPath(project_key): AxumPath<String>,
+    headers: HeaderMap,
+    form: Result<Form<ProjectUpdateForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let form = match accepted_browser_form(&state, &headers, form, "Invalid Project update") {
+        Ok(form) => form,
+        Err(response) => return *response,
+    };
+    let (project_id, current) = match current_browser_project(&state, &project_key).await {
+        Ok(current) => current,
+        Err(response) => return *response,
+    };
+    if let Err(error) = ProjectService::validate_update_request(&UpdateProjectRequest::new(
+        Some(form.title.clone()),
+        Some(form.slug.clone()),
+    )) {
+        return ui_error(&error);
+    }
+    if let Err(error) = authorize_project_form(
+        &state,
+        &headers,
+        &current,
+        ProjectFormAuthorization {
+            project_key: &project_key,
+            if_match: &form.if_match,
+            action: ProjectMutationAction::Update,
+            confirmation: ProjectConfirmation::Ordinary,
+            form_token: &form.csrf_token,
+        },
+    ) {
+        return ui_error(&error);
+    }
+    dispatch_browser_project_update(state.projects, project_id, form).await
+}
+
+async fn ui_submit_project_tombstone(
+    State(state): State<ApplicationState>,
+    AxumPath(project_key): AxumPath<String>,
+    headers: HeaderMap,
+    form: Result<Form<ProjectTombstoneForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let form = match accepted_browser_form(&state, &headers, form, "Invalid Project tombstone") {
+        Ok(form) => form,
+        Err(response) => return *response,
+    };
+    let (project_id, current) = match current_browser_project(&state, &project_key).await {
+        Ok(current) => current,
+        Err(response) => return *response,
+    };
+    if let Err(response) = browser_tombstone_constraints(&state, &project_id).await {
+        return *response;
+    }
+    if let Err(error) = authorize_project_form(
+        &state,
+        &headers,
+        &current,
+        ProjectFormAuthorization {
+            project_key: &project_key,
+            if_match: &form.if_match,
+            action: ProjectMutationAction::Tombstone,
+            confirmation: ProjectConfirmation::Exact(&form.confirmation),
+            form_token: &form.csrf_token,
+        },
+    ) {
+        return ui_error(&error);
+    }
+    dispatch_browser_project_tombstone(state.projects, project_id, form).await
+}
+
+fn accepted_browser_form<T>(
+    state: &ApplicationState,
+    headers: &HeaderMap,
+    form: Result<Form<T>, axum::extract::rejection::FormRejection>,
+    title: &str,
+) -> Result<T, Box<Response>> {
+    verify_browser_mutation(headers, &state.configuration.server.canonical_origin)
+        .map_err(|error| Box::new(ui_error(&error)))?;
+    form.map(|Form(form)| form).map_err(|rejection| {
+        Box::new(ui_error_status(
+            rejection.status(),
+            title,
+            &rejection.body_text(),
+        ))
+    })
+}
+
+async fn current_browser_project(
+    state: &ApplicationState,
+    project_key: &str,
+) -> Result<(String, Project), Box<Response>> {
+    let project_id = browser_project_id(project_key)?;
+    let current_id = project_id.clone();
+    let projects = state.projects.clone();
+    let current = tokio::task::spawn_blocking(move || projects.show(&current_id))
+        .await
+        .map_err(|error| {
+            Box::new(ui_error(&AppError::internal(format!(
+                "Project mutation preflight failed: {error}"
+            ))))
+        })?
+        .map_err(|error| Box::new(ui_error(&error)))?;
+    Ok((project_id, current))
+}
+
+async fn browser_tombstone_constraints(
+    state: &ApplicationState,
+    project_id: &str,
+) -> Result<(), Box<Response>> {
+    let projects = state.projects.clone();
+    let project_id = project_id.to_owned();
+    tokio::task::spawn_blocking(move || projects.validate_tombstone_constraints(&project_id))
+        .await
+        .map_err(|error| {
+            Box::new(ui_error(&AppError::internal(format!(
+                "Project tombstone preflight failed: {error}"
+            ))))
+        })?
+        .map_err(|error| Box::new(ui_error(&error)))
+}
+
+fn authorize_project_form(
+    state: &ApplicationState,
+    headers: &HeaderMap,
+    current: &Project,
+    authorization: ProjectFormAuthorization<'_>,
+) -> Result<(), AppError> {
+    if current.key() != authorization.project_key || current.etag() != authorization.if_match {
+        return Err(csrf_rejected());
+    }
+    if !authorization.confirmation.matches(current) {
+        return Err(csrf_rejected());
+    }
+    let token = browser_csrf_token(headers, authorization.form_token)?;
+    let scope = project_csrf_scope(authorization.action, current, authorization.confirmation);
+    state.csrf.consume(token, &scope)
+}
+
+async fn dispatch_browser_project_update(
+    projects: ProjectService,
+    project_id: String,
+    form: ProjectUpdateForm,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        projects.update(
+            &project_id,
+            UpdateProjectRequest::new(Some(form.title), Some(form.slug)),
+            &form.if_match,
+            &form.idempotency_key,
+        )
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => project_registration_redirect(&outcome),
+        Ok(Err(error)) => ui_error(&error),
+        Err(error) => ui_error(&AppError::internal(format!(
+            "Project update worker failed: {error}"
+        ))),
+    }
+}
+
+async fn dispatch_browser_project_tombstone(
+    projects: ProjectService,
+    project_id: String,
+    form: ProjectTombstoneForm,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+        projects.tombstone(
+            &project_id,
+            &TombstoneProjectRequest::new(form.confirmation),
+            &form.if_match,
+            &form.idempotency_key,
+        )
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => project_registration_redirect(&outcome),
+        Ok(Err(error)) => ui_error(&error),
+        Err(error) => ui_error(&AppError::internal(format!(
+            "Project tombstone worker failed: {error}"
         ))),
     }
 }
@@ -265,13 +591,63 @@ async fn dispatch_browser_project_registration(
     }
 }
 
-fn project_registration_redirect(outcome: &RegistrationOutcome) -> Response {
+fn project_registration_redirect(outcome: &ProjectMutationOutcome) -> Response {
     let Ok(location) = HeaderValue::from_str(outcome.project().detail_url()) else {
         return ui_error(&AppError::internal("Project detail URL is invalid"));
     };
     let mut response = StatusCode::SEE_OTHER.into_response();
     response.headers_mut().insert(LOCATION, location);
     no_store(response)
+}
+
+fn browser_project_id(project_key: &str) -> Result<String, Box<Response>> {
+    project_key
+        .rsplit_once('~')
+        .map(|(_, id)| id.to_ascii_lowercase())
+        .ok_or_else(|| {
+            Box::new(ui_error_status(
+                StatusCode::NOT_FOUND,
+                "Project not found",
+                "The Project route is malformed or unknown.",
+            ))
+        })
+}
+
+fn browser_project_redirect(location: &str) -> Response {
+    let Ok(location) = HeaderValue::from_str(location) else {
+        return ui_error(&AppError::internal("Project detail URL is invalid"));
+    };
+    let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
+    response.headers_mut().insert(LOCATION, location);
+    no_store(response)
+}
+
+fn browser_idempotency_key(operation: &str) -> Result<String, AppError> {
+    Ok(format!(
+        "browser-project-{operation}-{}",
+        random_opaque_id()?
+    ))
+}
+
+fn project_csrf_scope(
+    action: ProjectMutationAction,
+    project: &Project,
+    confirmation: ProjectConfirmation<'_>,
+) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        action.scope_name(),
+        project.id(),
+        project.etag(),
+        confirmation.scope_value()
+    )
+}
+
+fn csrf_rejected() -> AppError {
+    AppError::forbidden(
+        "csrf_rejected",
+        "browser mutation CSRF capability does not match the Project action or record version",
+    )
 }
 
 fn browser_csrf_token<'a>(
@@ -455,7 +831,134 @@ async fn register_project(
     }
 }
 
-fn project_registration_response(outcome: &RegistrationOutcome) -> Response {
+async fn update_project(
+    State(state): State<ApplicationState>,
+    AxumPath(project_id): AxumPath<String>,
+    headers: HeaderMap,
+    request: Result<Json<UpdateProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return api_failure(rejection.status(), &AppError::usage(rejection.body_text()));
+        }
+    };
+    if let Err(error) = ProjectService::validate_update_request(&request) {
+        return api_error(&error);
+    }
+    let Some(if_match) = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::precondition_required());
+    };
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::invalid(
+            "invalid_idempotency_key",
+            "Idempotency-Key is required",
+        ));
+    };
+    if let Err(error) = authorize_existing_project_api_browser_mutation(
+        &state,
+        &headers,
+        &project_id,
+        &if_match,
+        ProjectMutationAction::Update,
+        ProjectConfirmation::Ordinary,
+    )
+    .await
+    {
+        return api_error(&error);
+    }
+    let projects = state.projects.clone();
+    match tokio::task::spawn_blocking(move || {
+        projects.update(&project_id, request, &if_match, &idempotency_key)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => project_update_response(&outcome),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Project update worker failed: {error}"
+        ))),
+    }
+}
+
+async fn tombstone_project(
+    State(state): State<ApplicationState>,
+    AxumPath(project_id): AxumPath<String>,
+    headers: HeaderMap,
+    request: Result<Json<TombstoneProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return api_failure(rejection.status(), &AppError::usage(rejection.body_text()));
+        }
+    };
+    let Some(if_match) = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::precondition_required());
+    };
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::invalid(
+            "invalid_idempotency_key",
+            "Idempotency-Key is required",
+        ));
+    };
+    if let Err(error) = authorize_project_tombstone_api_browser_mutation(
+        &state,
+        &headers,
+        &project_id,
+        &if_match,
+        request.confirmation(),
+    )
+    .await
+    {
+        return api_error(&error);
+    }
+    let projects = state.projects.clone();
+    match tokio::task::spawn_blocking(move || {
+        projects.tombstone(&project_id, &request, &if_match, &idempotency_key)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => project_update_response(&outcome),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Project tombstone worker failed: {error}"
+        ))),
+    }
+}
+
+fn project_update_response(outcome: &ProjectMutationOutcome) -> Response {
+    let project = outcome.project();
+    let mut response = (StatusCode::OK, Json(Success::new(project))).into_response();
+    let Ok(etag) = HeaderValue::from_str(&project.etag()) else {
+        return api_error(&AppError::internal("Project response header is invalid"));
+    };
+    response.headers_mut().insert(ETAG, etag);
+    if outcome.replayed() {
+        response
+            .headers_mut()
+            .insert("idempotency-replayed", HeaderValue::from_static("true"));
+    }
+    no_store(response)
+}
+
+fn project_registration_response(outcome: &ProjectMutationOutcome) -> Response {
     let project = outcome.project();
     let mut response = (StatusCode::CREATED, Json(Success::new(project))).into_response();
     for (name, value) in [
@@ -541,20 +1044,84 @@ async fn not_found() -> Response {
     )
 }
 
-fn authorize_api_browser_mutation(
+async fn authorize_project_tombstone_api_browser_mutation(
     state: &ApplicationState,
     headers: &HeaderMap,
-    action: &str,
+    project_id: &str,
+    if_match: &str,
+    confirmation: &str,
 ) -> Result<(), AppError> {
-    let browser_request = [
+    if is_browser_mutation(headers) {
+        let projects = state.projects.clone();
+        let constrained_id = project_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            projects.validate_tombstone_constraints(&constrained_id)
+        })
+        .await
+        .map_err(|error| {
+            AppError::internal(format!(
+                "Project tombstone preflight worker failed: {error}"
+            ))
+        })??;
+    }
+    authorize_existing_project_api_browser_mutation(
+        state,
+        headers,
+        project_id,
+        if_match,
+        ProjectMutationAction::Tombstone,
+        ProjectConfirmation::Exact(confirmation),
+    )
+    .await
+}
+
+async fn authorize_existing_project_api_browser_mutation(
+    state: &ApplicationState,
+    headers: &HeaderMap,
+    project_id: &str,
+    if_match: &str,
+    action: ProjectMutationAction,
+    confirmation: ProjectConfirmation<'_>,
+) -> Result<(), AppError> {
+    if !is_browser_mutation(headers) {
+        return Ok(());
+    }
+    verify_browser_mutation(headers, &state.configuration.server.canonical_origin)?;
+    let projects = state.projects.clone();
+    let project_id = project_id.to_owned();
+    let project = tokio::task::spawn_blocking(move || projects.show(&project_id))
+        .await
+        .map_err(|error| {
+            AppError::internal(format!("Project browser preflight worker failed: {error}"))
+        })??;
+    if project.etag() != if_match {
+        return Err(AppError::changed_record());
+    }
+    let token = headers
+        .get("x-observatory-csrf")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(csrf_rejected)?;
+    let scope = project_csrf_scope(action, &project, confirmation);
+    state.csrf.consume(token, &scope)
+}
+
+fn is_browser_mutation(headers: &HeaderMap) -> bool {
+    [
         ORIGIN.as_str(),
         REFERER.as_str(),
         "sec-fetch-site",
         "sec-fetch-mode",
     ]
     .iter()
-    .any(|header| headers.contains_key(*header));
-    if !browser_request {
+    .any(|header| headers.contains_key(*header))
+}
+
+fn authorize_api_browser_mutation(
+    state: &ApplicationState,
+    headers: &HeaderMap,
+    action: &str,
+) -> Result<(), AppError> {
+    if !is_browser_mutation(headers) {
         return Ok(());
     }
     verify_browser_mutation(headers, &state.configuration.server.canonical_origin)?;

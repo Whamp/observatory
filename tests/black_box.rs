@@ -121,7 +121,68 @@ fn hidden_form_value(html: &str, name: &str) -> String {
         .and_then(|(_, remainder)| remainder.split_once('\"'))
         .map(|(value, _)| value)
         .expect("hidden form value");
-    value.to_owned()
+    value
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn seed_v2_catalogue(storage: &Path) {
+    for directory in [
+        storage.to_path_buf(),
+        storage.join("staging"),
+        storage.join("revisions"),
+        storage.join("quarantine"),
+        storage.join("backups"),
+        storage.join("candidates"),
+    ] {
+        fs::create_dir_all(&directory).expect("v2 private layout");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("v2 private mode");
+    }
+    let connection =
+        rusqlite::Connection::open(storage.join("catalogue.sqlite")).expect("v2 catalogue");
+    connection
+        .execute_batch(
+            "PRAGMA application_id=1329746774;
+             PRAGMA user_version=2;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             CREATE TABLE projects (
+               id TEXT PRIMARY KEY, record_version INTEGER NOT NULL CHECK(record_version > 0),
+               canonical_directory TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('live','gone')),
+               title TEXT NOT NULL, slug TEXT NOT NULL, title_fold TEXT NOT NULL,
+               search_text TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+               terminal_state TEXT, tombstoned_at TEXT, cause TEXT
+             ) STRICT;
+             CREATE UNIQUE INDEX projects_canonical_directory ON projects(canonical_directory);
+             CREATE TABLE artifacts (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+             CREATE TABLE services (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+             CREATE TABLE revisions (id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id), state TEXT NOT NULL CHECK(state IN ('available','unavailable'))) STRICT;
+             CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL) STRICT;
+             CREATE TABLE backup_leases (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
+             CREATE TABLE cleanup_runs (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
+             CREATE TABLE audit_events (
+               sequence INTEGER PRIMARY KEY, kind TEXT NOT NULL, details_json TEXT NOT NULL,
+               at TEXT NOT NULL, actor TEXT NOT NULL, cause TEXT NOT NULL,
+               resource_type TEXT NOT NULL, resource_id TEXT NOT NULL
+             ) STRICT;
+             CREATE TABLE idempotency_requests (
+               key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+               state TEXT NOT NULL CHECK(state IN ('in_progress','completed')),
+               status_code INTEGER, response_json TEXT, etag TEXT, completed_at TEXT
+             ) STRICT;
+             CREATE TABLE system_state (key TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;",
+        )
+        .expect("v2 schema");
+    connection
+        .execute(
+            "INSERT INTO system_state(key,value) VALUES ('cursor_secret',?1)",
+            [vec![7_u8; 32]],
+        )
+        .expect("v2 cursor secret");
 }
 
 fn one_response_server(status: &str, body: &str) -> (String, thread::JoinHandle<()>) {
@@ -181,7 +242,7 @@ fn migrates_empty_v1_catalogue_before_readiness() {
     );
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status["result"]["policy"]["userVersion"], 2);
+    assert_eq!(status["result"]["policy"]["userVersion"], 3);
     let backup_path = harness
         .storage
         .join("backups/schema-v1-pre-migration.sqlite");
@@ -209,6 +270,58 @@ fn migrates_empty_v1_catalogue_before_readiness() {
             .expect("backup quick check"),
         "ok"
     );
+}
+
+#[test]
+fn migrates_v2_catalogue_for_project_tombstone_gates() {
+    let harness = Harness::start_with(seed_v2_catalogue);
+    let status = cli(
+        &format!("http://{}", harness.address),
+        &["system", "status"],
+    );
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).expect("v3 status JSON");
+    assert_eq!(status["result"]["policy"]["userVersion"], 3);
+
+    let backup_path = harness
+        .storage
+        .join("backups/schema-v2-pre-migration.sqlite");
+    assert!(backup_path.is_file());
+    let backup = rusqlite::Connection::open_with_flags(
+        backup_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("v2 migration backup");
+    assert_eq!(
+        backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("backup schema version"),
+        2
+    );
+    assert_eq!(
+        backup
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .expect("backup quick check"),
+        "ok"
+    );
+
+    let catalogue =
+        rusqlite::Connection::open(harness.storage.join("catalogue.sqlite")).expect("v3 catalogue");
+    let service_state: i64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('services') WHERE name='state'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Service state column");
+    let operation_project: i64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('operation_intents') WHERE name='project_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("operation Project column");
+    assert_eq!((service_state, operation_project), (1, 1));
 }
 
 #[test]
@@ -426,6 +539,551 @@ fn project_slugs_follow_normalization_fallback_and_route_grammar() {
     assert_eq!(
         invalid.json::<Value>().expect("invalid slug JSON")["error"]["code"],
         "invalid_project_slug"
+    );
+}
+
+#[test]
+fn project_metadata_update_preserves_identity_and_replays_once() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("updated-project");
+    fs::create_dir(&directory).expect("updated Project directory");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-register-update")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("updated Project path"),
+            "title": "Original title",
+            "slug": "original-title"
+        }))
+        .send()
+        .expect("register Project for update");
+    assert_eq!(registered.status(), 201);
+    let registered: Value = registered.json().expect("registered Project");
+    let project = &registered["result"];
+    let id = project["id"].as_str().expect("Project ID").to_owned();
+    let canonical_directory = project["canonicalDirectory"].clone();
+    let created_at = project["createdAt"].clone();
+    let api_url = project["apiUrl"].clone();
+    let update = serde_json::json!({
+        "title": "Renamed Project",
+        "slug": "renamed-project"
+    });
+
+    let missing_precondition = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update")
+        .json(&update)
+        .send()
+        .expect("update without precondition");
+    assert_eq!(missing_precondition.status(), 428);
+    assert_eq!(
+        missing_precondition
+            .json::<Value>()
+            .expect("missing precondition error")["error"]["code"],
+        "precondition_required"
+    );
+
+    let stale = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update")
+        .header("If-Match", "\"rv-0\"")
+        .json(&update)
+        .send()
+        .expect("stale Project update");
+    assert_eq!(stale.status(), 412);
+    assert_eq!(
+        stale.json::<Value>().expect("stale update error")["error"]["code"],
+        "changed_record"
+    );
+
+    let updated = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update")
+        .header("If-Match", "\"rv-1\"")
+        .json(&update)
+        .send()
+        .expect("Project update");
+    assert_eq!(updated.status(), 200);
+    assert_eq!(updated.headers()["etag"], "\"rv-2\"");
+    assert_eq!(updated.headers()["cache-control"], "no-store");
+    let updated: Value = updated.json().expect("updated Project");
+    let updated_project = &updated["result"];
+    assert_eq!(updated_project["id"], id);
+    assert_eq!(updated_project["recordVersion"], 2);
+    assert_eq!(updated_project["title"], "Renamed Project");
+    assert_eq!(updated_project["slug"], "renamed-project");
+    assert_eq!(updated_project["canonicalDirectory"], canonical_directory);
+    assert_eq!(updated_project["createdAt"], created_at);
+    assert_eq!(updated_project["apiUrl"], api_url);
+    assert!(
+        updated_project["detailUrl"]
+            .as_str()
+            .expect("updated detail URL")
+            .contains("/renamed-project~")
+    );
+
+    let replayed = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update")
+        .header("If-Match", "\"rv-1\"")
+        .json(&update)
+        .send()
+        .expect("replayed Project update");
+    assert_eq!(replayed.status(), 200);
+    assert_eq!(replayed.headers()["idempotency-replayed"], "true");
+    assert_eq!(replayed.headers()["etag"], "\"rv-2\"");
+    assert_eq!(replayed.json::<Value>().expect("replayed update"), updated);
+
+    let changed_fingerprint = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update")
+        .header("If-Match", "\"rv-1\"")
+        .json(&serde_json::json!({ "title": "Different title" }))
+        .send()
+        .expect("changed update fingerprint");
+    assert_eq!(changed_fingerprint.status(), 409);
+    assert_eq!(
+        changed_fingerprint
+            .json::<Value>()
+            .expect("fingerprint error")["error"]["code"],
+        "idempotency_conflict"
+    );
+
+    let catalogue =
+        rusqlite::Connection::open(harness.storage.join("catalogue.sqlite")).expect("catalogue");
+    let update_events: i64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE kind='project_updated' AND resource_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .expect("Project update events");
+    assert_eq!(update_events, 1);
+}
+
+#[test]
+fn project_cli_updates_and_tombstones_with_current_preconditions() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("cli-lifecycle-project");
+    fs::create_dir(&directory).expect("CLI lifecycle Project directory");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-cli-register")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("CLI lifecycle path"),
+            "title": "CLI Lifecycle",
+            "slug": "cli-lifecycle"
+        }))
+        .send()
+        .expect("register CLI lifecycle Project")
+        .json::<Value>()
+        .expect("registered CLI lifecycle Project");
+    let key = registered["result"]["key"]
+        .as_str()
+        .expect("CLI lifecycle key")
+        .to_owned();
+
+    let no_idempotency = cli(
+        &format!("http://{}", harness.address),
+        &["project", "update", &key, "--title", "No key"],
+    );
+    assert_eq!(no_idempotency.status.code(), Some(2));
+    assert!(no_idempotency.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&no_idempotency.stderr).expect("missing key CLI error")["error"]
+            ["code"],
+        "invalid_idempotency_key"
+    );
+
+    let updated = cli(
+        &format!("http://{}", harness.address),
+        &[
+            "--idempotency-key",
+            "issue-23-cli-update",
+            "project",
+            "update",
+            &key,
+            "--title",
+            "CLI Renamed",
+            "--slug",
+            "cli-renamed",
+        ],
+    );
+    assert!(updated.status.success(), "{:?}", updated.stderr);
+    let updated: Value = serde_json::from_slice(&updated.stdout).expect("CLI update result");
+    assert_eq!(updated["result"]["title"], "CLI Renamed");
+    assert_eq!(updated["result"]["recordVersion"], 2);
+    let updated_key = updated["result"]["key"]
+        .as_str()
+        .expect("updated Project key")
+        .to_owned();
+
+    let no_confirmation = cli(
+        &format!("http://{}", harness.address),
+        &[
+            "--idempotency-key",
+            "issue-23-cli-tombstone",
+            "project",
+            "tombstone",
+            &updated_key,
+        ],
+    );
+    assert_eq!(no_confirmation.status.code(), Some(2));
+    assert!(no_confirmation.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&no_confirmation.stderr).expect("CLI confirmation error")["error"]
+            ["code"],
+        "confirmation_required"
+    );
+
+    let tombstoned = cli(
+        &format!("http://{}", harness.address),
+        &[
+            "--idempotency-key",
+            "issue-23-cli-tombstone",
+            "project",
+            "tombstone",
+            &updated_key,
+            "--yes",
+        ],
+    );
+    assert!(tombstoned.status.success(), "{:?}", tombstoned.stderr);
+    let tombstoned: Value =
+        serde_json::from_slice(&tombstoned.stdout).expect("CLI tombstone result");
+    assert_eq!(tombstoned["result"]["state"], "gone");
+    assert_eq!(tombstoned["result"]["recordVersion"], 3);
+
+    let gone = cli(
+        &format!("http://{}", harness.address),
+        &["project", "show", &updated_key],
+    );
+    assert_eq!(gone.status.code(), Some(3));
+    assert!(gone.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&gone.stderr).expect("CLI gone result")["error"]["code"],
+        "project_gone"
+    );
+
+    for (command, idempotency_key) in [
+        ("update", "issue-23-cli-update-gone"),
+        ("tombstone", "issue-23-cli-tombstone-gone"),
+    ] {
+        let mut arguments = vec![
+            "--idempotency-key",
+            idempotency_key,
+            "project",
+            command,
+            &updated_key,
+        ];
+        if command == "update" {
+            arguments.extend(["--title", "Still gone"]);
+        } else {
+            arguments.push("--yes");
+        }
+        let result = cli(&format!("http://{}", harness.address), &arguments);
+        assert_eq!(result.status.code(), Some(3), "{:?}", result.stderr);
+        assert!(result.stdout.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stderr).expect("gone mutation result")["error"]
+                ["code"],
+            "project_gone"
+        );
+    }
+
+    let unknown = cli(
+        &format!("http://{}", harness.address),
+        &[
+            "--idempotency-key",
+            "issue-23-cli-update-unknown",
+            "project",
+            "update",
+            "00000000000000000000000000",
+            "--title",
+            "Unknown",
+        ],
+    );
+    assert_eq!(unknown.status.code(), Some(3), "{:?}", unknown.stderr);
+    assert!(unknown.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unknown.stderr).expect("unknown mutation result")["error"]
+            ["code"],
+        "not_found"
+    );
+}
+
+#[test]
+fn project_tombstone_enforces_gates_and_preserves_artifact_association() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("tombstone-project");
+    fs::create_dir(&directory).expect("tombstone Project directory");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-register-tombstone")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("tombstone Project path"),
+            "title": "Tombstone Project",
+            "slug": "tombstone-project"
+        }))
+        .send()
+        .expect("register tombstone Project");
+    assert_eq!(registered.status(), 201);
+    let registered: Value = registered.json().expect("registered tombstone Project");
+    let project = &registered["result"];
+    let id = project["id"].as_str().expect("Project ID").to_owned();
+    let key = project["key"].as_str().expect("Project key").to_owned();
+    let detail_url = project["detailUrl"].clone();
+    let api_url = project["apiUrl"].clone();
+    let catalogue_path = harness.storage.join("catalogue.sqlite");
+    let catalogue = rusqlite::Connection::open(&catalogue_path).expect("catalogue");
+    catalogue
+        .execute(
+            "INSERT INTO artifacts(id,project_id,record_version) VALUES (?1,?2,1)",
+            rusqlite::params!["11111111111111111111111111", id],
+        )
+        .expect("associated Artifact fixture");
+    catalogue
+        .execute(
+            "INSERT INTO services(id,project_id,record_version,state) VALUES (?1,?2,1,'live')",
+            rusqlite::params!["22222222222222222222222222", id],
+        )
+        .expect("live Service fixture");
+    catalogue
+        .execute(
+            "INSERT INTO operation_intents(id,kind,state,details_json,project_id)
+             VALUES (?1,'fixture','intent_recorded','{}',?2)",
+            rusqlite::params!["33333333333333333333333333", id],
+        )
+        .expect("Project operation fixture");
+    drop(catalogue);
+    let tombstone_url = harness.url(&format!("/api/v1/projects/{id}"));
+    let confirmation = serde_json::json!({ "confirmation": key });
+
+    let missing_precondition = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .json(&confirmation)
+        .send()
+        .expect("tombstone without precondition");
+    assert_eq!(missing_precondition.status(), 428);
+
+    let wrong_confirmation = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .header("If-Match", "\"rv-1\"")
+        .json(&serde_json::json!({ "confirmation": "wrong-project" }))
+        .send()
+        .expect("tombstone with wrong confirmation");
+    assert_eq!(wrong_confirmation.status(), 422);
+    assert_eq!(
+        wrong_confirmation
+            .json::<Value>()
+            .expect("confirmation error")["error"]["code"],
+        "confirmation_required"
+    );
+
+    let live_service = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .header("If-Match", "\"rv-1\"")
+        .json(&confirmation)
+        .send()
+        .expect("tombstone with live Service");
+    assert_eq!(live_service.status(), 409);
+    assert_eq!(
+        live_service.json::<Value>().expect("live Service error")["error"]["code"],
+        "project_has_live_services"
+    );
+
+    let catalogue = rusqlite::Connection::open(&catalogue_path).expect("catalogue");
+    catalogue
+        .execute(
+            "UPDATE services SET state='gone' WHERE project_id=?1",
+            [&id],
+        )
+        .expect("retire Service fixture");
+    drop(catalogue);
+    let active_operation = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .header("If-Match", "\"rv-1\"")
+        .json(&confirmation)
+        .send()
+        .expect("tombstone with active operation");
+    assert_eq!(active_operation.status(), 409);
+    assert_eq!(
+        active_operation
+            .json::<Value>()
+            .expect("active operation error")["error"]["code"],
+        "project_operation_in_progress"
+    );
+
+    let catalogue = rusqlite::Connection::open(&catalogue_path).expect("catalogue");
+    catalogue
+        .execute(
+            "UPDATE operation_intents SET state='completed' WHERE project_id=?1",
+            [&id],
+        )
+        .expect("complete Project operation fixture");
+    drop(catalogue);
+    let tombstoned = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .header("If-Match", "\"rv-1\"")
+        .json(&confirmation)
+        .send()
+        .expect("tombstone Project");
+    assert_eq!(tombstoned.status(), 200);
+    assert_eq!(tombstoned.headers()["etag"], "\"rv-2\"");
+    let tombstoned: Value = tombstoned.json().expect("tombstoned Project result");
+    assert_eq!(tombstoned["result"]["id"], id);
+    assert_eq!(tombstoned["result"]["key"], key);
+    assert_eq!(tombstoned["result"]["state"], "gone");
+    assert_eq!(tombstoned["result"]["recordVersion"], 2);
+    assert_eq!(tombstoned["result"]["terminalState"], "tombstoned");
+    assert_eq!(tombstoned["result"]["cause"], "operator");
+    assert_eq!(tombstoned["result"]["detailUrl"], detail_url);
+    assert_eq!(tombstoned["result"]["apiUrl"], api_url);
+    assert!(tombstoned["result"]["tombstonedAt"].is_string());
+
+    let replayed = client
+        .delete(&tombstone_url)
+        .header("Idempotency-Key", "issue-23-tombstone")
+        .header("If-Match", "\"rv-1\"")
+        .json(&confirmation)
+        .send()
+        .expect("replay Project tombstone");
+    assert_eq!(replayed.status(), 200);
+    assert_eq!(replayed.headers()["idempotency-replayed"], "true");
+    assert_eq!(
+        replayed.json::<Value>().expect("replayed tombstone"),
+        tombstoned
+    );
+
+    let gone = client
+        .get(&tombstone_url)
+        .send()
+        .expect("show tombstoned Project");
+    assert_eq!(gone.status(), 410);
+    assert_eq!(
+        gone.json::<Value>().expect("gone Project error")["error"]["code"],
+        "project_gone"
+    );
+    let cannot_reuse = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-reuse-tombstone")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("tombstone Project path")
+        }))
+        .send()
+        .expect("attempt Project identity reuse");
+    assert_eq!(cannot_reuse.status(), 410);
+
+    let catalogue = rusqlite::Connection::open(catalogue_path).expect("catalogue");
+    let artifact_project: String = catalogue
+        .query_row(
+            "SELECT project_id FROM artifacts WHERE id='11111111111111111111111111'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Artifact Project association");
+    assert_eq!(artifact_project, id);
+    let tombstone_events: i64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE kind='project_tombstoned' AND resource_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .expect("Project tombstone audit count");
+    assert_eq!(tombstone_events, 1);
+}
+
+#[test]
+fn project_tombstone_audit_failure_rolls_back_and_retries_after_restart() {
+    let mut harness = Harness::start();
+    let directory = harness._root.path().join("tombstone-rollback-project");
+    fs::create_dir(&directory).expect("tombstone rollback Project directory");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-tombstone-rollback-register")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("tombstone rollback path"),
+            "title": "Tombstone Rollback",
+            "slug": "tombstone-rollback"
+        }))
+        .send()
+        .expect("register tombstone rollback Project")
+        .json::<Value>()
+        .expect("tombstone rollback Project");
+    let id = registered["result"]["id"]
+        .as_str()
+        .expect("tombstone rollback ID")
+        .to_owned();
+    let key = registered["result"]["key"]
+        .as_str()
+        .expect("tombstone rollback key")
+        .to_owned();
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("tombstone fault catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER inject_project_tombstone_failure
+             BEFORE INSERT ON audit_events
+             WHEN NEW.cause = 'project_tombstoned'
+             BEGIN SELECT RAISE(ABORT, 'injected tombstone failure'); END;",
+        )
+        .expect("install tombstone failure trigger");
+    let body = serde_json::json!({ "confirmation": key });
+    let failed = client
+        .delete(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-tombstone-rollback")
+        .header("If-Match", "\"rv-1\"")
+        .json(&body)
+        .send()
+        .expect("injected failed tombstone");
+    assert_eq!(failed.status(), 500);
+    let still_live = client
+        .get(harness.url(&format!("/api/v1/projects/{id}")))
+        .send()
+        .expect("Project after failed tombstone");
+    assert_eq!(still_live.status(), 200);
+    assert_eq!(still_live.headers()["etag"], "\"rv-1\"");
+    catalogue
+        .execute_batch("DROP TRIGGER inject_project_tombstone_failure;")
+        .expect("remove tombstone failure trigger");
+    drop(catalogue);
+
+    let pid = harness.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("SIGTERM")
+            .success()
+    );
+    assert!(harness.child.wait().expect("stopped daemon").success());
+    harness.child = daemon(&harness.runtime, &harness.storage, harness.address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("restart daemon after tombstone failure");
+    harness.wait_ready();
+
+    let retried = client
+        .delete(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-tombstone-rollback")
+        .header("If-Match", "\"rv-1\"")
+        .json(&body)
+        .send()
+        .expect("retry tombstone after restart");
+    assert_eq!(retried.status(), 200);
+    assert!(retried.headers().get("idempotency-replayed").is_none());
+    assert_eq!(
+        retried.json::<Value>().expect("retried tombstone")["result"]["state"],
+        "gone"
     );
 }
 
@@ -834,6 +1492,113 @@ fn project_registration_timeout_continues_and_identical_retry_replays() {
 }
 
 #[test]
+fn project_update_timeout_continues_and_identical_retry_replays() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("update-timeout-project");
+    fs::create_dir(&directory).expect("update timeout Project directory");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-timeout-register")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("update timeout path"),
+            "title": "Before timeout",
+            "slug": "before-timeout"
+        }))
+        .send()
+        .expect("register update timeout Project")
+        .json::<Value>()
+        .expect("update timeout Project");
+    let id = registered["result"]["id"]
+        .as_str()
+        .expect("update timeout ID")
+        .to_owned();
+    let key = registered["result"]["key"]
+        .as_str()
+        .expect("update timeout key")
+        .to_owned();
+    let body = serde_json::json!({
+        "title": "After timeout",
+        "slug": "after-timeout"
+    });
+
+    let mut lock_connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("lock update catalogue");
+    let lock = lock_connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("hold update write lock");
+    let server = format!("http://{}", harness.address);
+    let mut command = obs();
+    command
+        .args([
+            "--json",
+            "--server",
+            &server,
+            "--timeout",
+            "20ms",
+            "--idempotency-key",
+            "issue-23-update-timeout",
+            "project",
+            "update",
+            &key,
+            "--title",
+            "After timeout",
+            "--slug",
+            "after-timeout",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("timed Project update CLI");
+    thread::sleep(Duration::from_millis(100));
+    let timed_out = child.wait_with_output().expect("timed update output");
+    assert_eq!(timed_out.status.code(), Some(5));
+    assert!(timed_out.stdout.is_empty());
+    let timeout: Value = serde_json::from_slice(&timed_out.stderr).expect("update timeout JSON");
+    assert_eq!(timeout["error"]["code"], "client_timeout");
+    assert_eq!(
+        timeout["error"]["details"]["idempotencyKey"],
+        "issue-23-update-timeout"
+    );
+
+    let in_progress = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-update-timeout")
+        .header("If-Match", "\"rv-1\"")
+        .json(&body)
+        .send()
+        .expect("in-progress update retry");
+    assert_eq!(in_progress.status(), 409);
+    assert_eq!(in_progress.headers()["retry-after"], "1");
+    assert_eq!(
+        in_progress.json::<Value>().expect("in-progress update")["error"]["code"],
+        "idempotency_in_progress"
+    );
+
+    lock.rollback().expect("release update write lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let replay = client
+            .patch(harness.url(&format!("/api/v1/projects/{id}")))
+            .header("Idempotency-Key", "issue-23-update-timeout")
+            .header("If-Match", "\"rv-1\"")
+            .json(&body)
+            .send()
+            .expect("retry Project update");
+        if replay.status() == 200 {
+            assert_eq!(replay.headers()["idempotency-replayed"], "true");
+            assert_eq!(
+                replay.json::<Value>().expect("replayed Project update")["result"]["recordVersion"],
+                2
+            );
+            break;
+        }
+        assert_eq!(replay.status(), 409);
+        assert!(Instant::now() < deadline, "Project update did not complete");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn project_registration_transaction_failure_rolls_back_and_retries_after_restart() {
     let mut harness = Harness::start();
     let directory = harness._root.path().join("rollback-project");
@@ -1090,6 +1855,175 @@ fn browser_project_registration_is_same_origin_one_use_and_progressively_enhance
 }
 
 #[test]
+fn browser_project_update_and_tombstone_bind_version_and_confirmation() {
+    let harness = Harness::start();
+    let directory = harness._root.path().join("browser-lifecycle-project");
+    fs::create_dir(&directory).expect("browser lifecycle Project directory");
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("browser lifecycle client");
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-23-browser-register")
+        .json(&serde_json::json!({
+            "path": directory.to_str().expect("browser lifecycle path"),
+            "title": "Browser Lifecycle",
+            "slug": "browser-lifecycle"
+        }))
+        .send()
+        .expect("register browser lifecycle Project")
+        .json::<Value>()
+        .expect("browser lifecycle Project");
+    let id = registered["result"]["id"]
+        .as_str()
+        .expect("browser lifecycle ID")
+        .to_owned();
+    let detail_url = registered["result"]["detailUrl"]
+        .as_str()
+        .expect("browser lifecycle detail URL");
+    let detail_path = url::Url::parse(detail_url)
+        .expect("browser lifecycle detail URL")
+        .path()
+        .to_owned();
+
+    let stale_page = client
+        .get(harness.url(&detail_path))
+        .send()
+        .expect("initial lifecycle detail")
+        .text()
+        .expect("initial lifecycle HTML");
+    assert!(stale_page.contains("data-project-update"));
+    assert!(stale_page.contains("Tombstone Project"));
+    let stale_csrf = hidden_form_value(&stale_page, "csrfToken");
+    let stale_key = hidden_form_value(&stale_page, "idempotencyKey");
+    let stale_if_match = hidden_form_value(&stale_page, "ifMatch");
+    assert_eq!(stale_if_match, "\"rv-1\"");
+
+    let concurrent = client
+        .patch(harness.url(&format!("/api/v1/projects/{id}")))
+        .header("Idempotency-Key", "issue-23-browser-concurrent")
+        .header("If-Match", "\"rv-1\"")
+        .json(&serde_json::json!({ "title": "Concurrent title" }))
+        .send()
+        .expect("concurrent Project update");
+    assert_eq!(concurrent.status(), 200);
+
+    let stale_submission = client
+        .post(harness.url(&format!("{detail_path}update/")))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&[
+            ("title", "Stale title"),
+            ("slug", "browser-lifecycle"),
+            ("csrfToken", &stale_csrf),
+            ("idempotencyKey", &stale_key),
+            ("ifMatch", &stale_if_match),
+        ])
+        .send()
+        .expect("stale browser update");
+    assert_eq!(stale_submission.status(), 403);
+    assert!(
+        stale_submission
+            .text()
+            .expect("stale browser error")
+            .contains("csrf_rejected")
+    );
+
+    let fresh_page = client
+        .get(harness.url(&detail_path))
+        .send()
+        .expect("fresh lifecycle detail")
+        .text()
+        .expect("fresh lifecycle HTML");
+    let update_csrf = hidden_form_value(&fresh_page, "csrfToken");
+    let update_key = hidden_form_value(&fresh_page, "idempotencyKey");
+    let update_if_match = hidden_form_value(&fresh_page, "ifMatch");
+    assert_eq!(update_if_match, "\"rv-2\"");
+    let updated = client
+        .post(harness.url(&format!("{detail_path}update/")))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&[
+            ("title", "Browser Renamed"),
+            ("slug", "browser-renamed"),
+            ("csrfToken", &update_csrf),
+            ("idempotencyKey", &update_key),
+            ("ifMatch", &update_if_match),
+        ])
+        .send()
+        .expect("browser Project update");
+    assert_eq!(updated.status(), 303);
+    let updated_location = updated.headers()["location"]
+        .to_str()
+        .expect("updated detail Location")
+        .to_owned();
+    assert!(updated_location.contains("/browser-renamed~"));
+    let updated_path = url::Url::parse(&updated_location)
+        .expect("updated detail URL")
+        .path()
+        .to_owned();
+
+    let confirmation_page = client
+        .get(harness.url(&format!("{updated_path}tombstone/")))
+        .send()
+        .expect("Project tombstone review");
+    assert_eq!(confirmation_page.status(), 200);
+    let confirmation_page = confirmation_page.text().expect("tombstone review HTML");
+    assert!(confirmation_page.contains("Type the exact Project key"));
+    assert!(confirmation_page.contains("0 live Services"));
+    assert!(confirmation_page.contains("0 associated Artifacts"));
+    let tombstone_csrf = hidden_form_value(&confirmation_page, "csrfToken");
+    let tombstone_key = hidden_form_value(&confirmation_page, "idempotencyKey");
+    let tombstone_if_match = hidden_form_value(&confirmation_page, "ifMatch");
+    let current_key = format!("browser-renamed~{id}");
+
+    let wrong_confirmation = client
+        .post(harness.url(&format!("{updated_path}tombstone/")))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&[
+            ("confirmation", "wrong-key"),
+            ("csrfToken", &tombstone_csrf),
+            ("idempotencyKey", &tombstone_key),
+            ("ifMatch", &tombstone_if_match),
+        ])
+        .send()
+        .expect("wrong tombstone confirmation");
+    assert_eq!(wrong_confirmation.status(), 403);
+    assert!(
+        wrong_confirmation
+            .text()
+            .expect("wrong confirmation HTML")
+            .contains("csrf_rejected")
+    );
+
+    let tombstoned = client
+        .post(harness.url(&format!("{updated_path}tombstone/")))
+        .header("Host", "desktop.greyhound-chinstrap.ts.net")
+        .header("Origin", "https://desktop.greyhound-chinstrap.ts.net")
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&[
+            ("confirmation", current_key.as_str()),
+            ("csrfToken", &tombstone_csrf),
+            ("idempotencyKey", &tombstone_key),
+            ("ifMatch", &tombstone_if_match),
+        ])
+        .send()
+        .expect("browser Project tombstone");
+    assert_eq!(tombstoned.status(), 303);
+    assert_eq!(tombstoned.headers()["location"], updated_location);
+    let gone = client
+        .get(harness.url(&updated_path))
+        .send()
+        .expect("gone browser Project");
+    assert_eq!(gone.status(), 410);
+}
+
+#[test]
 fn unavailable_daemon_does_not_autostart() {
     let address = free_address();
     let output = cli(&format!("http://{address}"), &["system", "status"]);
@@ -1216,7 +2150,7 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
         }
     }
     assert_eq!(status["result"]["policy"]["applicationId"], 0x4f42_5356_u64);
-    assert_eq!(status["result"]["policy"]["userVersion"], 2);
+    assert_eq!(status["result"]["policy"]["userVersion"], 3);
     assert_eq!(status["result"]["policy"]["foreignKeys"], true);
     assert_eq!(status["result"]["policy"]["journalMode"], "wal");
     assert_eq!(status["result"]["policy"]["synchronous"], "FULL");
@@ -1306,6 +2240,9 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
             .starts_with('"')
     );
     let javascript_etag = javascript.headers()["etag"].clone();
+    let javascript_body = javascript.text().expect("ES module body");
+    assert!(javascript_body.contains("const body = new URLSearchParams()"));
+    assert!(!javascript_body.contains("const body = new FormData(form)"));
     let not_modified = reqwest::blocking::Client::new()
         .get(harness.url(&javascript_path))
         .header("if-none-match", javascript_etag)
