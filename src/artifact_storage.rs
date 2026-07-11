@@ -1,15 +1,20 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use rustix::fs::{
-    AtFlags, Mode, OFlags, RenameFlags, fsync, mkdirat, openat, renameat_with, statat,
+    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, fsync, mkdirat, openat, renameat_with,
+    statat,
 };
 use sha2::{Digest, Sha256};
 
+use crate::artifact_source::{ArtifactSource, DirectorySource, validate_relative_member_path};
 use crate::error::AppError;
 use crate::revision_manifest::{
-    CONTENT_DIRECTORY, MANIFEST_FILE, RevisionManifest, SingleFileRevision,
+    CONTENT_DIRECTORY, MANIFEST_FILE, RevisionIdentity, RevisionManifest, RevisionManifestInput,
+    RevisionMemberInput,
 };
 use crate::safe_file::{SafeRegularFile, open_directory};
 
@@ -24,6 +29,7 @@ pub(crate) struct StagedRevision {
     revision_id: String,
     entry_path: String,
     entry_media_type: String,
+    files: u64,
     logical_bytes: u64,
     payload_digest: String,
     manifest_digest: String,
@@ -34,6 +40,7 @@ pub(crate) struct FinalizedRevision {
     revision_id: String,
     entry_path: String,
     entry_media_type: String,
+    files: u64,
     logical_bytes: u64,
     payload_digest: String,
     manifest_digest: String,
@@ -45,6 +52,7 @@ pub(crate) struct RecoveryRequest<'a> {
     pub(crate) revision_id: &'a str,
     pub(crate) entry_path: &'a str,
     pub(crate) entry_media_type: &'a str,
+    pub(crate) files: u64,
     pub(crate) logical_bytes: u64,
     pub(crate) published_at: &'a str,
     pub(crate) payload_digest: Option<&'a str>,
@@ -74,6 +82,10 @@ impl StagedRevision {
         &self.entry_media_type
     }
 
+    pub(crate) const fn files(&self) -> u64 {
+        self.files
+    }
+
     pub(crate) const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
     }
@@ -100,6 +112,10 @@ impl FinalizedRevision {
         &self.entry_media_type
     }
 
+    pub(crate) const fn files(&self) -> u64 {
+        self.files
+    }
+
     pub(crate) const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
     }
@@ -118,6 +134,17 @@ impl ArtifactStorage {
         Ok(Self {
             root: Arc::new(open_directory(root)?),
         })
+    }
+
+    pub(crate) fn stage_source(
+        &self,
+        source: &mut ArtifactSource,
+        request: StageRequest<'_>,
+    ) -> Result<StagedRevision, AppError> {
+        match source {
+            ArtifactSource::File(source) => self.stage_single_file(source, request),
+            ArtifactSource::Directory(source) => self.stage_directory(source, request),
+        }
     }
 
     pub(crate) fn stage_single_file(
@@ -170,56 +197,101 @@ impl ArtifactStorage {
         storage_crash_fault("OBS_TEST_CRASH_PUBLISH_AFTER_PAYLOAD_SYNC", "payload sync");
         source.verify_unchanged()?;
 
-        let manifest_input = SingleFileRevision::new(request.artifact_id, request.revision_id)
-            .with_entry(request.entry_path, request.entry_media_type)
-            .with_content(logical_bytes, request.published_at, &payload_digest);
-        let manifest = RevisionManifest::single_file(&manifest_input);
-        let manifest_bytes = manifest.canonical_bytes()?;
-        let manifest_digest = RevisionManifest::digest(&manifest_bytes);
-        let mut manifest_file = File::from(
-            openat(
-                &operation,
-                MANIFEST_FILE,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o600),
-            )
-            .map_err(|error| storage_error("create Revision manifest", error))?,
-        );
-        manifest_file.write_all(&manifest_bytes).map_err(|error| {
-            AppError::internal(format!("cannot write Revision manifest: {error}"))
+        let manifest = RevisionManifest::new(RevisionManifestInput {
+            artifact_id: request.artifact_id,
+            revision_id: request.revision_id,
+            entry_path: request.entry_path,
+            entry_media_type: request.entry_media_type,
+            published_at: request.published_at,
+            members: vec![RevisionMemberInput {
+                path: request.entry_path.to_owned(),
+                size: logical_bytes,
+                digest: payload_digest,
+            }],
         })?;
-        storage_crash_fault(
-            "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_WRITE",
-            "manifest write",
-        );
-        manifest_file.sync_all().map_err(|error| {
-            AppError::internal(format!("cannot sync Revision manifest: {error}"))
-        })?;
-        storage_crash_fault(
-            "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_SYNC",
-            "manifest sync",
-        );
-        fsync(&content).map_err(|error| storage_error("sync Revision content directory", error))?;
-        storage_crash_fault(
-            "OBS_TEST_CRASH_PUBLISH_AFTER_CONTENT_SYNC",
-            "content directory sync",
-        );
-        fsync(&operation)
-            .map_err(|error| storage_error("sync Publish operation directory", error))?;
-        storage_crash_fault(
-            "OBS_TEST_CRASH_PUBLISH_AFTER_OPERATION_SYNC",
-            "operation directory sync",
-        );
-        fsync(&staging).map_err(|error| storage_error("sync staging directory", error))?;
-        storage_crash_fault(
-            "OBS_TEST_CRASH_PUBLISH_AFTER_STAGING_SYNC",
-            "staging directory sync",
-        );
+        let (payload_digest, manifest_digest) =
+            persist_manifest(&operation, &content, &staging, &manifest)?;
         Ok(StagedRevision {
             operation_id: request.operation_id.to_owned(),
             revision_id: request.revision_id.to_owned(),
             entry_path: request.entry_path.to_owned(),
             entry_media_type: request.entry_media_type.to_owned(),
+            files: 1,
+            logical_bytes,
+            payload_digest,
+            manifest_digest,
+        })
+    }
+
+    fn stage_directory(
+        &self,
+        source: &mut DirectorySource,
+        request: StageRequest<'_>,
+    ) -> Result<StagedRevision, AppError> {
+        validate_storage_identifier(request.operation_id)?;
+        validate_storage_identifier(request.artifact_id)?;
+        validate_storage_identifier(request.revision_id)?;
+        validate_entry_path(request.entry_path)?;
+        let staging = self.open_directory("staging")?;
+        mkdirat(&staging, request.operation_id, Mode::from_raw_mode(0o700))
+            .map_err(|error| storage_error("create Publish staging directory", error))?;
+        let operation = openat(
+            &staging,
+            request.operation_id,
+            directory_flags(),
+            Mode::empty(),
+        )
+        .map_err(|error| storage_error("open Publish staging directory", error))?;
+        mkdirat(&operation, CONTENT_DIRECTORY, Mode::from_raw_mode(0o700))
+            .map_err(|error| storage_error("create Revision content directory", error))?;
+        let content = openat(
+            &operation,
+            CONTENT_DIRECTORY,
+            directory_flags(),
+            Mode::empty(),
+        )
+        .map_err(|error| storage_error("open Revision content directory", error))?;
+        let mut manifest_members = Vec::new();
+        for member in source.members_mut() {
+            let mut destination = create_staged_member(&content, member.path())?;
+            let expected_size = member.size();
+            let (size, digest) = copy_and_hash(member.file_mut(), &mut destination, expected_size)?;
+            storage_crash_fault(
+                "OBS_TEST_CRASH_PUBLISH_AFTER_COPY_DIGEST",
+                "bundle member copy and digest",
+            );
+            destination.sync_all().map_err(|error| {
+                AppError::internal(format!("cannot sync staged Revision member: {error}"))
+            })?;
+            storage_crash_fault(
+                "OBS_TEST_CRASH_PUBLISH_AFTER_PAYLOAD_SYNC",
+                "bundle member sync",
+            );
+            manifest_members.push(RevisionMemberInput {
+                path: member.path().to_owned(),
+                size,
+                digest,
+            });
+        }
+        source.verify_unchanged()?;
+        let manifest = RevisionManifest::new(RevisionManifestInput {
+            artifact_id: request.artifact_id,
+            revision_id: request.revision_id,
+            entry_path: request.entry_path,
+            entry_media_type: request.entry_media_type,
+            published_at: request.published_at,
+            members: manifest_members,
+        })?;
+        let logical_bytes = manifest.logical_bytes();
+        let files = manifest.files();
+        let (payload_digest, manifest_digest) =
+            persist_manifest(&operation, &content, &staging, &manifest)?;
+        Ok(StagedRevision {
+            operation_id: request.operation_id.to_owned(),
+            revision_id: request.revision_id.to_owned(),
+            entry_path: request.entry_path.to_owned(),
+            entry_media_type: request.entry_media_type.to_owned(),
+            files,
             logical_bytes,
             payload_digest,
             manifest_digest,
@@ -257,6 +329,7 @@ impl ArtifactStorage {
             revision_id: staged.revision_id,
             entry_path: staged.entry_path,
             entry_media_type: staged.entry_media_type,
+            files: staged.files,
             logical_bytes: staged.logical_bytes,
             payload_digest: staged.payload_digest,
             manifest_digest: staged.manifest_digest,
@@ -283,6 +356,7 @@ impl ArtifactStorage {
             revision_id: verified.revision_id,
             entry_path: verified.entry_path,
             entry_media_type: verified.entry_media_type,
+            files: verified.files,
             logical_bytes: verified.logical_bytes,
             payload_digest: verified.payload_digest,
             manifest_digest: verified.manifest_digest,
@@ -307,6 +381,7 @@ impl ArtifactStorage {
             revision_id: verified.revision_id,
             entry_path: verified.entry_path,
             entry_media_type: verified.entry_media_type,
+            files: verified.files,
             logical_bytes: verified.logical_bytes,
             payload_digest: verified.payload_digest,
             manifest_digest: verified.manifest_digest,
@@ -357,12 +432,22 @@ impl ArtifactStorage {
         &self,
         revision_id: &str,
         entry_path: &str,
+        expected_manifest_digest: &str,
     ) -> Result<Vec<u8>, AppError> {
         validate_storage_identifier(revision_id)?;
         validate_entry_path(entry_path)?;
         let revisions = self.open_directory("revisions")?;
         let revision = openat(&revisions, revision_id, directory_flags(), Mode::empty())
             .map_err(|error| storage_error("open immutable Revision", error))?;
+        let (manifest, manifest_digest) = read_revision_manifest(&revision)?;
+        if manifest_digest != expected_manifest_digest {
+            return Err(AppError::internal(
+                "immutable Revision manifest digest mismatch",
+            ));
+        }
+        let member = manifest
+            .member(entry_path)
+            .ok_or_else(|| AppError::not_found("Artifact member does not exist"))?;
         let content = openat(
             &revision,
             CONTENT_DIRECTORY,
@@ -370,15 +455,7 @@ impl ArtifactStorage {
             Mode::empty(),
         )
         .map_err(|error| storage_error("open immutable Revision content", error))?;
-        let mut file = File::from(
-            openat(
-                &content,
-                entry_path,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|error| storage_error("open immutable Revision member", error))?,
-        );
+        let mut file = open_content_member(&content, entry_path)?;
         let metadata = file.metadata().map_err(|error| {
             AppError::internal(format!("cannot inspect Revision member: {error}"))
         })?;
@@ -388,6 +465,14 @@ impl ArtifactStorage {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| AppError::internal(format!("cannot read Revision member: {error}")))?;
+        let size = u64::try_from(bytes.len())
+            .map_err(|_| AppError::internal("Revision member size overflow"))?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        if size != member.size() || digest != member.digest() {
+            return Err(AppError::internal(
+                "immutable Revision member integrity mismatch",
+            ));
+        }
         Ok(bytes)
     }
 
@@ -401,9 +486,42 @@ struct VerifiedRevision {
     revision_id: String,
     entry_path: String,
     entry_media_type: String,
+    files: u64,
     logical_bytes: u64,
     payload_digest: String,
     manifest_digest: String,
+}
+
+fn read_revision_manifest(
+    revision: &rustix::fd::OwnedFd,
+) -> Result<(RevisionManifest, String), AppError> {
+    let mut file = File::from(
+        openat(
+            revision,
+            MANIFEST_FILE,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| storage_error("open Revision manifest", error))?,
+    );
+    let metadata = file.metadata().map_err(|error| {
+        AppError::internal(format!("cannot inspect Revision manifest: {error}"))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(AppError::internal(
+            "Revision manifest is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AppError::internal(format!("cannot read Revision manifest: {error}")))?;
+    let digest = RevisionManifest::digest(&bytes);
+    let manifest: RevisionManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::internal(format!("Revision manifest is invalid: {error}")))?;
+    if manifest.canonical_bytes()? != bytes {
+        return Err(AppError::internal("Revision manifest is not canonical"));
+    }
+    Ok((manifest, digest))
 }
 
 fn verify_revision_directory(
@@ -442,6 +560,24 @@ fn verify_revision_directory(
             "recoverable Revision manifest digest mismatch",
         ));
     }
+    let manifest: RevisionManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+        AppError::internal(format!("recoverable Revision manifest is invalid: {error}"))
+    })?;
+    if manifest.canonical_bytes()? != manifest_bytes
+        || !manifest.identity_matches(RevisionIdentity {
+            artifact_id: expected.artifact_id,
+            revision_id: expected.revision_id,
+            entry_path: expected.entry_path,
+            entry_media_type: expected.entry_media_type,
+            logical_bytes: expected.logical_bytes,
+            published_at: expected.published_at,
+        })
+        || manifest.files() != expected.files
+    {
+        return Err(AppError::internal(
+            "recoverable Revision manifest does not match intent",
+        ));
+    }
     let content = openat(
         revision,
         CONTENT_DIRECTORY,
@@ -449,63 +585,229 @@ fn verify_revision_directory(
         Mode::empty(),
     )
     .map_err(|error| storage_error("open recoverable Revision content", error))?;
-    let mut payload = File::from(
-        openat(
-            &content,
-            expected.entry_path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| storage_error("open recoverable Revision member", error))?,
-    );
-    if !payload
-        .metadata()
-        .map_err(|error| AppError::internal(format!("cannot inspect Revision member: {error}")))?
-        .file_type()
-        .is_file()
-    {
-        return Err(AppError::internal("Revision member is not a regular file"));
-    }
-    let mut payload_bytes = Vec::new();
-    payload
-        .read_to_end(&mut payload_bytes)
-        .map_err(|error| AppError::internal(format!("cannot read Revision member: {error}")))?;
-    let payload_digest = format!("sha256:{:x}", Sha256::digest(&payload_bytes));
-    if u64::try_from(payload_bytes.len()).ok() != Some(expected.logical_bytes)
-        || expected
-            .payload_digest
-            .is_some_and(|digest| digest != payload_digest)
-    {
-        return Err(AppError::internal(
-            "recoverable Revision payload does not match intent",
-        ));
-    }
-    let manifest: RevisionManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-        AppError::internal(format!("recoverable Revision manifest is invalid: {error}"))
-    })?;
-    if manifest.canonical_bytes()? != manifest_bytes
-        || !manifest.verify_single_file(
-            &SingleFileRevision::new(expected.artifact_id, expected.revision_id)
-                .with_entry(expected.entry_path, expected.entry_media_type)
-                .with_content(
-                    expected.logical_bytes,
-                    expected.published_at,
-                    &payload_digest,
-                ),
-        )
-    {
-        return Err(AppError::internal(
-            "recoverable Revision manifest does not match intent",
-        ));
-    }
+    let payload_digest = verify_revision_content(&content, &manifest, expected.payload_digest)?;
     Ok(VerifiedRevision {
         revision_id: expected.revision_id.to_owned(),
         entry_path: expected.entry_path.to_owned(),
         entry_media_type: expected.entry_media_type.to_owned(),
+        files: expected.files,
         logical_bytes: expected.logical_bytes,
         payload_digest,
         manifest_digest,
     })
+}
+
+fn verify_revision_content(
+    content: &rustix::fd::OwnedFd,
+    manifest: &RevisionManifest,
+    expected_digest: Option<&str>,
+) -> Result<String, AppError> {
+    let actual_members = content_member_paths(content, "")?;
+    let expected_members = manifest
+        .members()
+        .iter()
+        .map(|member| member.path().to_owned())
+        .collect::<Vec<_>>();
+    if actual_members != expected_members {
+        return Err(AppError::internal(
+            "recoverable Revision content inventory does not match its manifest",
+        ));
+    }
+    for member in manifest.members() {
+        validate_entry_path(member.path())?;
+        let mut payload = open_content_member(content, member.path())?;
+        let metadata = payload.metadata().map_err(|error| {
+            AppError::internal(format!("cannot inspect Revision member: {error}"))
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != member.size() {
+            return Err(AppError::internal(
+                "recoverable Revision member metadata mismatch",
+            ));
+        }
+        if hash_file(&mut payload)? != member.digest() {
+            return Err(AppError::internal(
+                "recoverable Revision member digest mismatch",
+            ));
+        }
+    }
+    let digest = manifest.content_digest()?;
+    if expected_digest.is_some_and(|expected| expected != digest) {
+        return Err(AppError::internal(
+            "recoverable Revision content inventory mismatch",
+        ));
+    }
+    Ok(digest)
+}
+
+fn persist_manifest(
+    operation: &rustix::fd::OwnedFd,
+    content: &rustix::fd::OwnedFd,
+    staging: &rustix::fd::OwnedFd,
+    manifest: &RevisionManifest,
+) -> Result<(String, String), AppError> {
+    let content_digest = manifest.content_digest()?;
+    let manifest_bytes = manifest.canonical_bytes()?;
+    let manifest_digest = RevisionManifest::digest(&manifest_bytes);
+    let mut file = File::from(
+        openat(
+            operation,
+            MANIFEST_FILE,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| storage_error("create Revision manifest", error))?,
+    );
+    file.write_all(&manifest_bytes)
+        .map_err(|error| AppError::internal(format!("cannot write Revision manifest: {error}")))?;
+    storage_crash_fault(
+        "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_WRITE",
+        "manifest write",
+    );
+    file.sync_all()
+        .map_err(|error| AppError::internal(format!("cannot sync Revision manifest: {error}")))?;
+    storage_crash_fault(
+        "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_SYNC",
+        "manifest sync",
+    );
+    sync_content_directories(content)?;
+    storage_crash_fault(
+        "OBS_TEST_CRASH_PUBLISH_AFTER_CONTENT_SYNC",
+        "content directory sync",
+    );
+    fsync(operation).map_err(|error| storage_error("sync Publish operation directory", error))?;
+    storage_crash_fault(
+        "OBS_TEST_CRASH_PUBLISH_AFTER_OPERATION_SYNC",
+        "operation directory sync",
+    );
+    fsync(staging).map_err(|error| storage_error("sync staging directory", error))?;
+    storage_crash_fault(
+        "OBS_TEST_CRASH_PUBLISH_AFTER_STAGING_SYNC",
+        "staging directory sync",
+    );
+    Ok((content_digest, manifest_digest))
+}
+
+fn open_content_member(content: &rustix::fd::OwnedFd, path: &str) -> Result<File, AppError> {
+    validate_relative_member_path(path)?;
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    let file_name = parts
+        .pop()
+        .ok_or_else(|| AppError::internal("Revision member path is empty"))?;
+    let mut directory = openat(content, ".", directory_flags(), Mode::empty())
+        .map_err(|error| storage_error("open Revision content directory", error))?;
+    for part in parts {
+        directory = openat(&directory, part, directory_flags(), Mode::empty())
+            .map_err(revision_member_error)?;
+    }
+    Ok(File::from(
+        openat(
+            &directory,
+            file_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(revision_member_error)?,
+    ))
+}
+
+fn create_staged_member(content: &rustix::fd::OwnedFd, path: &str) -> Result<File, AppError> {
+    validate_relative_member_path(path)?;
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    let file_name = parts
+        .pop()
+        .ok_or_else(|| AppError::internal("staged member path is empty"))?;
+    let mut directory = openat(content, ".", directory_flags(), Mode::empty())
+        .map_err(|error| storage_error("open staged content directory", error))?;
+    for part in parts {
+        match mkdirat(&directory, part, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(storage_error("create staged member directory", error)),
+        }
+        directory = openat(&directory, part, directory_flags(), Mode::empty())
+            .map_err(|error| storage_error("open staged member directory", error))?;
+    }
+    Ok(File::from(
+        openat(
+            &directory,
+            file_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| storage_error("create staged Revision member", error))?,
+    ))
+}
+
+fn content_member_paths(
+    directory: &rustix::fd::OwnedFd,
+    prefix: &str,
+) -> Result<Vec<String>, AppError> {
+    let iterator = openat(directory, ".", directory_flags(), Mode::empty())
+        .map_err(|error| storage_error("open Revision content inventory", error))?;
+    let entries = Dir::new(iterator)
+        .map_err(|error| storage_error("read Revision content inventory", error))?;
+    let mut names = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
+            Ok(entry) => Some(Ok(
+                OsStr::from_bytes(entry.file_name().to_bytes()).to_owned()
+            )),
+            Err(error) => Some(Err(storage_error("read Revision content member", error))),
+        })
+        .collect::<Result<Vec<OsString>, AppError>>()?;
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut paths = Vec::new();
+    for name in names {
+        let name = name
+            .to_str()
+            .ok_or_else(|| AppError::internal("Revision member name is not UTF-8"))?;
+        let path = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| storage_error("inspect Revision content member", error))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let child = openat(directory, name, directory_flags(), Mode::empty())
+                    .map_err(|error| storage_error("open Revision content directory", error))?;
+                paths.extend(content_member_paths(&child, &path)?);
+            }
+            FileType::RegularFile => paths.push(path),
+            _ => {
+                return Err(AppError::internal(
+                    "Revision content contains an unsafe member type",
+                ));
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn sync_content_directories(directory: &rustix::fd::OwnedFd) -> Result<(), AppError> {
+    let iterator = openat(directory, ".", directory_flags(), Mode::empty())
+        .map_err(|error| storage_error("open staged directory for sync", error))?;
+    let entries = Dir::new(iterator)
+        .map_err(|error| storage_error("read staged directory for sync", error))?;
+    let names = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
+            Ok(entry) => Some(Ok(
+                OsStr::from_bytes(entry.file_name().to_bytes()).to_owned()
+            )),
+            Err(error) => Some(Err(storage_error("read staged directory entry", error))),
+        })
+        .collect::<Result<Vec<OsString>, AppError>>()?;
+    for name in names {
+        let stat = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| storage_error("inspect staged directory entry", error))?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let child = openat(directory, &name, directory_flags(), Mode::empty())
+                .map_err(|error| storage_error("open staged child directory", error))?;
+            sync_content_directories(&child)?;
+        }
+    }
+    fsync(directory).map_err(|error| storage_error("sync staged content directory", error))
 }
 
 fn entry_exists(directory: &rustix::fd::OwnedFd, name: &str) -> Result<bool, AppError> {
@@ -536,6 +838,21 @@ fn quarantine_if_present(
 
 fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn hash_file(file: &mut File) -> Result<String, AppError> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| AppError::internal(format!("cannot hash Revision member: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 fn copy_and_hash(
@@ -571,6 +888,15 @@ fn copy_and_hash(
     Ok((logical_bytes, format!("sha256:{:x}", digest.finalize())))
 }
 
+fn revision_member_error(error: rustix::io::Errno) -> AppError {
+    if error == rustix::io::Errno::NOENT {
+        AppError::not_found("Artifact member does not exist")
+    } else {
+        storage_error("open Revision member", error)
+    }
+}
+
+#[cfg(feature = "test-faults")]
 fn storage_crash_fault(variable: &str, boundary: &str) {
     assert!(
         std::env::var_os(variable).is_none(),
@@ -578,43 +904,16 @@ fn storage_crash_fault(variable: &str, boundary: &str) {
     );
 }
 
+#[cfg(not(feature = "test-faults"))]
+fn storage_crash_fault(_variable: &str, _boundary: &str) {}
+
 fn storage_error(action: &str, error: rustix::io::Errno) -> AppError {
     AppError::internal(format!("cannot {action}: {error}"))
 }
 
-pub(crate) fn safe_entry_name(source: &SafeRegularFile) -> Result<&str, AppError> {
-    let name = source.file_name().to_str().ok_or_else(|| {
-        AppError::invalid(
-            "invalid_source",
-            "Artifact source filename must be valid UTF-8",
-        )
-    })?;
-    if entry_path_is_safe(name) {
-        Ok(name)
-    } else {
-        Err(AppError::invalid(
-            "invalid_source",
-            "Artifact source filename cannot be represented by a safe Artifact route",
-        ))
-    }
-}
-
 fn validate_entry_path(value: &str) -> Result<(), AppError> {
-    if entry_path_is_safe(value) {
-        Ok(())
-    } else {
-        Err(AppError::internal("invalid immutable Revision entry path"))
-    }
-}
-
-fn entry_path_is_safe(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.contains(['/', '\\', '\0'])
-        && !value.as_bytes().windows(3).any(|window| {
-            window[0] == b'%' && window[1].is_ascii_hexdigit() && window[2].is_ascii_hexdigit()
-        })
+    validate_relative_member_path(value)
+        .map_err(|_| AppError::internal("invalid immutable Revision member path"))
 }
 
 fn validate_storage_identifier(value: &str) -> Result<(), AppError> {

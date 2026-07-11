@@ -1,7 +1,8 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -291,7 +292,7 @@ fn migrates_empty_v1_catalogue_before_readiness() {
     );
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status["result"]["policy"]["userVersion"], 4);
+    assert_eq!(status["result"]["policy"]["userVersion"], 5);
     let backup_path = harness
         .storage
         .join("backups/schema-v1-pre-migration.sqlite");
@@ -329,8 +330,8 @@ fn migrates_v2_catalogue_for_project_tombstone_gates() {
         &["system", "status"],
     );
     assert!(status.status.success());
-    let status: Value = serde_json::from_slice(&status.stdout).expect("v4 status JSON");
-    assert_eq!(status["result"]["policy"]["userVersion"], 4);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("v5 status JSON");
+    assert_eq!(status["result"]["policy"]["userVersion"], 5);
 
     let backup_path = harness
         .storage
@@ -371,6 +372,19 @@ fn migrates_v2_catalogue_for_project_tombstone_gates() {
             .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
             .expect("v3 backup quick check"),
         "ok"
+    );
+    let v4_backup = rusqlite::Connection::open_with_flags(
+        harness
+            .storage
+            .join("backups/schema-v4-pre-migration.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("v4 migration backup");
+    assert_eq!(
+        v4_backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("v4 backup schema version"),
+        4
     );
 
     let catalogue =
@@ -848,6 +862,1163 @@ fn single_file_publish_creates_current_artifact_and_immutable_revision() {
 }
 
 #[test]
+fn directory_publish_uses_portable_metadata_and_serves_exact_nested_members() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("bundle-project");
+    fs::create_dir(&project_directory).expect("bundle Project");
+    let bundle = harness._root.path().join("portable-bundle");
+    fs::create_dir_all(bundle.join("pages")).expect("bundle pages");
+    fs::create_dir_all(bundle.join("assets")).expect("bundle assets");
+    fs::write(
+        bundle.join(".obs.json"),
+        r#"{"schemaVersion":1,"entry":"pages/start.html","title":"Portable field guide","description":"A complete browser bundle"}"#,
+    )
+    .expect("portable metadata");
+    fs::write(
+        bundle.join("pages/start.html"),
+        "<!doctype html><h1>Portable field guide</h1><script src=\"../assets/app.js\"></script>",
+    )
+    .expect("bundle entry");
+    fs::write(
+        bundle.join("index.html"),
+        "<h1>Explicit entry</h1><link href=\"/root.css\">",
+    )
+    .expect("explicit bundle entry");
+    fs::write(bundle.join("assets/app.js"), "window.bundleReady = true;\n").expect("bundle script");
+    fs::write(bundle.join(".theme"), "night\n").expect("bundle dotfile");
+    fs::create_dir(bundle.join("control")).expect("bundle control directory");
+    fs::write(bundle.join("control/status.json"), "{\"ok\":true}")
+        .expect("bundle control-named member");
+    fs::write(bundle.join("café note.txt"), "unicode member").expect("bundle Unicode member");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-bundle-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Bundle Project"}))
+        .send()
+        .expect("register bundle Project")
+        .json::<Value>()
+        .expect("bundle Project JSON");
+    let published = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-directory-publish")
+        .json(&serde_json::json!({
+            "source": {"path": bundle, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish directory bundle");
+    assert_eq!(published.status(), 201);
+    let published = published.json::<Value>().expect("directory Publish JSON");
+    let artifact = &published["result"]["artifact"];
+    let revision = &published["result"]["revision"];
+    assert_eq!(artifact["title"], "Portable field guide");
+    assert_eq!(artifact["description"], "A complete browser bundle");
+    assert_eq!(artifact["files"], 6);
+    assert_eq!(revision["entryPath"], "pages/start.html");
+    assert_eq!(revision["entryMediaType"], "text/html");
+    let expected_bytes = 84 + 46 + 27 + 6 + 11 + 14;
+    assert_eq!(artifact["logicalBytes"], expected_bytes);
+    let open_path = url::Url::parse(artifact["openUrl"].as_str().expect("bundle Open URL"))
+        .expect("bundle Open URL parse")
+        .path()
+        .to_owned();
+    let entry = client
+        .get(harness.url(&open_path))
+        .send()
+        .expect("serve bundle entry");
+    assert_eq!(entry.status(), 200);
+    assert_eq!(
+        entry.text().expect("bundle entry bytes"),
+        "<!doctype html><h1>Portable field guide</h1><script src=\"../assets/app.js\"></script>"
+    );
+    let supporting = client
+        .get(harness.url(&format!("{open_path}assets/app.js")))
+        .send()
+        .expect("serve nested supporting member");
+    assert_eq!(supporting.status(), 200);
+    assert_eq!(
+        supporting.text().expect("supporting member bytes"),
+        "window.bundleReady = true;\n"
+    );
+    let control_named = client
+        .get(harness.url(&format!("{open_path}control/status.json")))
+        .send()
+        .expect("serve control-named member");
+    assert_eq!(control_named.status(), 200);
+    assert_eq!(
+        control_named.text().expect("control-named bytes"),
+        "{\"ok\":true}"
+    );
+    let unicode_member = client
+        .get(harness.url(&format!("{open_path}caf%C3%A9%20note.txt")))
+        .send()
+        .expect("serve canonical Unicode member");
+    assert_eq!(unicode_member.status(), 200);
+    assert_eq!(
+        unicode_member.text().expect("Unicode member bytes"),
+        "unicode member"
+    );
+    let wrong_case = client
+        .get(harness.url(&format!("{open_path}Assets/app.js")))
+        .send()
+        .expect("case-sensitive member miss");
+    assert_eq!(wrong_case.status(), 404);
+    for unsafe_path in ["assets%2Fapp.js", "assets%252Fapp.js", "assets//app.js"] {
+        let rejected = client
+            .get(harness.url(&format!("{open_path}{unsafe_path}")))
+            .send()
+            .expect("ambiguous nested member path");
+        assert!(rejected.status().is_client_error(), "path={unsafe_path}");
+    }
+    for unsafe_path in ["assets/%2e/app.js", "assets/%2e%2e/app.js"] {
+        let status = raw_get_status(harness.address, &format!("{open_path}{unsafe_path}"));
+        assert!(
+            (400..500).contains(&status),
+            "path={unsafe_path}, status={status}"
+        );
+    }
+    let revision_id = revision["id"].as_str().expect("bundle Revision ID");
+    let revision_directory = harness.storage.join("revisions").join(revision_id);
+    let manifest_bytes = fs::read(revision_directory.join("revision-manifest.json"))
+        .expect("bundle Revision manifest");
+    assert_eq!(
+        revision["manifestDigest"],
+        format!("sha256:{:x}", Sha256::digest(&manifest_bytes))
+    );
+    let manifest: Value =
+        serde_json::from_slice(&manifest_bytes).expect("bundle Revision manifest JSON");
+    assert_eq!(manifest["files"], 6);
+    assert_eq!(manifest["logicalBytes"], expected_bytes);
+    assert_eq!(
+        manifest["members"]
+            .as_array()
+            .expect("bundle manifest members")
+            .iter()
+            .map(|member| member["path"].as_str().expect("bundle member path"))
+            .collect::<Vec<_>>(),
+        vec![
+            ".theme",
+            "assets/app.js",
+            "café note.txt",
+            "control/status.json",
+            "index.html",
+            "pages/start.html"
+        ]
+    );
+    fs::write(
+        revision_directory.join("content").join("unmanifested.txt"),
+        "must not serve",
+    )
+    .expect("seed unmanifested immutable member");
+    let unmanifested = client
+        .get(harness.url(&format!("{open_path}unmanifested.txt")))
+        .send()
+        .expect("request unmanifested member");
+    assert_eq!(unmanifested.status(), 404);
+    let script_path = revision_directory.join("content/assets/app.js");
+    fs::write(&script_path, "tampered bytes\n").expect("tamper immutable member");
+    let tampered_member = client
+        .get(harness.url(&format!("{open_path}assets/app.js")))
+        .send()
+        .expect("request tampered immutable member");
+    assert_eq!(tampered_member.status(), 500);
+    fs::write(&script_path, "window.bundleReady = true;\n").expect("restore immutable member");
+    let mut changed_manifest = manifest.clone();
+    changed_manifest["members"]
+        .as_array_mut()
+        .expect("mutable manifest members")
+        .push(serde_json::json!({
+            "path": "unmanifested.txt",
+            "size": 14,
+            "digest": format!("sha256:{:x}", Sha256::digest(b"must not serve"))
+        }));
+    changed_manifest["files"] = serde_json::json!(7);
+    changed_manifest["logicalBytes"] = serde_json::json!(expected_bytes + 14);
+    fs::write(
+        revision_directory.join("revision-manifest.json"),
+        serde_jcs::to_vec(&changed_manifest).expect("canonical changed manifest"),
+    )
+    .expect("tamper Revision manifest");
+    let tampered_manifest = client
+        .get(harness.url(&format!("{open_path}unmanifested.txt")))
+        .send()
+        .expect("request manifest-authorized extra member");
+    assert_eq!(tampered_manifest.status(), 500);
+    fs::write(
+        revision_directory.join("revision-manifest.json"),
+        &manifest_bytes,
+    )
+    .expect("restore Revision manifest");
+    let metadata = client
+        .get(harness.url(&format!("{open_path}.obs.json")))
+        .send()
+        .expect("portable metadata is consumed");
+    assert_eq!(metadata.status(), 404);
+    assert_eq!(
+        published["result"]["warnings"][0]["code"],
+        "root_relative_reference"
+    );
+    assert_eq!(published["result"]["warnings"][0]["member"], "index.html");
+
+    let explicit = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-explicit-entry")
+        .json(&serde_json::json!({
+            "source": {"path": bundle, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "entry": "index.html",
+            "title": "Operator title",
+            "description": "Operator description",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish explicit-entry bundle");
+    assert_eq!(explicit.status(), 201);
+    let explicit = explicit
+        .json::<Value>()
+        .expect("explicit-entry Publish JSON");
+    assert_eq!(explicit["result"]["revision"]["entryPath"], "index.html");
+    assert_eq!(explicit["result"]["artifact"]["title"], "Operator title");
+    assert_eq!(
+        explicit["result"]["artifact"]["description"],
+        "Operator description"
+    );
+}
+
+#[test]
+fn directory_publish_rejects_unsafe_trees_metadata_and_entry_selection() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("bundle-validation-project");
+    fs::create_dir(&project_directory).expect("bundle validation Project");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-validation-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Bundle Validation"}))
+        .send()
+        .expect("register bundle validation Project")
+        .json::<Value>()
+        .expect("bundle validation Project JSON");
+    let project_id = project["result"]["id"].clone();
+
+    let missing_entry = harness._root.path().join("missing-entry-bundle");
+    fs::create_dir(&missing_entry).expect("missing-entry bundle");
+    fs::write(missing_entry.join("notes.txt"), "notes").expect("missing-entry member");
+
+    let malformed_metadata = harness._root.path().join("malformed-metadata-bundle");
+    fs::create_dir(&malformed_metadata).expect("malformed metadata bundle");
+    fs::write(malformed_metadata.join("index.html"), "<p>entry</p>")
+        .expect("malformed metadata entry");
+    fs::write(
+        malformed_metadata.join(".obs.json"),
+        r#"{"schemaVersion":1,"unexpected":true}"#,
+    )
+    .expect("malformed portable metadata");
+
+    let unsupported_entry = harness._root.path().join("unsupported-entry-bundle");
+    fs::create_dir(&unsupported_entry).expect("unsupported entry bundle");
+    fs::write(unsupported_entry.join("app.css"), "body{}").expect("unsupported entry member");
+
+    let symlink_bundle = harness._root.path().join("symlink-bundle");
+    fs::create_dir(&symlink_bundle).expect("symlink bundle");
+    fs::write(symlink_bundle.join("index.html"), "<p>entry</p>").expect("symlink entry");
+    symlink("/etc/hosts", symlink_bundle.join("outside.txt")).expect("bundle symlink");
+
+    let hardlink_bundle = harness._root.path().join("hardlink-bundle");
+    fs::create_dir(&hardlink_bundle).expect("hardlink bundle");
+    fs::write(hardlink_bundle.join("index.html"), "<p>entry</p>").expect("hardlink entry");
+    fs::hard_link(
+        hardlink_bundle.join("index.html"),
+        hardlink_bundle.join("duplicate.html"),
+    )
+    .expect("bundle hard link");
+
+    let unsafe_entry_bundle = harness._root.path().join("unsafe-entry-bundle");
+    fs::create_dir(&unsafe_entry_bundle).expect("unsafe entry bundle");
+    fs::write(unsafe_entry_bundle.join("index.html"), "<p>entry</p>").expect("unsafe entry file");
+
+    let special_bundle = harness._root.path().join("special-bundle");
+    fs::create_dir(&special_bundle).expect("special bundle");
+    fs::write(special_bundle.join("index.html"), "<p>entry</p>").expect("special entry");
+    let _socket = UnixListener::bind(special_bundle.join("agent.sock")).expect("bundle socket");
+
+    for (ordinal, source, entry, expected_code) in [
+        (1, &missing_entry, None, "invalid_entry"),
+        (2, &malformed_metadata, None, "invalid_metadata"),
+        (
+            3,
+            &unsupported_entry,
+            Some("app.css"),
+            "unsupported_entry_media",
+        ),
+        (4, &symlink_bundle, None, "unsafe_source"),
+        (5, &hardlink_bundle, None, "unsafe_source"),
+        (6, &special_bundle, None, "unsafe_source"),
+        (
+            7,
+            &unsafe_entry_bundle,
+            Some("../index.html"),
+            "invalid_source",
+        ),
+    ] {
+        let response = client
+            .post(harness.url("/api/v1/artifacts"))
+            .header(
+                "Idempotency-Key",
+                format!("issue-25-invalid-bundle-{ordinal}"),
+            )
+            .json(&serde_json::json!({
+                "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+                "projectId": project_id,
+                "entry": entry,
+                "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+            }))
+            .send()
+            .expect("invalid directory Publish");
+        assert!(response.status().is_client_error(), "ordinal={ordinal}");
+        let body = response.json::<Value>().expect("invalid bundle JSON");
+        assert_eq!(body["error"]["code"], expected_code, "ordinal={ordinal}");
+        assert!(
+            !body
+                .to_string()
+                .contains(harness._root.path().to_str().expect("private root")),
+            "ordinal={ordinal} leaked source path"
+        );
+    }
+
+    let fallback = harness._root.path().join("fallback-bundle");
+    fs::create_dir(&fallback).expect("fallback bundle");
+    fs::write(fallback.join("index.html"), "<p>fallback</p>").expect("fallback entry");
+    let fallback = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-index-fallback")
+        .json(&serde_json::json!({
+            "source": {"path": fallback, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("index fallback Publish");
+    assert_eq!(fallback.status(), 201);
+    let fallback = fallback.json::<Value>().expect("index fallback JSON");
+    assert_eq!(fallback["result"]["revision"]["entryPath"], "index.html");
+    assert_eq!(fallback["result"]["artifact"]["title"], "fallback-bundle");
+}
+
+#[test]
+fn directory_publish_accepts_every_browser_entry_media_family() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("bundle-media-project");
+    fs::create_dir(&project_directory).expect("bundle media Project");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-media-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Bundle Media"}))
+        .send()
+        .expect("register bundle media Project")
+        .json::<Value>()
+        .expect("bundle media Project JSON");
+    for (ordinal, name, media_type, bytes) in [
+        (1, "entry.txt", "text/plain", b"plain text".as_slice()),
+        (2, "entry.png", "image/png", b"png bytes".as_slice()),
+        (3, "entry.mp3", "audio/mpeg", b"audio bytes".as_slice()),
+        (4, "entry.mp4", "video/mp4", b"video bytes".as_slice()),
+        (
+            5,
+            "entry.pdf",
+            "application/pdf",
+            b"%PDF fixture".as_slice(),
+        ),
+        (
+            6,
+            "entry.json",
+            "application/json",
+            br#"{"ok":true}"#.as_slice(),
+        ),
+        (7, "entry.md", "text/markdown", b"# Markdown".as_slice()),
+    ] {
+        let bundle = harness._root.path().join(format!("media-{ordinal}"));
+        fs::create_dir(&bundle).expect("media bundle");
+        fs::write(bundle.join(name), bytes).expect("media entry bytes");
+        fs::write(bundle.join("support.js"), "supporting JavaScript")
+            .expect("media supporting file");
+        let published = client
+            .post(harness.url("/api/v1/artifacts"))
+            .header("Idempotency-Key", format!("issue-25-media-{ordinal}"))
+            .json(&serde_json::json!({
+                "source": {"path": bundle, "callerWorkingDirectory": harness._root.path()},
+                "projectId": project["result"]["id"],
+                "entry": name,
+                "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+            }))
+            .send()
+            .expect("Publish media bundle");
+        assert_eq!(published.status(), 201, "name={name}");
+        let published = published.json::<Value>().expect("media Publish JSON");
+        assert_eq!(
+            published["result"]["revision"]["entryMediaType"],
+            media_type
+        );
+        let open_path = url::Url::parse(
+            published["result"]["artifact"]["openUrl"]
+                .as_str()
+                .expect("media Open URL"),
+        )
+        .expect("media Open URL parse")
+        .path()
+        .to_owned();
+        assert_eq!(
+            client
+                .get(harness.url(&open_path))
+                .send()
+                .expect("serve media entry")
+                .bytes()
+                .expect("media response bytes")
+                .as_ref(),
+            bytes,
+            "name={name}"
+        );
+    }
+}
+
+#[test]
+fn directory_publish_detects_member_and_tree_mutation_before_visibility() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("bundle-race-project");
+    fs::create_dir(&project_directory).expect("bundle race Project");
+    let bundle = harness._root.path().join("changing-bundle");
+    fs::create_dir(&bundle).expect("changing bundle");
+    fs::write(bundle.join("00-index.html"), "<h1>Stable entry</h1>").expect("bundle race entry");
+    let changing = bundle.join("changing.bin");
+    let mut changing_file = fs::File::create(&changing).expect("changing bundle member");
+    changing_file
+        .set_len(32 * 1024 * 1024)
+        .expect("size changing bundle member");
+    changing_file
+        .write_all(b"bundle race")
+        .expect("initialize changing bundle member");
+    changing_file
+        .sync_all()
+        .expect("sync changing bundle member");
+    drop(changing_file);
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-bundle-race-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Bundle Race"}))
+        .send()
+        .expect("register bundle race Project")
+        .json::<Value>()
+        .expect("bundle race Project JSON");
+    let mutating = Arc::new(AtomicBool::new(true));
+    let writer_flag = mutating.clone();
+    let writer_path = changing.clone();
+    let writer = thread::spawn(move || {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .expect("open changing bundle writer");
+        let mut byte = 0_u8;
+        while writer_flag.load(Ordering::Acquire) {
+            file.seek(SeekFrom::End(-1))
+                .expect("seek changing bundle member");
+            file.write_all(&[byte]).expect("mutate bundle member");
+            file.sync_data().expect("sync bundle member mutation");
+            byte ^= 1;
+        }
+    });
+    thread::sleep(Duration::from_millis(10));
+    let changed = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-bundle-race-publish")
+        .json(&serde_json::json!({
+            "source": {"path": bundle, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "entry": "00-index.html",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("source-changed directory Publish");
+    mutating.store(false, Ordering::Release);
+    writer.join().expect("bundle mutation writer");
+    assert_eq!(changed.status(), 422);
+    assert_eq!(
+        changed.json::<Value>().expect("bundle source_changed JSON")["error"]["code"],
+        "source_changed"
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("bundle race catalogue");
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("bundle race visible count");
+        assert_eq!(count, 0, "table={table}");
+    }
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn directory_publish_detects_added_member_after_intent_acceptance() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS", "400");
+        },
+    );
+    let project_directory = harness._root.path().join("bundle-addition-project");
+    fs::create_dir(&project_directory).expect("bundle addition Project");
+    let bundle = harness._root.path().join("bundle-addition");
+    fs::create_dir(&bundle).expect("bundle addition source");
+    fs::write(bundle.join("index.html"), "<h1>Original tree</h1>").expect("bundle addition entry");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-addition-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Bundle Addition"}))
+        .send()
+        .expect("register bundle addition Project")
+        .json::<Value>()
+        .expect("bundle addition Project JSON");
+    let publish_client = client.clone();
+    let publish_url = harness.url("/api/v1/artifacts");
+    let publish_root = harness._root.path().to_path_buf();
+    let publish_bundle = bundle.clone();
+    let project_id = project["result"]["id"].clone();
+    let publish = thread::spawn(move || {
+        publish_client
+            .post(publish_url)
+            .header("Idempotency-Key", "issue-25-addition-publish")
+            .json(&serde_json::json!({
+                "source": {"path": publish_bundle, "callerWorkingDirectory": publish_root},
+                "projectId": project_id,
+                "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+            }))
+            .send()
+            .expect("bundle addition Publish")
+    });
+    let mut accepted = false;
+    for _ in 0..100 {
+        let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+            .expect("bundle addition catalogue");
+        let count: u64 = catalogue
+            .query_row(
+                "SELECT count(*) FROM operation_intents WHERE kind='artifact_publish'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bundle addition intent count");
+        if count == 1 {
+            accepted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(accepted, "Publish intent was not observed");
+    fs::write(bundle.join("added.txt"), "added after acceptance").expect("add member after intent");
+    let changed = publish.join().expect("bundle addition worker");
+    assert_eq!(changed.status(), 422);
+    assert_eq!(
+        changed.json::<Value>().expect("bundle addition JSON")["error"]["code"],
+        "source_changed"
+    );
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn directory_publish_detects_removal_rename_metadata_and_link_count_races() {
+    for mutation in ["remove", "rename", "metadata", "hardlink"] {
+        assert_directory_tree_race(mutation);
+    }
+}
+
+#[cfg(feature = "test-faults")]
+fn assert_directory_tree_race(mutation: &str) {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS", "300");
+        },
+    );
+    let project_directory = harness
+        ._root
+        .path()
+        .join(format!("bundle-{mutation}-project"));
+    fs::create_dir(&project_directory).expect("bundle tree-race Project");
+    let bundle = harness._root.path().join(format!("bundle-{mutation}"));
+    fs::create_dir(&bundle).expect("bundle tree-race source");
+    fs::write(bundle.join("index.html"), "<h1>Tree race</h1>").expect("tree-race entry");
+    fs::write(bundle.join("support.txt"), "support").expect("tree-race support");
+    fs::write(
+        bundle.join(".obs.json"),
+        r#"{"schemaVersion":1,"entry":"index.html"}"#,
+    )
+    .expect("tree-race metadata");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", format!("issue-25-{mutation}-project"))
+        .json(&serde_json::json!({"path": project_directory, "title": mutation}))
+        .send()
+        .expect("register tree-race Project")
+        .json::<Value>()
+        .expect("tree-race Project JSON");
+    let publish_client = client.clone();
+    let publish_url = harness.url("/api/v1/artifacts");
+    let publish_bundle = bundle.clone();
+    let caller = harness._root.path().to_path_buf();
+    let project_id = project["result"]["id"].clone();
+    let key = format!("issue-25-{mutation}-publish");
+    let publish = thread::spawn(move || {
+        publish_client
+            .post(publish_url)
+            .header("Idempotency-Key", key)
+            .json(&serde_json::json!({
+                "source": {"path": publish_bundle, "callerWorkingDirectory": caller},
+                "projectId": project_id,
+                "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+            }))
+            .send()
+            .expect("tree-race Publish")
+    });
+    for _ in 0..100 {
+        let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+            .expect("tree-race catalogue");
+        let accepted: bool = catalogue
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_intents WHERE kind='artifact_publish')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tree-race intent state");
+        if accepted {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    match mutation {
+        "remove" => fs::remove_file(bundle.join("support.txt")).expect("remove bundle member"),
+        "rename" => fs::rename(bundle.join("support.txt"), bundle.join("renamed.txt"))
+            .expect("rename bundle member"),
+        "metadata" => fs::write(
+            bundle.join(".obs.json"),
+            r#"{"schemaVersion":1,"entry":"index.html","title":"changed"}"#,
+        )
+        .expect("change portable metadata"),
+        "hardlink" => fs::hard_link(bundle.join("support.txt"), bundle.join("linked.txt"))
+            .expect("change bundle link count"),
+        _ => unreachable!(),
+    }
+    let changed = publish.join().expect("tree-race worker");
+    assert_eq!(changed.status(), 422, "mutation={mutation}");
+    assert_eq!(
+        changed.json::<Value>().expect("tree-race error JSON")["error"]["code"],
+        "source_changed",
+        "mutation={mutation}"
+    );
+}
+
+#[test]
+fn artifact_replacement_preserves_identity_and_immutable_revision_history() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.arg("--max-live-artifacts").arg("1");
+        },
+    );
+    let project_directory = harness._root.path().join("replacement-project");
+    fs::create_dir(&project_directory).expect("replacement Project");
+    let first_source = harness._root.path().join("first.html");
+    fs::write(&first_source, "<h1>First Revision</h1>").expect("first Revision source");
+    let replacement = harness._root.path().join("replacement-bundle");
+    fs::create_dir(&replacement).expect("replacement bundle");
+    fs::write(replacement.join("index.html"), "<h1>Second Revision</h1>")
+        .expect("replacement entry");
+    fs::write(replacement.join("support.txt"), "supporting bytes").expect("replacement support");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-replacement-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Replacement Project"}))
+        .send()
+        .expect("register replacement Project")
+        .json::<Value>()
+        .expect("replacement Project JSON");
+    let first = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-first-publish")
+        .json(&serde_json::json!({
+            "source": {"path": first_source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "title": "Stable Artifact",
+            "retention": {"mode": "pinned", "ttlMs": null, "pinReason": "keep identity"}
+        }))
+        .send()
+        .expect("first Publish")
+        .json::<Value>()
+        .expect("first Publish JSON");
+    let artifact_id = first["result"]["artifact"]["id"]
+        .as_str()
+        .expect("Artifact ID");
+    let artifact_key = first["result"]["artifact"]["key"]
+        .as_str()
+        .expect("Artifact key");
+    let first_revision_id = first["result"]["revision"]["id"]
+        .as_str()
+        .expect("first Revision ID");
+    let replace_path = format!("/api/v1/artifacts/{artifact_id}/replace");
+    let missing_precondition = client
+        .post(harness.url(&replace_path))
+        .header("Idempotency-Key", "issue-25-missing-replace-precondition")
+        .json(&serde_json::json!({
+            "source": {"path": replacement, "callerWorkingDirectory": harness._root.path()}
+        }))
+        .send()
+        .expect("replacement without If-Match");
+    assert_eq!(missing_precondition.status(), 428);
+    let stale = client
+        .post(harness.url(&replace_path))
+        .header("If-Match", "\"rv-99\"")
+        .header("Idempotency-Key", "issue-25-stale-replacement")
+        .json(&serde_json::json!({
+            "source": {"path": replacement, "callerWorkingDirectory": harness._root.path()}
+        }))
+        .send()
+        .expect("stale replacement");
+    assert_eq!(stale.status(), 412);
+    let failed = client
+        .post(harness.url(&replace_path))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-failed-replacement")
+        .json(&serde_json::json!({
+            "source": {"path": harness._root.path().join("missing"), "callerWorkingDirectory": harness._root.path()}
+        }))
+        .send()
+        .expect("failed replacement");
+    assert!(failed.status().is_client_error() || failed.status().is_server_error());
+    let replaced = client
+        .post(harness.url(&replace_path))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-successful-replacement")
+        .json(&serde_json::json!({
+            "source": {"path": replacement, "callerWorkingDirectory": harness._root.path()},
+            "title": "Stable Artifact",
+            "slug": "advanced-stable"
+        }))
+        .send()
+        .expect("successful replacement");
+    let replacement_status = replaced.status();
+    let replacement_etag = replaced.headers().get("etag").cloned();
+    let replaced = replaced.json::<Value>().expect("replacement JSON");
+    assert_eq!(replacement_status, 200, "{replaced:#}");
+    assert_eq!(replacement_etag.expect("replacement ETag"), "\"rv-2\"");
+    assert_eq!(replaced["result"]["artifact"]["id"], artifact_id);
+    assert_eq!(
+        replaced["result"]["artifact"]["key"],
+        format!("advanced-stable~{artifact_id}")
+    );
+    assert_ne!(
+        artifact_key,
+        replaced["result"]["artifact"]["key"]
+            .as_str()
+            .expect("replacement key")
+    );
+    assert_eq!(replaced["result"]["artifact"]["recordVersion"], 2);
+    assert_eq!(replaced["result"]["artifact"]["revisionCount"], 2);
+    assert_eq!(
+        replaced["result"]["artifact"]["retention"]["mode"],
+        "pinned"
+    );
+    let second_revision_id = replaced["result"]["revision"]["id"]
+        .as_str()
+        .expect("second Revision ID");
+    assert_ne!(second_revision_id, first_revision_id);
+    let replay = client
+        .post(harness.url(&replace_path))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-successful-replacement")
+        .json(&serde_json::json!({
+            "source": {"path": replacement, "callerWorkingDirectory": harness._root.path()},
+            "title": "Stable Artifact",
+            "slug": "advanced-stable"
+        }))
+        .send()
+        .expect("replacement replay");
+    assert_eq!(replay.status(), 200);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(
+        replay.json::<Value>().expect("replacement replay JSON")["result"]["revision"]["id"],
+        second_revision_id
+    );
+    let stable_path = url::Url::parse(
+        replaced["result"]["artifact"]["openUrl"]
+            .as_str()
+            .expect("stable Open URL"),
+    )
+    .expect("stable Open URL parse")
+    .path()
+    .to_owned();
+    let durable_slug: String = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("replacement slug catalogue")
+        .query_row(
+            "SELECT slug FROM artifacts WHERE id=?1",
+            [artifact_id],
+            |row| row.get(0),
+        )
+        .expect("durable replacement slug");
+    assert_eq!(durable_slug, "advanced-stable");
+    let no_redirect = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("no-redirect replacement client");
+    let stale_slug = no_redirect
+        .get(harness.url(&format!("/artifacts/{artifact_key}/")))
+        .send()
+        .expect("stale replacement slug redirect");
+    assert_eq!(
+        stale_slug.status(),
+        308,
+        "location={:?}",
+        stale_slug.headers().get("location")
+    );
+    assert_eq!(
+        stale_slug.headers()["location"],
+        replaced["result"]["artifact"]["openUrl"]
+            .as_str()
+            .expect("replacement Open URL")
+    );
+    assert_eq!(
+        client
+            .get(harness.url(&stable_path))
+            .send()
+            .expect("stable replacement bytes")
+            .text()
+            .expect("stable replacement text"),
+        "<h1>Second Revision</h1>"
+    );
+    assert_eq!(
+        client
+            .get(harness.url(&format!("/revisions/{first_revision_id}/")))
+            .send()
+            .expect("old immutable Revision")
+            .text()
+            .expect("old immutable bytes"),
+        "<h1>First Revision</h1>"
+    );
+    let history = client
+        .get(harness.url(&format!("/api/v1/artifacts/{artifact_id}/revisions")))
+        .send()
+        .expect("replacement Revision history")
+        .json::<Value>()
+        .expect("replacement history JSON");
+    assert_eq!(
+        history["result"]["items"]
+            .as_array()
+            .expect("history items")
+            .len(),
+        2
+    );
+    assert_eq!(history["result"]["items"][0]["id"], second_revision_id);
+    assert_eq!(history["result"]["items"][0]["state"], "current");
+    assert_eq!(history["result"]["items"][1]["id"], first_revision_id);
+    assert_eq!(history["result"]["items"][1]["state"], "superseded");
+    let first_page = client
+        .get(harness.url(&format!("/api/v1/artifacts/{artifact_id}/revisions")))
+        .query(&[
+            ("availability", "all"),
+            ("order", "published"),
+            ("direction", "desc"),
+            ("limit", "1"),
+        ])
+        .send()
+        .expect("first Revision history page");
+    assert_eq!(first_page.status(), 200);
+    let next_link = first_page.headers()["link"]
+        .to_str()
+        .expect("Revision next Link")
+        .strip_prefix('<')
+        .and_then(|value| value.split_once('>'))
+        .map(|(target, relation)| {
+            assert_eq!(relation, "; rel=\"next\"");
+            target
+        })
+        .expect("Revision RFC 8288 Link");
+    let next_link = url::Url::parse(next_link).expect("absolute Revision next URL");
+    let next_local = format!(
+        "{}?{}",
+        next_link.path(),
+        next_link.query().expect("Revision continuation query")
+    );
+    let second_page = client
+        .get(harness.url(&next_local))
+        .send()
+        .expect("second Revision history page")
+        .json::<Value>()
+        .expect("second Revision history JSON");
+    assert_eq!(second_page["result"]["items"][0]["id"], first_revision_id);
+    let superseded = client
+        .get(harness.url(&format!("/api/v1/artifacts/{artifact_id}/revisions")))
+        .query(&[
+            ("availability", "superseded"),
+            ("order", "superseded"),
+            ("direction", "desc"),
+        ])
+        .send()
+        .expect("superseded Revision history")
+        .json::<Value>()
+        .expect("superseded Revision history JSON");
+    assert_eq!(superseded["result"]["items"][0]["id"], first_revision_id);
+    let detail_path = url::Url::parse(
+        replaced["result"]["artifact"]["detailUrl"]
+            .as_str()
+            .expect("replacement detail URL"),
+    )
+    .expect("replacement detail URL parse")
+    .path()
+    .to_owned();
+    let detail = client
+        .get(harness.url(&detail_path))
+        .send()
+        .expect("replacement browser detail")
+        .text()
+        .expect("replacement browser HTML");
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("replacement audit catalogue");
+    let replacement_audits: u64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM audit_events
+             WHERE kind='artifact_replaced' AND resource_id=?1",
+            [artifact_id],
+            |row| row.get(0),
+        )
+        .expect("replacement audit count");
+    assert_eq!(replacement_audits, 1);
+    for expected in [
+        "Revision history",
+        first_revision_id,
+        second_revision_id,
+        "Revision · current",
+        "Revision · superseded",
+        "2 files",
+    ] {
+        assert!(
+            detail.contains(expected),
+            "missing {expected:?} in {detail}"
+        );
+    }
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn interrupted_replacement_preserves_old_current_then_recovers_once() {
+    for fault in [
+        "OBS_TEST_FAIL_PUBLISH_AFTER_INTENT",
+        "OBS_TEST_FAIL_PUBLISH_AFTER_STAGE_SYNC",
+        "OBS_TEST_FAIL_PUBLISH_AFTER_STAGED",
+        "OBS_TEST_FAIL_PUBLISH_AFTER_FINALIZE",
+        "OBS_TEST_FAIL_PUBLISH_AFTER_RENAME",
+    ] {
+        assert_interrupted_replacement_recovers_once(fault);
+    }
+}
+
+#[cfg(feature = "test-faults")]
+fn assert_interrupted_replacement_recovers_once(fault: &str) {
+    let mut harness = Harness::start();
+    let project_directory = harness._root.path().join("replacement-recovery-project");
+    fs::create_dir(&project_directory).expect("replacement recovery Project");
+    let first_source = harness._root.path().join("replacement-old.html");
+    let next_source = harness._root.path().join("replacement-new-bundle");
+    fs::write(&first_source, "<h1>Old current</h1>").expect("old replacement source");
+    fs::create_dir(&next_source).expect("new replacement bundle");
+    fs::write(next_source.join("index.html"), "<h1>Recovered current</h1>")
+        .expect("new replacement entry");
+    fs::write(next_source.join("support.txt"), "recovered support")
+        .expect("new replacement support");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-recovery-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Replacement Recovery"}))
+        .send()
+        .expect("register replacement recovery Project")
+        .json::<Value>()
+        .expect("replacement recovery Project JSON");
+    let first = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-recovery-first")
+        .json(&serde_json::json!({
+            "source": {"path": first_source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "title": "Recoverable Replacement",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish replacement recovery base")
+        .json::<Value>()
+        .expect("replacement recovery base JSON");
+    let artifact_id = first["result"]["artifact"]["id"]
+        .as_str()
+        .expect("replacement recovery Artifact ID");
+    let artifact_key = first["result"]["artifact"]["key"]
+        .as_str()
+        .expect("replacement recovery key");
+    let old_revision_id = first["result"]["revision"]["id"]
+        .as_str()
+        .expect("old recovery Revision ID");
+    let body = serde_json::json!({
+        "source": {"path": next_source, "callerWorkingDirectory": harness._root.path()},
+        "title": "Recoverable Replacement"
+    });
+    harness.restart_configured(|command| {
+        command.env(fault, "1");
+    });
+    let interrupted = client
+        .post(harness.url(&format!("/api/v1/artifacts/{artifact_id}/replace")))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-recovery-replace")
+        .json(&body)
+        .send()
+        .expect("interrupt replacement after rename");
+    assert_eq!(interrupted.status(), 500);
+    let stable_path = format!("/artifacts/{artifact_key}/");
+    assert_eq!(
+        client
+            .get(harness.url(&stable_path))
+            .send()
+            .expect("old current after interrupted replacement")
+            .text()
+            .expect("old current bytes"),
+        "<h1>Old current</h1>"
+    );
+    harness.restart_configured(|_| {});
+    let replay = client
+        .post(harness.url(&format!("/api/v1/artifacts/{artifact_id}/replace")))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-recovery-replace")
+        .json(&body)
+        .send()
+        .expect("replay recovered replacement");
+    assert_eq!(replay.status(), 200);
+    if fault != "OBS_TEST_FAIL_PUBLISH_AFTER_INTENT" {
+        assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    }
+    let replay = replay.json::<Value>().expect("recovered replacement JSON");
+    assert_eq!(replay["result"]["artifact"]["recordVersion"], 2);
+    assert_eq!(replay["result"]["artifact"]["revisionCount"], 2);
+    assert_ne!(replay["result"]["revision"]["id"], old_revision_id);
+    assert_eq!(
+        client
+            .get(harness.url(&stable_path))
+            .send()
+            .expect("recovered current bytes")
+            .text()
+            .expect("recovered current text"),
+        "<h1>Recovered current</h1>"
+    );
+}
+
+#[test]
+fn replacement_visibility_failure_rolls_back_selection_and_restart_commits_once() {
+    let mut harness = Harness::start();
+    let project_directory = harness._root.path().join("replacement-rollback-project");
+    fs::create_dir(&project_directory).expect("replacement rollback Project");
+    let old_source = harness._root.path().join("rollback-old.html");
+    let new_source = harness._root.path().join("rollback-new.html");
+    fs::write(&old_source, "<p>old selection</p>").expect("old rollback source");
+    fs::write(&new_source, "<p>new selection</p>").expect("new rollback source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-25-replace-rollback-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Replace Rollback"}))
+        .send()
+        .expect("register replacement rollback Project")
+        .json::<Value>()
+        .expect("replacement rollback Project JSON");
+    let first = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-25-replace-rollback-first")
+        .json(&serde_json::json!({
+            "source": {"path": old_source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project["result"]["id"],
+            "title": "Rollback Artifact",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish replacement rollback base")
+        .json::<Value>()
+        .expect("replacement rollback base JSON");
+    let artifact_id = first["result"]["artifact"]["id"]
+        .as_str()
+        .expect("rollback Artifact ID");
+    let old_revision_id = first["result"]["revision"]["id"]
+        .as_str()
+        .expect("rollback old Revision ID");
+    let catalogue_path = harness.storage.join("catalogue.sqlite");
+    let catalogue =
+        rusqlite::Connection::open(&catalogue_path).expect("replacement rollback catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER inject_artifact_replace_audit_failure
+             BEFORE INSERT ON audit_events
+             WHEN NEW.kind='artifact_replaced'
+             BEGIN SELECT RAISE(ABORT, 'injected replacement audit failure'); END;",
+        )
+        .expect("install replacement visibility fault");
+    let body = serde_json::json!({
+        "source": {"path": new_source, "callerWorkingDirectory": harness._root.path()},
+        "title": "Rollback Artifact"
+    });
+    let failed = client
+        .post(harness.url(&format!("/api/v1/artifacts/{artifact_id}/replace")))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-replace-rollback")
+        .json(&body)
+        .send()
+        .expect("fault replacement visibility transaction");
+    assert_eq!(failed.status(), 500);
+    let authority: (u64, String, u64) = catalogue
+        .query_row(
+            "SELECT record_version,current_revision_id,(SELECT count(*) FROM revisions)
+             FROM artifacts WHERE id=?1",
+            [artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("rolled-back replacement authority");
+    assert_eq!(authority, (1, old_revision_id.to_owned(), 1));
+    catalogue
+        .execute_batch("DROP TRIGGER inject_artifact_replace_audit_failure;")
+        .expect("remove replacement visibility fault");
+    drop(catalogue);
+    harness.restart_configured(|_| {});
+    let replay = client
+        .post(harness.url(&format!("/api/v1/artifacts/{artifact_id}/replace")))
+        .header("If-Match", "\"rv-1\"")
+        .header("Idempotency-Key", "issue-25-replace-rollback")
+        .json(&body)
+        .send()
+        .expect("replay replacement visibility recovery");
+    assert_eq!(replay.status(), 200);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let catalogue =
+        rusqlite::Connection::open(catalogue_path).expect("replacement recovered catalogue");
+    let authority: (u64, u64, u64) = catalogue
+        .query_row(
+            "SELECT record_version,revision_count,(SELECT count(*) FROM revisions)
+             FROM artifacts WHERE id=?1",
+            [artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("recovered replacement authority");
+    assert_eq!(authority, (2, 2, 2));
+}
+
+#[test]
 fn published_artifact_is_discoverable_through_api_ledger_and_browser_details() {
     let harness = Harness::start();
     let project_directory = harness._root.path().join("artifact-discovery-project");
@@ -1166,6 +2337,42 @@ fn artifact_cli_publishes_lists_and_shows_through_the_daemon() {
         &["artifact", "list", "--all", "--retention", "typo"],
     );
     assert_eq!(invalid_retention.status.code(), Some(2));
+
+    let replacement_source = harness._root.path().join("cli-replacement.html");
+    fs::write(&replacement_source, "<h1>CLI replacement</h1>").expect("CLI replacement source");
+    let replaced = cli(
+        &server,
+        &[
+            "--idempotency-key",
+            "issue-25-cli-replacement",
+            "artifact",
+            "replace",
+            artifact_key,
+            replacement_source
+                .to_str()
+                .expect("CLI replacement source path"),
+            "--title",
+            "CLI Note Replaced",
+        ],
+    );
+    assert!(replaced.status.success(), "{replaced:?}");
+    let replaced: Value = serde_json::from_slice(&replaced.stdout).expect("CLI replacement JSON");
+    assert_eq!(replaced["result"]["artifact"]["id"], artifact_id);
+    assert_eq!(replaced["result"]["artifact"]["recordVersion"], 2);
+    assert_eq!(
+        replaced["result"]["artifact"]["retention"]["mode"],
+        "pinned"
+    );
+    let history = cli(&server, &["artifact", "show", artifact_id, "--revisions"]);
+    assert!(history.status.success(), "{history:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&history.stdout).expect("CLI replaced history JSON")
+            ["result"]["items"]
+            .as_array()
+            .expect("CLI replaced history items")
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -1349,6 +2556,7 @@ fn artifact_publish_capacity_failure_precedes_storage_and_visibility() {
     );
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn concurrent_publish_capacity_counts_the_first_durable_reservation() {
     let harness = Harness::start_configured(
@@ -1533,6 +2741,7 @@ fn source_change_binds_the_key_and_requires_a_new_key_for_later_bytes() {
     );
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn interrupted_publish_reconciles_before_restart_readiness_and_replays_exactly() {
     let mut harness = Harness::start_configured(
@@ -1645,6 +2854,7 @@ fn interrupted_publish_reconciles_before_restart_readiness_and_replays_exactly()
     assert_eq!(operation_state, "completed");
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn publish_restart_resumes_each_synced_previsibility_phase() {
     for (fault, suffix) in [
@@ -1657,6 +2867,7 @@ fn publish_restart_resumes_each_synced_previsibility_phase() {
     }
 }
 
+#[cfg(feature = "test-faults")]
 fn assert_publish_recovers_from_phase(fault: &str, suffix: &str) {
     let mut harness = Harness::start_configured(
         |_| {},
@@ -1742,6 +2953,7 @@ fn assert_publish_recovers_from_phase(fault: &str, suffix: &str) {
     assert_eq!(state, "completed", "fault={fault}");
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn publish_restart_classifies_every_storage_durability_boundary() {
     for (fault, suffix, completes) in [
@@ -1800,6 +3012,7 @@ fn publish_restart_classifies_every_storage_durability_boundary() {
     }
 }
 
+#[cfg(feature = "test-faults")]
 fn assert_storage_boundary_recovery(fault: &str, suffix: &str, completes: bool) {
     let mut harness = Harness::start_configured(
         |_| {},
@@ -1871,6 +3084,7 @@ fn assert_storage_boundary_recovery(fault: &str, suffix: &str, completes: bool) 
     assert_eq!(visible, u64::from(completes));
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn intent_recorded_retry_rejects_changed_source_without_new_visibility() {
     let mut harness = Harness::start_configured(
@@ -1955,6 +3169,7 @@ fn intent_recorded_retry_rejects_changed_source_without_new_visibility() {
     assert_eq!(fresh.status(), 201);
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn awaiting_retry_publish_keeps_capacity_reserved_across_restart() {
     let mut harness = Harness::start_configured(
@@ -2021,6 +3236,7 @@ fn awaiting_retry_publish_keeps_capacity_reserved_across_restart() {
     assert_eq!(resumed.status(), 201);
 }
 
+#[cfg(feature = "test-faults")]
 #[test]
 fn malformed_interrupted_publish_is_quarantined_and_bound_to_its_key() {
     let mut harness = Harness::start_configured(
@@ -4420,7 +5636,7 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
         }
     }
     assert_eq!(status["result"]["policy"]["applicationId"], 0x4f42_5356_u64);
-    assert_eq!(status["result"]["policy"]["userVersion"], 4);
+    assert_eq!(status["result"]["policy"]["userVersion"], 5);
     assert_eq!(status["result"]["policy"]["foreignKeys"], true);
     assert_eq!(status["result"]["policy"]["journalMode"], "wal");
     assert_eq!(status["result"]["policy"]["synchronous"], "FULL");

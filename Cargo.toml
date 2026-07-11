@@ -11,6 +11,9 @@ keywords = ["catalogue", "artifacts", "services"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 publish = false
 
+[features]
+test-faults = []
+
 [[bin]]
 name = "obs"
 path = "src/main.rs"

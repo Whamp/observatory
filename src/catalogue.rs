@@ -15,7 +15,7 @@ use crate::storage_boundary::StorageBoundary;
 use crate::storage_status::{self, StorageStatus};
 
 pub const APPLICATION_ID: i64 = 0x4f42_5356;
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -274,10 +274,12 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
                files INTEGER NOT NULL CHECK(files > 0),
                logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0),
                manifest_digest TEXT NOT NULL,
-               published_at TEXT NOT NULL
+               published_at TEXT NOT NULL,
+               superseded_at TEXT
              ) STRICT;
              CREATE INDEX artifacts_project_state ON artifacts(project_id, state);
              CREATE INDEX revisions_artifact_published ON revisions(artifact_id, published_at DESC);
+             CREATE INDEX revisions_artifact_superseded ON revisions(artifact_id, superseded_at DESC);
              CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL, project_id TEXT REFERENCES projects(id)) STRICT;
              CREATE INDEX operation_intents_kind_state ON operation_intents(kind, state);
              CREATE TABLE backup_leases (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
@@ -327,13 +329,19 @@ fn migrate(root: &Path, connection: &Connection) -> Result<(), AppError> {
         1 => {
             migrate_v1_to_v2(root, connection)?;
             migrate_v2_to_v3(root, connection)?;
-            migrate_v3_to_v4(root, connection)
+            migrate_v3_to_v4(root, connection)?;
+            migrate_v4_to_v5(root, connection)
         }
         2 => {
             migrate_v2_to_v3(root, connection)?;
-            migrate_v3_to_v4(root, connection)
+            migrate_v3_to_v4(root, connection)?;
+            migrate_v4_to_v5(root, connection)
         }
-        3 => migrate_v3_to_v4(root, connection),
+        3 => {
+            migrate_v3_to_v4(root, connection)?;
+            migrate_v4_to_v5(root, connection)
+        }
+        4 => migrate_v4_to_v5(root, connection),
         _ => Err(AppError::internal("catalogue schema is unsupported")),
     }
 }
@@ -496,6 +504,20 @@ fn migrate_v3_to_v4(root: &Path, connection: &Connection) -> Result<(), AppError
              CREATE INDEX revisions_artifact_published ON revisions(artifact_id, published_at DESC);
              CREATE INDEX operation_intents_kind_state ON operation_intents(kind, state);
              PRAGMA user_version=4;
+             COMMIT;",
+        )
+        .map_err(database_error)
+}
+
+fn migrate_v4_to_v5(root: &Path, connection: &Connection) -> Result<(), AppError> {
+    backup_before_migration(root, connection, 4)?;
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE revisions ADD COLUMN superseded_at TEXT;
+             CREATE INDEX revisions_artifact_superseded
+               ON revisions(artifact_id, superseded_at DESC);
+             PRAGMA user_version=5;
              COMMIT;",
         )
         .map_err(database_error)

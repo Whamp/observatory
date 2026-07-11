@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::artifact_source::{ArtifactSource, SourceWarning};
 use crate::artifact_storage::{
     ArtifactStorage, FinalizedRevision, RecoveryRequest, StageRequest, StagedRevision,
-    safe_entry_name,
 };
 use crate::catalogue::Catalogue;
 use crate::crypto::random_opaque_id;
@@ -12,7 +12,6 @@ use crate::cursor;
 use crate::error::{AppError, StoredError};
 use crate::project::LedgerQuery;
 use crate::route_slug;
-use crate::safe_file::open_regular_file;
 use caseless::default_case_fold_str;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rustix::fs::statvfs;
@@ -34,6 +33,17 @@ pub(crate) struct PublishArtifactRequest {
     slug: Option<String>,
     #[serde(default)]
     retention: PublishRetention,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReplaceArtifactRequest {
+    source: PublishSource,
+    entry: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    slug: Option<String>,
+    retention: Option<PublishRetention>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -110,6 +120,15 @@ pub(crate) struct PublishResult {
     operation: String,
     artifact: Artifact,
     revision: Revision,
+    warnings: Vec<PublishWarning>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishWarning {
+    code: String,
+    message: String,
+    member: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -149,6 +168,8 @@ pub(crate) struct Revision {
     logical_bytes: u64,
     manifest_digest: String,
     published_at: String,
+    #[serde(skip)]
+    superseded_at: Option<String>,
     api_url: String,
     open_url: String,
 }
@@ -182,6 +203,17 @@ struct PublishIntent {
     capacity_reservation_bytes: u64,
     idempotency_key: String,
     fingerprint: String,
+    #[serde(default)]
+    warnings: Vec<PublishWarning>,
+    #[serde(default)]
+    replacement: Option<ReplacementIntent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplacementIntent {
+    previous_revision_id: String,
+    expected_record_version: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,6 +280,29 @@ pub(crate) struct RevisionList {
     page: ArtifactPage,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ListRevisionsQuery {
+    availability: Option<String>,
+    order: Option<String>,
+    direction: Option<String>,
+    limit: Option<u16>,
+    after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RevisionCursor {
+    endpoint: String,
+    artifact_id: String,
+    availability: String,
+    order: String,
+    direction: ListDirection,
+    last_value: String,
+    last_id: String,
+    expires_at_ms: i128,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArtifactPage {
@@ -279,6 +334,7 @@ struct NewArtifact<'a> {
     slug: &'a str,
     project: ProjectReference,
     retention: Retention,
+    files: u64,
     logical_bytes: u64,
     published_at: &'a str,
 }
@@ -289,13 +345,19 @@ struct NewRevision<'a> {
     artifact_id: &'a str,
     entry_path: &'a str,
     entry_media_type: &'a str,
+    files: u64,
     logical_bytes: u64,
     manifest_digest: &'a str,
     published_at: &'a str,
 }
 
+struct ReplacementState {
+    artifact: Artifact,
+    expected_record_version: u64,
+}
+
 struct PreparedPublish {
-    source: crate::safe_file::SafeRegularFile,
+    source: ArtifactSource,
     operation_id: String,
     artifact_id: String,
     revision_id: String,
@@ -314,12 +376,19 @@ struct CapacityPolicy {
 }
 
 #[derive(Clone, Copy)]
+enum ReservationKind {
+    Publish,
+    Replace,
+}
+
+#[derive(Clone, Copy)]
 struct PublishReservation<'a> {
     idempotency_key: &'a str,
     fingerprint: &'a str,
     project_id: &'a str,
     required_bytes: u64,
     capacity: CapacityPolicy,
+    kind: ReservationKind,
 }
 
 #[derive(Clone, Copy)]
@@ -330,6 +399,14 @@ struct ArtifactCursorBinding<'a> {
     folded_query: &'a str,
     order: &'a str,
     direction: ListDirection,
+}
+
+struct NormalizedRevisionList {
+    availability: String,
+    order: String,
+    direction: ListDirection,
+    limit: u16,
+    cursor: Option<RevisionCursor>,
 }
 
 struct NormalizedArtifactList {
@@ -409,6 +486,7 @@ impl ArtifactService {
                 revision_id: &intent.revision.id,
                 entry_path: &intent.revision.entry_path,
                 entry_media_type: &intent.revision.entry_media_type,
+                files: intent.revision.files,
                 logical_bytes: intent.revision.logical_bytes,
                 published_at: &intent.revision.published_at,
                 payload_digest: intent.payload_digest.as_deref(),
@@ -508,11 +586,67 @@ impl ArtifactService {
         {
             return self.persist_publish(&mut connection, prepared, idempotency_key);
         }
-        if let Some(outcome) = completed_publish(&connection, idempotency_key, &fingerprint)? {
+        if let Some(outcome) = completed_publish(&connection, idempotency_key, &fingerprint, false)?
+        {
             return Ok(outcome);
         }
-        let prepared =
-            self.prepare_publish(&mut connection, request, idempotency_key, &fingerprint)?;
+        let prepared = self.prepare_publish(
+            &mut connection,
+            request,
+            idempotency_key,
+            &fingerprint,
+            None,
+        )?;
+        self.persist_publish(&mut connection, prepared, idempotency_key)
+    }
+
+    pub(crate) fn replace(
+        &self,
+        artifact_id: &str,
+        request: &ReplaceArtifactRequest,
+        if_match: &str,
+        idempotency_key: &str,
+    ) -> Result<PublishOutcome, AppError> {
+        validate_opaque_id(artifact_id)?;
+        validate_idempotency_key(idempotency_key)?;
+        validate_source_paths(&request.source)?;
+        let normalized_source = normalized_source_selection(&request.source.path)?;
+        let fingerprint =
+            replacement_fingerprint(artifact_id, request, if_match, &normalized_source)?;
+        let _guard = self.begin_mutation(idempotency_key, &fingerprint)?;
+        let mut connection = self.catalogue.connection()?;
+        if let Some(outcome) = completed_publish(&connection, idempotency_key, &fingerprint, true)?
+        {
+            return Ok(outcome);
+        }
+        let current = artifact_by_id(&connection, artifact_id, &self.canonical_origin)?
+            .ok_or_else(|| AppError::not_found("Artifact does not exist"))?;
+        if current.state != "live" {
+            return Err(AppError::gone(
+                "artifact_gone",
+                "Artifact identity is not live",
+            ));
+        }
+        if current.etag() != if_match {
+            return Err(AppError::changed_record());
+        }
+        let publish_request = replacement_publish_request(request, &current);
+        if let Some(prepared) =
+            resumable_publish(&connection, &publish_request, idempotency_key, &fingerprint)?
+        {
+            return self.persist_publish(&mut connection, prepared, idempotency_key);
+        }
+        let expected_record_version = current.record_version;
+        let prepared = self.prepare_publish(
+            &mut connection,
+            &publish_request,
+            idempotency_key,
+            &fingerprint,
+            Some(&ReplacementState {
+                artifact: current,
+                expected_record_version,
+            }),
+        )?;
         self.persist_publish(&mut connection, prepared, idempotency_key)
     }
 
@@ -522,22 +656,30 @@ impl ArtifactService {
         request: &PublishArtifactRequest,
         idempotency_key: &str,
         fingerprint: &str,
+        replacement: Option<&ReplacementState>,
     ) -> Result<PreparedPublish, AppError> {
         let project = project_reference(connection, &request.project_id)?;
         let normalized_source = normalized_source_selection(&request.source.path)?;
-        let mut source = open_regular_file(Path::new(&normalized_source), "Artifact source")?;
-        let entry_path = safe_entry_name(&source)?.to_owned();
-        validate_entry_override(request.entry.as_deref(), &entry_path)?;
+        let mut source = ArtifactSource::open(Path::new(&normalized_source))?;
+        let entry_path = source.entry_path(request.entry.as_deref())?;
         let entry_media_type = entry_media_type(&entry_path)?;
         let title = artifact_title(request, &entry_path, &entry_media_type, &mut source)?;
-        let description = request.description.clone().unwrap_or_default();
-        let slug = artifact_slug(request.slug.as_deref(), &title)?;
+        let description = request
+            .description
+            .clone()
+            .or_else(|| source.portable_description().map(str::to_owned))
+            .unwrap_or_default();
+        let slug = replacement_slug(request.slug.as_deref(), &title, replacement)?;
         let published = observed_instant()?;
         let published_at = format_instant(published)?;
         let retention = retention(&request.retention, published)?;
+        let warnings = publish_warnings(&mut source)?;
         let filesystem_capacity = filesystem_capacity(self.catalogue.root())?;
         let operation_id = allocate_id(connection, "operation_intents")?;
-        let artifact_id = allocate_id(connection, "artifacts")?;
+        let artifact_id = match replacement {
+            Some(replacement) => replacement.artifact.id.clone(),
+            None => allocate_id(connection, "artifacts")?,
+        };
         let revision_id = allocate_id(connection, "revisions")?;
         let artifact = self.artifact_representation(NewArtifact {
             artifact_id: &artifact_id,
@@ -547,29 +689,35 @@ impl ArtifactService {
             slug: &slug,
             project,
             retention,
-            logical_bytes: source.size(),
+            files: source.files(),
+            logical_bytes: source.logical_bytes(),
             published_at: &published_at,
         });
+        let artifact = replacement_artifact_representation(artifact, replacement);
         let revision = self.revision_representation(NewRevision {
             revision_id: &revision_id,
             artifact_id: &artifact_id,
             entry_path: &entry_path,
             entry_media_type: &entry_media_type,
-            logical_bytes: source.size(),
+            files: source.files(),
+            logical_bytes: source.logical_bytes(),
             manifest_digest: "",
             published_at: &published_at,
         });
+        let replacement_intent = replacement.map(replacement_intent);
         let intent = PublishIntent {
-            protocol: "publish_single_file_v1".into(),
+            protocol: "publish_artifact_v2".into(),
             operation_id: operation_id.clone(),
             phase: PublishPhase::IntentRecorded,
             artifact,
             revision,
             payload_digest: None,
             source_snapshot_digest: source.snapshot_digest(),
-            capacity_reservation_bytes: source.size(),
+            capacity_reservation_bytes: source.logical_bytes(),
             idempotency_key: idempotency_key.to_owned(),
             fingerprint: fingerprint.to_owned(),
+            warnings,
+            replacement: replacement_intent,
         };
         record_publish_intent(
             connection,
@@ -578,12 +726,17 @@ impl ArtifactService {
                 idempotency_key,
                 fingerprint,
                 project_id: &request.project_id,
-                required_bytes: source.size(),
+                required_bytes: source.logical_bytes(),
                 capacity: CapacityPolicy {
                     max_stored_bytes: self.max_stored_bytes,
                     max_live_artifacts: self.max_live_artifacts,
                     filesystem_available_bytes: filesystem_capacity.0,
                     reserve_bytes: filesystem_capacity.1,
+                },
+                kind: if replacement.is_some() {
+                    ReservationKind::Replace
+                } else {
+                    ReservationKind::Publish
                 },
             },
         )?;
@@ -610,7 +763,7 @@ impl ArtifactService {
         mut prepared: PreparedPublish,
         idempotency_key: &str,
     ) -> Result<PublishOutcome, AppError> {
-        let staged = match self.storage.stage_single_file(
+        let staged = match self.storage.stage_source(
             &mut prepared.source,
             StageRequest {
                 operation_id: &prepared.operation_id,
@@ -686,29 +839,92 @@ impl ArtifactService {
         Ok(artifact)
     }
 
-    pub(crate) fn list_revisions(&self, artifact_id: &str) -> Result<RevisionList, AppError> {
+    pub(crate) fn list_revisions(
+        &self,
+        artifact_id: &str,
+        query: &ListRevisionsQuery,
+    ) -> Result<RevisionList, AppError> {
         self.show_artifact(artifact_id)?;
         let connection = self.catalogue.connection()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT id,artifact_id,state,entry_path,entry_media_type,files,logical_bytes,manifest_digest,published_at
-                 FROM revisions WHERE artifact_id=?1 ORDER BY published_at DESC,id ASC",
+        let normalized = normalize_revision_list(&connection, artifact_id, query)?;
+        let availability = normalized.availability.as_str();
+        let order = normalized.order.as_str();
+        let direction = normalized.direction;
+        let limit = normalized.limit;
+        let cursor = normalized.cursor;
+        let boundary_value = cursor.as_ref().map(|cursor| cursor.last_value.as_str());
+        let boundary_id = cursor.as_ref().map(|cursor| cursor.last_id.as_str());
+        let value_expression = if order == "superseded" {
+            "coalesce(superseded_at,published_at)"
+        } else {
+            "published_at"
+        };
+        let comparison = match direction {
+            ListDirection::Asc => ">",
+            ListDirection::Desc => "<",
+        };
+        let ordering = match direction {
+            ListDirection::Asc => "ASC",
+            ListDirection::Desc => "DESC",
+        };
+        let sql = format!(
+            "SELECT id,artifact_id,state,entry_path,entry_media_type,files,logical_bytes,
+                    manifest_digest,published_at,superseded_at
+             FROM revisions
+             WHERE artifact_id=?1
+               AND (?2='all' OR state=?2)
+               AND (?3 IS NULL OR {value_expression} {comparison} ?3
+                    OR ({value_expression}=?3 AND id>?4))
+             ORDER BY {value_expression} {ordering},id ASC LIMIT ?5"
+        );
+        let mut statement = connection.prepare(&sql).map_err(database_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    artifact_id,
+                    availability,
+                    boundary_value,
+                    boundary_id,
+                    limit + 1
+                ],
+                |row| revision_from_row(row, &self.canonical_origin),
             )
             .map_err(database_error)?;
-        let rows = statement
-            .query_map([artifact_id], |row| {
-                revision_from_row(row, &self.canonical_origin)
-            })
-            .map_err(database_error)?;
-        let items = rows
+        let mut items = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
+        let has_more = items.len() > usize::from(limit);
+        if has_more {
+            items.truncate(usize::from(limit));
+        }
+        let next_cursor = if has_more {
+            let last = items
+                .last()
+                .ok_or_else(|| AppError::internal("Revision page boundary is missing"))?;
+            Some(cursor::encode(
+                &connection,
+                &RevisionCursor {
+                    endpoint: format!("artifact-revisions:{artifact_id}"),
+                    artifact_id: artifact_id.to_owned(),
+                    availability: availability.to_owned(),
+                    order: order.to_owned(),
+                    direction,
+                    last_value: revision_order_value(last, order).to_owned(),
+                    last_id: last.id.clone(),
+                    expires_at_ms: (OffsetDateTime::now_utc() + Duration::minutes(15))
+                        .unix_timestamp_nanos()
+                        / 1_000_000,
+                },
+            )?)
+        } else {
+            None
+        };
         Ok(RevisionList {
             items,
             page: ArtifactPage {
-                limit: 200,
-                next_cursor: None,
-                has_more: false,
+                limit,
+                next_cursor,
+                has_more,
             },
         })
     }
@@ -838,7 +1054,7 @@ impl ArtifactService {
         let connection = self.catalogue.connection()?;
         let record = connection
             .query_row(
-                "SELECT a.slug || '~' || a.id, r.id, r.entry_path, r.entry_media_type
+                "SELECT a.slug || '~' || a.id, r.id, r.entry_path, r.entry_media_type, r.manifest_digest
                  FROM artifacts a
                  JOIN revisions r ON r.id = a.current_revision_id
                  WHERE a.id=?1 AND a.state='live' AND r.state IN ('current','superseded')",
@@ -849,6 +1065,7 @@ impl ArtifactService {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -857,13 +1074,13 @@ impl ArtifactService {
         let Some(record) = record else {
             return Err(artifact_serving_absence(&connection, id)?);
         };
-        if requested_member.is_some_and(|member| member != record.2) {
-            return Err(AppError::not_found("Artifact member does not exist"));
-        }
-        let bytes = self.storage.read_revision_member(&record.1, &record.2)?;
+        let member = requested_member.unwrap_or(&record.2);
+        let bytes = self
+            .storage
+            .read_revision_member(&record.1, member, &record.4)?;
         Ok(ServedRevision {
             bytes,
-            media_type: record.3,
+            media_type: member_media_type(member, &record.2, &record.3),
             artifact_key: Some(record.0),
         })
     }
@@ -877,22 +1094,27 @@ impl ArtifactService {
         let connection = self.catalogue.connection()?;
         let record = connection
             .query_row(
-                "SELECT entry_path, entry_media_type FROM revisions WHERE id=?1 AND state IN ('current','superseded')",
+                "SELECT entry_path,entry_media_type,manifest_digest
+                 FROM revisions WHERE id=?1 AND state IN ('current','superseded')",
                 [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(database_error)?;
         let Some(record) = record else {
             return Err(revision_serving_absence(&connection, id)?);
         };
-        if requested_member.is_some_and(|member| member != record.0) {
-            return Err(AppError::not_found("Revision member does not exist"));
-        }
-        let bytes = self.storage.read_revision_member(id, &record.0)?;
+        let member = requested_member.unwrap_or(&record.0);
+        let bytes = self.storage.read_revision_member(id, member, &record.2)?;
         Ok(ServedRevision {
             bytes,
-            media_type: record.1,
+            media_type: member_media_type(member, &record.0, &record.1),
             artifact_key: None,
         })
     }
@@ -915,7 +1137,7 @@ impl ArtifactService {
             project: input.project,
             current_revision_id: input.revision_id.to_owned(),
             retention: input.retention,
-            files: 1,
+            files: input.files,
             logical_bytes: input.logical_bytes,
             revision_count: 1,
             published_at: input.published_at.to_owned(),
@@ -936,10 +1158,11 @@ impl ArtifactService {
             state: "current".into(),
             entry_path: input.entry_path.to_owned(),
             entry_media_type: input.entry_media_type.to_owned(),
-            files: 1,
+            files: input.files,
             logical_bytes: input.logical_bytes,
             manifest_digest: input.manifest_digest.to_owned(),
             published_at: input.published_at.to_owned(),
+            superseded_at: None,
             api_url: format!(
                 "{}api/v1/revisions/{}",
                 self.canonical_origin, input.revision_id
@@ -1027,6 +1250,51 @@ impl PublishArtifactRequest {
     }
 }
 
+impl ReplaceArtifactRequest {
+    pub(crate) fn new(source_path: String, caller_working_directory: String) -> Self {
+        Self {
+            source: PublishSource {
+                path: source_path,
+                caller_working_directory,
+            },
+            entry: None,
+            title: None,
+            description: None,
+            slug: None,
+            retention: None,
+        }
+    }
+
+    pub(crate) fn with_entry(mut self, entry: Option<String>) -> Self {
+        self.entry = entry;
+        self
+    }
+
+    pub(crate) fn with_metadata(
+        mut self,
+        title: Option<String>,
+        description: Option<String>,
+        slug: Option<String>,
+    ) -> Self {
+        self.title = title;
+        self.description = description;
+        self.slug = slug;
+        self
+    }
+
+    pub(crate) fn with_retention(
+        mut self,
+        retention: Option<(RetentionMode, Option<u64>, Option<String>)>,
+    ) -> Self {
+        self.retention = retention.map(|(mode, ttl_ms, pin_reason)| PublishRetention {
+            mode,
+            ttl_ms,
+            pin_reason,
+        });
+        self
+    }
+}
+
 impl ListArtifactsQuery {
     pub(crate) fn next_link(
         &self,
@@ -1108,6 +1376,47 @@ impl ListArtifactsQuery {
     }
 }
 
+impl RevisionList {
+    pub(crate) fn items(&self) -> &[Revision] {
+        &self.items
+    }
+
+    pub(crate) fn next_cursor(&self) -> Option<&str> {
+        self.page.next_cursor.as_deref()
+    }
+}
+
+impl ListRevisionsQuery {
+    pub(crate) fn next_link(
+        &self,
+        canonical_origin: &str,
+        artifact_id: &str,
+        cursor: &str,
+    ) -> Result<String, AppError> {
+        let mut url = url::Url::parse(&format!(
+            "{canonical_origin}api/v1/artifacts/{artifact_id}/revisions"
+        ))
+        .map_err(|error| AppError::internal(format!("Revision list URL is invalid: {error}")))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (name, value) in [
+                ("availability", self.availability.as_deref()),
+                ("order", self.order.as_deref()),
+                ("direction", self.direction.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    pairs.append_pair(name, value);
+                }
+            }
+            if let Some(limit) = self.limit {
+                pairs.append_pair("limit", &limit.to_string());
+            }
+            pairs.append_pair("after", cursor);
+        }
+        Ok(url.into())
+    }
+}
+
 impl ArtifactList {
     pub(crate) fn empty(limit: u16) -> Self {
         Self {
@@ -1126,6 +1435,32 @@ impl ArtifactList {
 
     pub(crate) fn next_cursor(&self) -> Option<&str> {
         self.page.next_cursor.as_deref()
+    }
+}
+
+impl Revision {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn state(&self) -> &str {
+        &self.state
+    }
+
+    pub(crate) fn open_url(&self) -> &str {
+        &self.open_url
+    }
+
+    pub(crate) fn files(&self) -> u64 {
+        self.files
+    }
+
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    pub(crate) fn published_at(&self) -> &str {
+        &self.published_at
     }
 }
 
@@ -1199,19 +1534,13 @@ impl Artifact {
     }
 }
 
-impl Revision {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub(crate) fn open_url(&self) -> &str {
-        &self.open_url
-    }
-}
-
 impl PublishOutcome {
     pub(crate) const fn result(&self) -> &PublishResult {
         &self.result
+    }
+
+    pub(crate) fn is_replacement(&self) -> bool {
+        self.result.operation == "replace"
     }
 
     pub(crate) const fn replayed(&self) -> bool {
@@ -1348,7 +1677,8 @@ fn revision_by_id(
 ) -> Result<Option<Revision>, AppError> {
     connection
         .query_row(
-            "SELECT id,artifact_id,state,entry_path,entry_media_type,files,logical_bytes,manifest_digest,published_at FROM revisions WHERE id=?1",
+            "SELECT id,artifact_id,state,entry_path,entry_media_type,files,logical_bytes,manifest_digest,published_at,superseded_at
+             FROM revisions WHERE id=?1",
             [id],
             |row| revision_from_row(row, canonical_origin),
         )
@@ -1374,6 +1704,7 @@ fn revision_from_row(
         logical_bytes: row.get(6)?,
         manifest_digest: row.get(7)?,
         published_at: row.get(8)?,
+        superseded_at: row.get(9)?,
     })
 }
 
@@ -1381,8 +1712,10 @@ fn decode_recovery_intent(operation_id: &str, encoded: &str) -> Result<PublishIn
     let intent: PublishIntent = serde_json::from_str(encoded).map_err(|error| {
         AppError::internal(format!("interrupted Publish intent is invalid: {error}"))
     })?;
-    if intent.protocol != "publish_single_file_v1"
-        || intent.operation_id != operation_id
+    if !matches!(
+        intent.protocol.as_str(),
+        "publish_single_file_v1" | "publish_artifact_v2"
+    ) || intent.operation_id != operation_id
         || !valid_sha256_digest(&intent.source_snapshot_digest)
     {
         return Err(AppError::internal(
@@ -1496,7 +1829,7 @@ fn resumable_publish(
         ));
     }
     let normalized_source = normalized_source_selection(&request.source.path)?;
-    let source = open_regular_file(Path::new(&normalized_source), "Artifact source")?;
+    let source = ArtifactSource::open(Path::new(&normalized_source))?;
     if source.snapshot_digest() != intent.source_snapshot_digest {
         let error = AppError::source_changed();
         fail_publish_intent(
@@ -1508,9 +1841,10 @@ fn resumable_publish(
         )?;
         return Err(error);
     }
-    let entry_path = safe_entry_name(&source)?.to_owned();
+    let entry_path = source.entry_path(request.entry.as_deref())?;
     if entry_path != intent.revision.entry_path
-        || source.size() != intent.revision.logical_bytes
+        || source.logical_bytes() != intent.revision.logical_bytes
+        || source.files() != intent.revision.files
         || entry_media_type(&entry_path)? != intent.revision.entry_media_type
     {
         let error = AppError::source_changed();
@@ -1539,6 +1873,7 @@ fn completed_publish(
     connection: &Connection,
     key: &str,
     fingerprint: &str,
+    in_progress_is_none: bool,
 ) -> Result<Option<PublishOutcome>, AppError> {
     let stored = connection
         .query_row(
@@ -1573,6 +1908,9 @@ fn completed_publish(
         return Err(AppError::from_stored(stored));
     }
     if state != "completed" {
+        if in_progress_is_none {
+            return Ok(None);
+        }
         return Err(AppError::retryable_conflict(
             "idempotency_in_progress",
             "an identical Artifact Publish is already in progress",
@@ -1590,6 +1928,7 @@ fn completed_publish(
     }))
 }
 
+#[cfg(feature = "test-faults")]
 fn publish_test_hold_after_intent() -> Result<(), AppError> {
     let Some(value) = std::env::var_os("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS") else {
         return Ok(());
@@ -1603,6 +1942,12 @@ fn publish_test_hold_after_intent() -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(not(feature = "test-faults"))]
+fn publish_test_hold_after_intent() -> Result<(), AppError> {
+    Ok(())
+}
+
+#[cfg(feature = "test-faults")]
 fn publish_fault(variable: &str, phase: &str) -> Result<(), AppError> {
     if std::env::var_os(variable).is_some() {
         Err(AppError::internal(format!(
@@ -1611,6 +1956,11 @@ fn publish_fault(variable: &str, phase: &str) -> Result<(), AppError> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(not(feature = "test-faults"))]
+fn publish_fault(_variable: &str, _phase: &str) -> Result<(), AppError> {
+    Ok(())
 }
 
 fn filesystem_capacity(root: &Path) -> Result<(u64, u64), AppError> {
@@ -1626,6 +1976,7 @@ fn check_capacity(
     transaction: &Transaction<'_>,
     required_bytes: u64,
     policy: CapacityPolicy,
+    kind: ReservationKind,
 ) -> Result<(), AppError> {
     let live_artifacts: u64 = transaction
         .query_row(
@@ -1638,7 +1989,8 @@ fn check_capacity(
         .query_row(
             "SELECT count(*) FROM operation_intents
              WHERE kind='artifact_publish'
-               AND state IN ('intent_recorded','awaiting_retry','staged','renamed')",
+               AND state IN ('intent_recorded','awaiting_retry','staged','renamed')
+               AND json_extract(details_json,'$.replacement') IS NULL",
             [],
             |row| row.get(0),
         )
@@ -1679,7 +2031,7 @@ fn check_capacity(
     let projected_stored_bytes = accounted_stored_bytes.saturating_add(required_bytes);
     let projected_live_artifacts = live_artifacts
         .saturating_add(pending_artifacts)
-        .saturating_add(1);
+        .saturating_add(u64::from(matches!(kind, ReservationKind::Publish)));
     let stored_blocked =
         policy.max_stored_bytes != 0 && projected_stored_bytes > policy.max_stored_bytes;
     let live_blocked =
@@ -1724,6 +2076,7 @@ fn record_publish_intent(
         &transaction,
         reservation.required_bytes,
         reservation.capacity,
+        reservation.kind,
     )?;
     transaction
         .execute(
@@ -1781,9 +2134,14 @@ fn commit_publish_visibility(
     idempotency_key: &str,
 ) -> Result<PublishOutcome, AppError> {
     let result = PublishResult {
-        operation: "publish".into(),
+        operation: if intent.replacement.is_some() {
+            "replace".into()
+        } else {
+            "publish".into()
+        },
         artifact: intent.artifact.clone(),
         revision: intent.revision.clone(),
+        warnings: intent.warnings.clone(),
     };
     let response_json = serde_json::to_string(&result)
         .map_err(|error| AppError::internal(format!("cannot store Publish result: {error}")))?;
@@ -1791,30 +2149,19 @@ fn commit_publish_visibility(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
     require_live_project(&transaction, &intent.artifact.project.id)?;
-    insert_artifact(&transaction, &intent.artifact)?;
-    insert_revision(&transaction, &intent.revision)?;
-    transaction
-        .execute(
-            "UPDATE artifacts SET current_revision_id=?2 WHERE id=?1 AND current_revision_id IS NULL",
-            params![intent.artifact.id, intent.revision.id],
-        )
-        .map_err(database_error)?;
-    transaction
-        .execute(
-            "INSERT INTO audit_events(kind,details_json,at,actor,cause,resource_type,resource_id)
-             VALUES ('artifact_published',?1,?2,'operator','publish','artifact',?3)",
-            params![
-                serde_json::json!({
-                    "artifactId": intent.artifact.id,
-                    "revisionId": intent.revision.id,
-                    "logicalBytes": intent.artifact.logical_bytes
-                })
-                .to_string(),
-                intent.artifact.published_at,
-                intent.artifact.id,
-            ],
-        )
-        .map_err(database_error)?;
+    if let Some(replacement) = intent.replacement.as_ref() {
+        commit_replacement(&transaction, intent, replacement)?;
+    } else {
+        insert_artifact(&transaction, &intent.artifact)?;
+        insert_revision(&transaction, &intent.revision)?;
+        transaction
+            .execute(
+                "UPDATE artifacts SET current_revision_id=?2 WHERE id=?1 AND current_revision_id IS NULL",
+                params![intent.artifact.id, intent.revision.id],
+            )
+            .map_err(database_error)?;
+    }
+    insert_publish_audit(&transaction, intent)?;
     transaction
         .execute(
             "UPDATE operation_intents SET state='completed',details_json=?2 WHERE id=?1 AND state='renamed'",
@@ -1826,8 +2173,14 @@ fn commit_publish_visibility(
         .map_err(database_error)?;
     transaction
         .execute(
-            "UPDATE idempotency_requests SET state='completed',status_code=201,response_json=?2,etag=?3,completed_at=?4 WHERE key=?1 AND state='in_progress'",
-            params![idempotency_key, response_json, intent.artifact.etag(), intent.artifact.published_at],
+            "UPDATE idempotency_requests SET state='completed',status_code=?2,response_json=?3,etag=?4,completed_at=?5 WHERE key=?1 AND state='in_progress'",
+            params![
+                idempotency_key,
+                if intent.replacement.is_some() { 200 } else { 201 },
+                response_json,
+                intent.artifact.etag(),
+                intent.artifact.published_at
+            ],
         )
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)?;
@@ -1835,6 +2188,101 @@ fn commit_publish_visibility(
         result,
         replayed: false,
     })
+}
+
+fn commit_replacement(
+    transaction: &Transaction<'_>,
+    intent: &PublishIntent,
+    replacement: &ReplacementIntent,
+) -> Result<(), AppError> {
+    let artifact = &intent.artifact;
+    insert_revision(transaction, &intent.revision)?;
+    let changed = transaction
+        .execute(
+            "UPDATE artifacts SET
+               record_version=?2,title=?3,description=?4,slug=?5,title_fold=?6,search_text=?7,
+               current_revision_id=?8,retention_mode=?9,ttl_ms=?10,expires_at=?11,pin_reason=?12,
+               recovery_until=NULL,files=?13,logical_bytes=?14,revision_count=?15,
+               published_at=?16,updated_at=?17
+             WHERE id=?1 AND state='live' AND record_version=?18 AND current_revision_id=?19",
+            params![
+                artifact.id,
+                artifact.record_version,
+                artifact.title,
+                artifact.description,
+                artifact.slug,
+                default_case_fold_str(&artifact.title),
+                default_case_fold_str(&format!(
+                    "{}\n{}\n{}",
+                    artifact.title, artifact.description, artifact.slug
+                )),
+                intent.revision.id,
+                retention_mode(&artifact.retention),
+                artifact.retention.ttl_ms,
+                artifact.retention.expires_at,
+                artifact.retention.pin_reason,
+                artifact.files,
+                artifact.logical_bytes,
+                artifact.revision_count,
+                artifact.published_at,
+                artifact.updated_at,
+                replacement.expected_record_version,
+                replacement.previous_revision_id,
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(AppError::changed_record());
+    }
+    let superseded = transaction
+        .execute(
+            "UPDATE revisions SET state='superseded',superseded_at=?3
+             WHERE id=?1 AND artifact_id=?2 AND state='current'",
+            params![
+                replacement.previous_revision_id,
+                artifact.id,
+                artifact.updated_at
+            ],
+        )
+        .map_err(database_error)?;
+    if superseded != 1 {
+        return Err(AppError::changed_record());
+    }
+    Ok(())
+}
+
+fn insert_publish_audit(
+    transaction: &Transaction<'_>,
+    intent: &PublishIntent,
+) -> Result<(), AppError> {
+    let replacing = intent.replacement.is_some();
+    transaction
+        .execute(
+            "INSERT INTO audit_events(kind,details_json,at,actor,cause,resource_type,resource_id)
+             VALUES (?1,?2,?3,'operator',?4,'artifact',?5)",
+            params![
+                if replacing {
+                    "artifact_replaced"
+                } else {
+                    "artifact_published"
+                },
+                serde_json::json!({
+                    "artifactId": intent.artifact.id,
+                    "revisionId": intent.revision.id,
+                    "previousRevisionId": intent
+                        .replacement
+                        .as_ref()
+                        .map(|replacement| replacement.previous_revision_id.as_str()),
+                    "logicalBytes": intent.artifact.logical_bytes
+                })
+                .to_string(),
+                intent.artifact.published_at,
+                if replacing { "replace" } else { "publish" },
+                intent.artifact.id,
+            ],
+        )
+        .map_err(database_error)?;
+    Ok(())
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &Artifact) -> Result<(), AppError> {
@@ -1941,6 +2389,7 @@ fn staged_intent(mut intent: PublishIntent, staged: &StagedRevision) -> PublishI
     staged
         .entry_media_type()
         .clone_into(&mut intent.revision.entry_media_type);
+    intent.revision.files = staged.files();
     intent.revision.logical_bytes = staged.logical_bytes();
     staged
         .manifest_digest()
@@ -1959,10 +2408,12 @@ fn completed_intent(mut intent: PublishIntent, finalized: &FinalizedRevision) ->
     finalized
         .entry_media_type()
         .clone_into(&mut intent.revision.entry_media_type);
+    intent.revision.files = finalized.files();
     intent.revision.logical_bytes = finalized.logical_bytes();
     finalized
         .manifest_digest()
         .clone_into(&mut intent.revision.manifest_digest);
+    intent.artifact.files = finalized.files();
     intent.artifact.logical_bytes = finalized.logical_bytes();
     intent.payload_digest = Some(finalized.payload_digest().to_owned());
     intent
@@ -2112,6 +2563,96 @@ fn decode_artifact_cursor(
     Ok(Some(cursor))
 }
 
+fn normalize_revision_list(
+    connection: &Connection,
+    artifact_id: &str,
+    query: &ListRevisionsQuery,
+) -> Result<NormalizedRevisionList, AppError> {
+    let availability = query.availability.as_deref().unwrap_or("all");
+    if !matches!(
+        availability,
+        "all" | "current" | "superseded" | "unavailable" | "gone"
+    ) {
+        return Err(AppError::invalid(
+            "invalid_filter",
+            "invalid Revision availability",
+        ));
+    }
+    let order = query.order.as_deref().unwrap_or("published");
+    if !matches!(order, "published" | "superseded") {
+        return Err(AppError::invalid("invalid_order", "invalid Revision order"));
+    }
+    let direction = ListDirection::parse(query.direction.as_deref())?;
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=200).contains(&limit) {
+        return Err(AppError::invalid(
+            "invalid_limit",
+            "limit must be between 1 and 200",
+        ));
+    }
+    let cursor = decode_revision_cursor(
+        connection,
+        artifact_id,
+        query,
+        availability,
+        order,
+        direction,
+    )?;
+    Ok(NormalizedRevisionList {
+        availability: availability.to_owned(),
+        order: order.to_owned(),
+        direction,
+        limit,
+        cursor,
+    })
+}
+
+fn decode_revision_cursor(
+    connection: &Connection,
+    artifact_id: &str,
+    query: &ListRevisionsQuery,
+    availability: &str,
+    order: &str,
+    direction: ListDirection,
+) -> Result<Option<RevisionCursor>, AppError> {
+    let cursor = query
+        .after
+        .as_deref()
+        .map(|token| cursor::decode::<RevisionCursor>(connection, token))
+        .transpose()?;
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let now_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    if cursor.expires_at_ms <= now_ms {
+        return Err(AppError::conflict("cursor_expired", "cursor has expired"));
+    }
+    if cursor.endpoint != format!("artifact-revisions:{artifact_id}")
+        || cursor.artifact_id != artifact_id
+        || cursor.availability != availability
+        || cursor.order != order
+        || cursor.direction != direction
+        || validate_opaque_id(&cursor.last_id).is_err()
+    {
+        return Err(AppError::invalid(
+            "invalid_cursor",
+            "cursor does not match Revision filters or order",
+        ));
+    }
+    Ok(Some(cursor))
+}
+
+fn revision_order_value<'a>(revision: &'a Revision, order: &str) -> &'a str {
+    if order == "superseded" {
+        revision
+            .superseded_at
+            .as_deref()
+            .unwrap_or(&revision.published_at)
+    } else {
+        &revision.published_at
+    }
+}
+
 fn normalized_source_selection(value: &str) -> Result<String, AppError> {
     let path = Path::new(value);
     let mut normalized = PathBuf::from("/");
@@ -2142,8 +2683,12 @@ fn normalized_source_selection(value: &str) -> Result<String, AppError> {
 }
 
 fn validate_publish_paths(request: &PublishArtifactRequest) -> Result<(), AppError> {
-    if !Path::new(&request.source.path).is_absolute()
-        || !Path::new(&request.source.caller_working_directory).is_absolute()
+    validate_source_paths(&request.source)
+}
+
+fn validate_source_paths(source: &PublishSource) -> Result<(), AppError> {
+    if !Path::new(&source.path).is_absolute()
+        || !Path::new(&source.caller_working_directory).is_absolute()
     {
         return Err(AppError::invalid(
             "invalid_source",
@@ -2153,14 +2698,15 @@ fn validate_publish_paths(request: &PublishArtifactRequest) -> Result<(), AppErr
     Ok(())
 }
 
-fn validate_entry_override(entry: Option<&str>, file_name: &str) -> Result<(), AppError> {
-    if entry.is_some_and(|entry| entry != file_name) {
-        return Err(AppError::invalid(
-            "invalid_entry",
-            "a single-file Artifact entry must name the selected source file",
-        ));
+fn member_media_type(member_path: &str, entry_path: &str, entry_media_type: &str) -> String {
+    if member_path == entry_path {
+        entry_media_type.to_owned()
+    } else {
+        mime_guess::from_path(member_path)
+            .first_raw()
+            .unwrap_or("application/octet-stream")
+            .to_owned()
     }
-    Ok(())
 }
 
 fn entry_media_type(entry_path: &str) -> Result<String, AppError> {
@@ -2191,18 +2737,18 @@ fn artifact_title(
     request: &PublishArtifactRequest,
     entry_path: &str,
     media_type: &str,
-    source: &mut crate::safe_file::SafeRegularFile,
+    source: &mut ArtifactSource,
 ) -> Result<String, AppError> {
-    if let Some(title) = request.title.as_deref() {
+    if let Some(title) = request.title.as_deref().or_else(|| source.portable_title()) {
         return validated_title(title);
     }
     if media_type == "text/html" {
-        let prefix = source.read_prefix(1_048_576)?;
+        let prefix = source.read_entry_prefix(entry_path, 1_048_576)?;
         if let Some(title) = html_title(&prefix) {
             return validated_title(&title);
         }
     }
-    validated_title(entry_path)
+    validated_title(source.source_basename().unwrap_or(entry_path))
 }
 
 fn html_title(bytes: &[u8]) -> Option<String> {
@@ -2309,6 +2855,109 @@ fn retention_mode(retention: &Retention) -> &'static str {
         RetentionMode::Ttl => "ttl",
         RetentionMode::Pinned => "pinned",
     }
+}
+
+fn replacement_slug(
+    supplied: Option<&str>,
+    title: &str,
+    replacement: Option<&ReplacementState>,
+) -> Result<String, AppError> {
+    match (replacement, supplied) {
+        (Some(replacement), None) => Ok(replacement.artifact.slug.clone()),
+        (_, supplied) => artifact_slug(supplied, title),
+    }
+}
+
+fn publish_warnings(source: &mut ArtifactSource) -> Result<Vec<PublishWarning>, AppError> {
+    source
+        .warnings()
+        .map(|warnings| warnings.into_iter().map(publish_warning).collect())
+}
+
+fn publish_warning(warning: SourceWarning) -> PublishWarning {
+    PublishWarning {
+        code: warning.code.to_owned(),
+        message: warning.message.to_owned(),
+        member: warning.member,
+    }
+}
+
+fn replacement_artifact_representation(
+    mut artifact: Artifact,
+    replacement: Option<&ReplacementState>,
+) -> Artifact {
+    if let Some(replacement) = replacement {
+        artifact.record_version = replacement.artifact.record_version.saturating_add(1);
+        artifact.revision_count = replacement.artifact.revision_count.saturating_add(1);
+    }
+    artifact
+}
+
+fn replacement_intent(replacement: &ReplacementState) -> ReplacementIntent {
+    ReplacementIntent {
+        previous_revision_id: replacement.artifact.current_revision_id.clone(),
+        expected_record_version: replacement.expected_record_version,
+    }
+}
+
+fn replacement_publish_request(
+    request: &ReplaceArtifactRequest,
+    current: &Artifact,
+) -> PublishArtifactRequest {
+    let retention = request
+        .retention
+        .clone()
+        .unwrap_or_else(|| match current.retention.mode {
+            RetentionMode::Default => PublishRetention::default(),
+            RetentionMode::Ttl => PublishRetention {
+                mode: RetentionMode::Ttl,
+                ttl_ms: current.retention.ttl_ms,
+                pin_reason: None,
+            },
+            RetentionMode::Pinned => PublishRetention {
+                mode: RetentionMode::Pinned,
+                ttl_ms: None,
+                pin_reason: current.retention.pin_reason.clone(),
+            },
+        });
+    PublishArtifactRequest {
+        source: request.source.clone(),
+        project_id: current.project.id.clone(),
+        entry: request.entry.clone(),
+        title: request.title.clone(),
+        description: request.description.clone(),
+        slug: request.slug.clone(),
+        retention,
+    }
+}
+
+fn replacement_fingerprint(
+    artifact_id: &str,
+    request: &ReplaceArtifactRequest,
+    if_match: &str,
+    normalized_source: &str,
+) -> Result<String, AppError> {
+    #[derive(Serialize)]
+    struct Fingerprint<'a> {
+        api_version: u8,
+        method: &'static str,
+        route: String,
+        body: &'a ReplaceArtifactRequest,
+        artifact_id: &'a str,
+        if_match: &'a str,
+        normalized_source: &'a str,
+    }
+    let canonical = serde_jcs::to_vec(&Fingerprint {
+        api_version: 1,
+        method: "POST",
+        route: format!("/api/v1/artifacts/{artifact_id}/replace"),
+        body: request,
+        artifact_id,
+        if_match,
+        normalized_source,
+    })
+    .map_err(|error| AppError::internal(format!("cannot fingerprint replacement: {error}")))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 fn publish_fingerprint(

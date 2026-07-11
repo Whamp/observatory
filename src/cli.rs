@@ -166,6 +166,25 @@ pub async fn delete<T: Serialize>(
     emit_response(response, json_output, Some(mutation.idempotency_key)).await
 }
 
+pub async fn post_existing<T: Serialize>(
+    server_override: Option<String>,
+    timeout_override_ms: Option<u64>,
+    mutation: ExistingResourceMutation<'_, T>,
+    json_output: bool,
+) -> Result<(), AppError> {
+    let (client, server) = client(server_override, timeout_override_ms)?;
+    let response = client
+        .post(endpoint(&server, mutation.path))
+        .header("accept", "application/json")
+        .header("if-match", mutation.if_match)
+        .header("idempotency-key", mutation.idempotency_key)
+        .json(mutation.body)
+        .send()
+        .await
+        .map_err(|error| request_error(&error, Some(mutation.idempotency_key)))?;
+    emit_response(response, json_output, Some(mutation.idempotency_key)).await
+}
+
 pub async fn post<T: Serialize>(
     server_override: Option<String>,
     timeout_override_ms: Option<u64>,

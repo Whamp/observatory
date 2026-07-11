@@ -1,4 +1,4 @@
-use crate::artifact::{Artifact, ArtifactList, Revision};
+use crate::artifact::{Artifact, ArtifactList, Revision, RevisionList};
 use crate::project::{Project, ProjectList, ProjectTombstonePreview};
 
 pub fn index(projects: &ProjectList, build_id: &str, query: &str) -> String {
@@ -106,11 +106,19 @@ pub fn project_detail(
             body.push_str(&text_escape(artifact.current_revision_id()));
             body.push_str("</code></dd></div><div><dt>Size</dt><dd>");
             body.push_str(&artifact.files().to_string());
-            body.push_str(" file · ");
+            body.push_str(if artifact.files() == 1 {
+                " file · "
+            } else {
+                " files · "
+            });
             body.push_str(&artifact.logical_bytes().to_string());
             body.push_str(" logical bytes · ");
             body.push_str(&artifact.revision_count().to_string());
-            body.push_str(" Revision");
+            body.push_str(if artifact.revision_count() == 1 {
+                " Revision"
+            } else {
+                " Revisions"
+            });
             body.push_str("</dd></div><div><dt>Published</dt><dd>");
             body.push_str(&text_escape(artifact.published_at()));
             body.push_str("</dd></div>");
@@ -131,7 +139,12 @@ pub fn project_detail(
     shell(project.title(), &body, build_id)
 }
 
-pub fn artifact_detail(artifact: &Artifact, revision: &Revision, build_id: &str) -> String {
+pub fn artifact_detail(
+    artifact: &Artifact,
+    revision: &Revision,
+    history: &RevisionList,
+    build_id: &str,
+) -> String {
     let mut body = String::new();
     body.push_str("<nav><a href=\"");
     body.push_str(&attribute_escape(&format!(
@@ -175,7 +188,29 @@ pub fn artifact_detail(artifact: &Artifact, revision: &Revision, build_id: &str)
         body.push_str(&text_escape(reason));
         body.push_str("</dd></div>");
     }
-    body.push_str("</dl>");
+    body.push_str("</dl><section aria-labelledby=\"revision-history-title\"><div class=\"section-heading\"><h2 id=\"revision-history-title\">Revision history</h2><span>");
+    body.push_str(&history.items().len().to_string());
+    body.push_str(" immutable states</span></div><ol class=\"entry-list\">");
+    for item in history.items() {
+        body.push_str("<li><article><div><p class=\"entry-kind\">Revision · ");
+        body.push_str(&text_escape(item.state()));
+        body.push_str("</p><h3><code>");
+        body.push_str(&text_escape(item.id()));
+        body.push_str("</code></h3><p>");
+        body.push_str(&item.files().to_string());
+        body.push_str(if item.files() == 1 {
+            " file · "
+        } else {
+            " files · "
+        });
+        body.push_str(&item.logical_bytes().to_string());
+        body.push_str(" logical bytes · ");
+        body.push_str(&text_escape(item.published_at()));
+        body.push_str("</p></div><div class=\"entry-actions\"><a href=\"");
+        body.push_str(&attribute_escape(item.open_url()));
+        body.push_str("\">Open immutable</a></div></article></li>");
+    }
+    body.push_str("</ol></section>");
     shell(artifact.title(), &body, build_id)
 }
 

@@ -14,6 +14,7 @@
 #![deny(clippy::all, clippy::correctness, clippy::suspicious)]
 
 mod artifact;
+mod artifact_source;
 mod artifact_storage;
 mod catalogue;
 mod cli;
@@ -39,7 +40,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use artifact::{PublishArtifactRequest, RetentionMode};
+use artifact::{PublishArtifactRequest, ReplaceArtifactRequest, RetentionMode};
 use config::ServeOverrides;
 use error::AppError;
 use project::{RegisterProjectRequest, TombstoneProjectRequest, UpdateProjectRequest};
@@ -169,6 +170,13 @@ struct ArtifactCommand {
 #[derive(Debug, Subcommand)]
 enum ArtifactLeaf {
     Publish(ArtifactPublishCommand),
+    Replace {
+        artifact: String,
+        #[command(flatten)]
+        publish: ArtifactPublishCommand,
+        #[arg(long)]
+        record_version: Option<u64>,
+    },
     List(ArtifactListCommand),
     Show {
         selector: String,
@@ -387,6 +395,11 @@ async fn run_artifact(
 ) -> Result<(), AppError> {
     match command.command {
         ArtifactLeaf::Publish(publish) => run_artifact_publish(context, publish).await,
+        ArtifactLeaf::Replace {
+            artifact,
+            publish,
+            record_version,
+        } => run_artifact_replace(context, &artifact, publish, record_version).await,
         ArtifactLeaf::List(list) => run_artifact_list(context, list).await,
         ArtifactLeaf::Show {
             selector,
@@ -432,6 +445,58 @@ async fn run_artifact_publish(
         "/api/v1/artifacts",
         &idempotency_key,
         &request,
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_artifact_replace(
+    context: ProjectClientContext,
+    selector: &str,
+    command: ArtifactPublishCommand,
+    record_version: Option<u64>,
+) -> Result<(), AppError> {
+    let idempotency_key = mutation_idempotency_key(context.idempotency_key)?;
+    let artifact_id = artifact_selector_id(selector)?;
+    let caller_working_directory = absolute_project_selection(None)?;
+    let source_path = absolute_source_selection(command.source)?;
+    if command.reason.is_some() && !command.pin {
+        return Err(AppError::invalid(
+            "invalid_retention",
+            "--reason requires --pin",
+        ));
+    }
+    let retention = if command.pin {
+        Some((RetentionMode::Pinned, None, command.reason))
+    } else {
+        command.ttl.map(|ttl| (RetentionMode::Ttl, Some(ttl), None))
+    };
+    let request = ReplaceArtifactRequest::new(source_path, caller_working_directory)
+        .with_entry(command.entry)
+        .with_metadata(command.title, command.description, command.slug)
+        .with_retention(retention);
+    let path = format!("/api/v1/artifacts/{artifact_id}/replace");
+    let if_match = match record_version {
+        Some(version) if version > 0 => format!("\"rv-{version}\""),
+        Some(_) => {
+            return Err(AppError::invalid(
+                "invalid_record_version",
+                "--record-version must be positive",
+            ));
+        }
+        None => cli::fetch_resource(
+            context.client.server.clone(),
+            context.client.timeout,
+            &format!("/api/v1/artifacts/{artifact_id}"),
+        )
+        .await?
+        .etag()
+        .to_owned(),
+    };
+    cli::post_existing(
+        context.client.server,
+        context.client.timeout,
+        cli::ExistingResourceMutation::new(&path, &if_match, &idempotency_key, &request),
         context.client.json,
     )
     .await
@@ -485,19 +550,25 @@ async fn run_artifact_show(
     selector: &str,
     revisions: bool,
 ) -> Result<(), AppError> {
-    let id = selector.rsplit_once('~').map_or(selector, |(_, id)| id);
-    if !is_project_id(id) {
-        return Err(AppError::invalid(
-            "invalid_artifact_id",
-            "Artifact selector must be an opaque ID or Artifact key",
-        ));
-    }
+    let id = artifact_selector_id(selector)?;
     let path = if revisions {
         format!("/api/v1/artifacts/{id}/revisions")
     } else {
         format!("/api/v1/artifacts/{id}")
     };
     cli::get(client.server, client.timeout, &path, client.json).await
+}
+
+fn artifact_selector_id(selector: &str) -> Result<&str, AppError> {
+    let id = selector.rsplit_once('~').map_or(selector, |(_, id)| id);
+    if is_project_id(id) {
+        Ok(id)
+    } else {
+        Err(AppError::invalid(
+            "invalid_artifact_id",
+            "Artifact selector must be an opaque ID or Artifact key",
+        ))
+    }
 }
 
 async fn run_project_list(
