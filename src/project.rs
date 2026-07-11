@@ -5,24 +5,18 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crate::catalogue::Catalogue;
+use crate::crypto::random_opaque_id;
+use crate::cursor;
+use crate::error::AppError;
+use crate::route_slug;
+use crate::safe_file::open_directory;
 use caseless::default_case_fold_str;
-use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime};
-use unicode_normalization::UnicodeNormalization;
-use unicode_normalization::char::is_combining_mark;
-
-use crate::catalogue::Catalogue;
-use crate::crypto::random_opaque_id;
-use crate::error::AppError;
-use crate::safe_file::open_directory;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug)]
 pub struct ProjectService {
@@ -761,10 +755,10 @@ impl ProjectService {
         scoped_project_id: Option<String>,
     ) -> Result<Ledger, AppError> {
         let limit = validate_limit(query.limit)?;
-        if query.after.is_some() {
+        if query.after.is_some() && query.kind.as_deref() == Some("service") {
             return Err(AppError::invalid(
                 "invalid_cursor",
-                "empty ledger has no valid continuation cursor",
+                "Service-only ledger has no valid continuation cursor",
             ));
         }
         if !matches!(
@@ -1021,42 +1015,12 @@ fn validate_project_id(id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn encode_cursor(connection: &Connection, cursor: &ProjectCursor) -> Result<String, AppError> {
-    let payload = serde_jcs::to_vec(&cursor)
-        .map_err(|error| AppError::internal(format!("cannot encode cursor: {error}")))?;
-    let secret = cursor_secret(connection)?;
-    let mut mac = HmacSha256::new_from_slice(&secret)
-        .map_err(|_| AppError::internal("cursor secret is invalid"))?;
-    mac.update(&payload);
-    let signature = mac.finalize().into_bytes();
-    Ok(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(payload),
-        URL_SAFE_NO_PAD.encode(signature)
-    ))
+fn encode_cursor(connection: &Connection, value: &ProjectCursor) -> Result<String, AppError> {
+    cursor::encode(connection, value)
 }
 
 fn decode_cursor(connection: &Connection, token: &str) -> Result<ProjectCursor, AppError> {
-    let Some((payload, signature)) = token.split_once('.') else {
-        return Err(AppError::invalid("invalid_cursor", "cursor is malformed"));
-    };
-    if signature.contains('.') {
-        return Err(AppError::invalid("invalid_cursor", "cursor is malformed"));
-    }
-    let payload = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| AppError::invalid("invalid_cursor", "cursor is malformed"))?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(signature)
-        .map_err(|_| AppError::invalid("invalid_cursor", "cursor is malformed"))?;
-    let secret = cursor_secret(connection)?;
-    let mut mac = HmacSha256::new_from_slice(&secret)
-        .map_err(|_| AppError::internal("cursor secret is invalid"))?;
-    mac.update(&payload);
-    mac.verify_slice(&signature)
-        .map_err(|_| AppError::invalid("invalid_cursor", "cursor signature is invalid"))?;
-    let cursor: ProjectCursor = serde_json::from_slice(&payload)
-        .map_err(|_| AppError::invalid("invalid_cursor", "cursor payload is invalid"))?;
+    let cursor: ProjectCursor = cursor::decode(connection, token)?;
     let now_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
     if cursor.expires_at_ms <= now_ms {
         return Err(AppError::conflict("cursor_expired", "cursor has expired"));
@@ -1064,20 +1028,6 @@ fn decode_cursor(connection: &Connection, token: &str) -> Result<ProjectCursor, 
     validate_project_id(&cursor.last_id)
         .map_err(|_| AppError::invalid("invalid_cursor", "cursor boundary is invalid"))?;
     Ok(cursor)
-}
-
-fn cursor_secret(connection: &Connection) -> Result<Vec<u8>, AppError> {
-    let secret = connection
-        .query_row(
-            "SELECT value FROM system_state WHERE key='cursor_secret'",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .map_err(database_error)?;
-    if secret.len() != 32 {
-        return Err(AppError::internal("cursor secret has an invalid length"));
-    }
-    Ok(secret)
 }
 
 fn project_next_link(
@@ -1318,7 +1268,7 @@ fn record_project_update(
 
 fn project_slug(slug: Option<&str>, title: &str) -> Result<String, AppError> {
     let supplied = slug.is_some();
-    let normalized = normalize_slug(slug.unwrap_or(title));
+    let normalized = route_slug::normalize(slug.unwrap_or(title));
     if normalized.is_empty() && supplied {
         return Err(AppError::invalid(
             "invalid_project_slug",
@@ -1330,35 +1280,6 @@ fn project_slug(slug: Option<&str>, title: &str) -> Result<String, AppError> {
     } else {
         normalized
     })
-}
-
-fn normalize_slug(value: &str) -> String {
-    let mut slug = String::new();
-    let mut separator = false;
-    for character in value
-        .nfkd()
-        .filter(|character| character.is_ascii() && !is_combining_mark(*character))
-    {
-        append_slug_character(&mut slug, &mut separator, character);
-    }
-    slug
-}
-
-fn append_slug_character(slug: &mut String, separator: &mut bool, character: char) {
-    if !character.is_ascii_alphanumeric() {
-        *separator = true;
-        return;
-    }
-    if *separator && !slug.is_empty() {
-        if slug.len() >= 47 {
-            return;
-        }
-        slug.push('-');
-    }
-    *separator = false;
-    if slug.len() < 48 {
-        slug.push(character.to_ascii_lowercase());
-    }
 }
 
 fn registration_fingerprint(

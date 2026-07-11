@@ -24,7 +24,7 @@ pub async fn serve(overrides: ServeOverrides) -> Result<(), AppError> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|error| AppError::unavailable_with(format!("cannot bind {address}: {error}")))?;
-    let state = ApplicationState::new(configuration, catalogue.clone());
+    let state = ApplicationState::new(configuration, catalogue.clone())?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await

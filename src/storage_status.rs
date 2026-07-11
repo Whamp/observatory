@@ -10,10 +10,8 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
+use crate::catalogue::{APPLICATION_ID, SCHEMA_VERSION};
 use crate::error::AppError;
-
-const APPLICATION_ID: i64 = 0x4f42_5356;
-const SCHEMA_VERSION: i64 = 3;
 const RESERVED_BYTES: u64 = 1_073_741_824;
 const BTRFS_MAGIC: i64 = 0x9123_683e;
 const EXT_MAGIC: i64 = 0xef53;
@@ -245,17 +243,33 @@ impl Inspection<'_> {
     }
 
     fn inspect_operations(&mut self) -> Result<(), AppError> {
+        let awaiting_retry = query_count(
+            &self.connection,
+            "SELECT count(*) FROM operation_intents WHERE state='awaiting_retry'",
+        )?;
         let interrupted = query_count(
             &self.connection,
-            "SELECT count(*) FROM operation_intents WHERE state NOT IN ('completed','cancelled','failed_terminal')",
+            "SELECT count(*) FROM operation_intents
+             WHERE state NOT IN ('completed','cancelled','failed_terminal','awaiting_retry')",
         )?;
         self.record(if interrupted == 0 {
             CheckSpec::pass(
                 "storage.intents",
-                "terminal",
+                if awaiting_retry == 0 {
+                    "terminal"
+                } else {
+                    "awaiting_retry"
+                },
                 "operation_interrupted",
-                "operation intents were classified",
-                json!({ "nonterminal": interrupted }),
+                if awaiting_retry == 0 {
+                    "operation intents were classified"
+                } else {
+                    "accepted Publish intents await identical caller retry"
+                },
+                json!({
+                    "nonterminal": awaiting_retry,
+                    "awaitingRetry": awaiting_retry
+                }),
             )
         } else {
             CheckSpec::fail(
@@ -263,7 +277,11 @@ impl Inspection<'_> {
                 "interrupted_ambiguous",
                 "operation_interrupted",
                 "operation intents include unsupported interrupted work",
-                json!({ "nonterminal": interrupted }),
+                json!({
+                    "nonterminal": interrupted + awaiting_retry,
+                    "awaitingRetry": awaiting_retry,
+                    "ambiguous": interrupted
+                }),
             )
         });
 
@@ -449,7 +467,7 @@ fn query_count(connection: &Connection, statement: &str) -> Result<u64, AppError
 
 fn missing_available_revisions(connection: &Connection, root: &Path) -> Result<u64, AppError> {
     let mut statement = connection
-        .prepare("SELECT id FROM revisions WHERE state='available'")
+        .prepare("SELECT id FROM revisions WHERE state IN ('current','superseded')")
         .map_err(database_error)?;
     let ids = statement
         .query_map([], |row| row.get::<_, String>(0))

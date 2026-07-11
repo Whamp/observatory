@@ -11,10 +11,11 @@ use serde_json::json;
 
 use crate::crypto::random_bytes;
 use crate::error::AppError;
+use crate::storage_boundary::StorageBoundary;
 use crate::storage_status::{self, StorageStatus};
 
 pub const APPLICATION_ID: i64 = 0x4f42_5356;
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -93,6 +94,10 @@ impl Catalogue {
 
     pub(crate) fn connection(&self) -> Result<Connection, AppError> {
         configured_connection(&self.path)
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn counts(&self) -> Result<CatalogueCounts, AppError> {
@@ -234,10 +239,47 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
                cause TEXT
              ) STRICT;
              CREATE UNIQUE INDEX projects_canonical_directory ON projects(canonical_directory);
-             CREATE TABLE artifacts (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0)) STRICT;
+             CREATE TABLE artifacts (
+               id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL REFERENCES projects(id),
+               record_version INTEGER NOT NULL CHECK(record_version > 0),
+               state TEXT NOT NULL CHECK(state IN ('live','recoverable','gone')),
+               title TEXT NOT NULL,
+               description TEXT NOT NULL,
+               slug TEXT NOT NULL,
+               title_fold TEXT NOT NULL,
+               search_text TEXT NOT NULL,
+               current_revision_id TEXT REFERENCES revisions(id),
+               retention_mode TEXT NOT NULL CHECK(retention_mode IN ('default','ttl','pinned')),
+               ttl_ms INTEGER CHECK(ttl_ms IS NULL OR ttl_ms > 0),
+               expires_at TEXT,
+               pin_reason TEXT,
+               recovery_until TEXT,
+               files INTEGER NOT NULL CHECK(files > 0),
+               logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0),
+               revision_count INTEGER NOT NULL CHECK(revision_count > 0),
+               published_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               terminal_state TEXT,
+               tombstoned_at TEXT,
+               cause TEXT
+             ) STRICT;
              CREATE TABLE services (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), record_version INTEGER NOT NULL CHECK(record_version > 0), state TEXT NOT NULL CHECK(state IN ('live','gone'))) STRICT;
-             CREATE TABLE revisions (id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL REFERENCES artifacts(id), state TEXT NOT NULL CHECK(state IN ('available','unavailable'))) STRICT;
+             CREATE TABLE revisions (
+               id TEXT PRIMARY KEY,
+               artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+               state TEXT NOT NULL CHECK(state IN ('current','superseded','unavailable','gone')),
+               entry_path TEXT NOT NULL,
+               entry_media_type TEXT NOT NULL,
+               files INTEGER NOT NULL CHECK(files > 0),
+               logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0),
+               manifest_digest TEXT NOT NULL,
+               published_at TEXT NOT NULL
+             ) STRICT;
+             CREATE INDEX artifacts_project_state ON artifacts(project_id, state);
+             CREATE INDEX revisions_artifact_published ON revisions(artifact_id, published_at DESC);
              CREATE TABLE operation_intents (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, details_json TEXT NOT NULL, project_id TEXT REFERENCES projects(id)) STRICT;
+             CREATE INDEX operation_intents_kind_state ON operation_intents(kind, state);
              CREATE TABLE backup_leases (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
              CREATE TABLE cleanup_runs (id TEXT PRIMARY KEY, state TEXT NOT NULL) STRICT;
              CREATE TABLE audit_events (
@@ -253,7 +295,7 @@ fn initialize(connection: &Connection) -> Result<(), AppError> {
              CREATE TABLE idempotency_requests (
                key TEXT PRIMARY KEY,
                fingerprint TEXT NOT NULL,
-               state TEXT NOT NULL CHECK(state IN ('in_progress','completed')),
+               state TEXT NOT NULL CHECK(state IN ('in_progress','completed','failed_terminal')),
                status_code INTEGER,
                response_json TEXT,
                etag TEXT,
@@ -284,9 +326,14 @@ fn migrate(root: &Path, connection: &Connection) -> Result<(), AppError> {
         SCHEMA_VERSION => Ok(()),
         1 => {
             migrate_v1_to_v2(root, connection)?;
-            migrate_v2_to_v3(root, connection)
+            migrate_v2_to_v3(root, connection)?;
+            migrate_v3_to_v4(root, connection)
         }
-        2 => migrate_v2_to_v3(root, connection),
+        2 => {
+            migrate_v2_to_v3(root, connection)?;
+            migrate_v3_to_v4(root, connection)
+        }
+        3 => migrate_v3_to_v4(root, connection),
         _ => Err(AppError::internal("catalogue schema is unsupported")),
     }
 }
@@ -347,7 +394,7 @@ fn migrate_v1_to_v2(root: &Path, connection: &Connection) -> Result<(), AppError
              CREATE TABLE idempotency_requests (
                key TEXT PRIMARY KEY,
                fingerprint TEXT NOT NULL,
-               state TEXT NOT NULL CHECK(state IN ('in_progress','completed')),
+               state TEXT NOT NULL CHECK(state IN ('in_progress','completed','failed_terminal')),
                status_code INTEGER,
                response_json TEXT,
                etag TEXT,
@@ -376,6 +423,79 @@ fn migrate_v2_to_v3(root: &Path, connection: &Connection) -> Result<(), AppError
              CREATE INDEX services_project_state ON services(project_id, state);
              CREATE INDEX operation_intents_project_state ON operation_intents(project_id, state);
              PRAGMA user_version=3;
+             COMMIT;",
+        )
+        .map_err(database_error)
+}
+
+fn migrate_v3_to_v4(root: &Path, connection: &Connection) -> Result<(), AppError> {
+    if count(connection, "artifacts")? != 0 || count(connection, "revisions")? != 0 {
+        return Err(AppError::internal(
+            "schema v3 contains Artifact state that its public contract could not create",
+        ));
+    }
+    backup_before_migration(root, connection, 3)?;
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE idempotency_requests RENAME TO idempotency_requests_v3;
+             CREATE TABLE idempotency_requests (
+               key TEXT PRIMARY KEY,
+               fingerprint TEXT NOT NULL,
+               state TEXT NOT NULL CHECK(state IN ('in_progress','completed','failed_terminal')),
+               status_code INTEGER,
+               response_json TEXT,
+               etag TEXT,
+               completed_at TEXT
+             ) STRICT;
+             INSERT INTO idempotency_requests(
+               key,fingerprint,state,status_code,response_json,etag,completed_at
+             )
+             SELECT key,fingerprint,state,status_code,response_json,etag,completed_at
+             FROM idempotency_requests_v3;
+             DROP TABLE idempotency_requests_v3;
+             DROP TABLE revisions;
+             DROP TABLE artifacts;
+             CREATE TABLE artifacts (
+               id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL REFERENCES projects(id),
+               record_version INTEGER NOT NULL CHECK(record_version > 0),
+               state TEXT NOT NULL CHECK(state IN ('live','recoverable','gone')),
+               title TEXT NOT NULL,
+               description TEXT NOT NULL,
+               slug TEXT NOT NULL,
+               title_fold TEXT NOT NULL,
+               search_text TEXT NOT NULL,
+               current_revision_id TEXT REFERENCES revisions(id),
+               retention_mode TEXT NOT NULL CHECK(retention_mode IN ('default','ttl','pinned')),
+               ttl_ms INTEGER CHECK(ttl_ms IS NULL OR ttl_ms > 0),
+               expires_at TEXT,
+               pin_reason TEXT,
+               recovery_until TEXT,
+               files INTEGER NOT NULL CHECK(files > 0),
+               logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0),
+               revision_count INTEGER NOT NULL CHECK(revision_count > 0),
+               published_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               terminal_state TEXT,
+               tombstoned_at TEXT,
+               cause TEXT
+             ) STRICT;
+             CREATE TABLE revisions (
+               id TEXT PRIMARY KEY,
+               artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+               state TEXT NOT NULL CHECK(state IN ('current','superseded','unavailable','gone')),
+               entry_path TEXT NOT NULL,
+               entry_media_type TEXT NOT NULL,
+               files INTEGER NOT NULL CHECK(files > 0),
+               logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0),
+               manifest_digest TEXT NOT NULL,
+               published_at TEXT NOT NULL
+             ) STRICT;
+             CREATE INDEX artifacts_project_state ON artifacts(project_id, state);
+             CREATE INDEX revisions_artifact_published ON revisions(artifact_id, published_at DESC);
+             CREATE INDEX operation_intents_kind_state ON operation_intents(kind, state);
+             PRAGMA user_version=4;
              COMMIT;",
         )
         .map_err(database_error)
@@ -521,21 +641,50 @@ fn reconcile(root: &Path, connection: &Connection) -> Result<(), AppError> {
     if foreign_key_failures != 0 {
         return Err(AppError::internal("catalogue foreign key check failed"));
     }
-    let interrupted: u64 = connection
-        .query_row(
-            "SELECT count(*) FROM operation_intents WHERE state NOT IN ('completed','cancelled','failed_terminal')",
-            [],
-            |row| row.get(0),
+    let mut protected_staging = HashSet::new();
+    let mut protected_revisions = HashSet::new();
+    let interrupted = connection
+        .prepare(
+            "SELECT kind,details_json FROM operation_intents
+             WHERE state NOT IN ('completed','cancelled','failed_terminal')",
         )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
         .map_err(database_error)?;
-    if interrupted != 0 {
-        return Err(AppError::internal(
-            "startup reconciliation found an unsupported interrupted operation",
-        ));
+    for (kind, details) in interrupted {
+        if kind != "artifact_publish" {
+            return Err(AppError::internal(
+                "startup reconciliation found an unsupported interrupted operation",
+            ));
+        }
+        let details: serde_json::Value = serde_json::from_str(&details)
+            .map_err(|error| AppError::internal(format!("Publish intent is invalid: {error}")))?;
+        let operation_id = details
+            .get("operationId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::internal("Publish intent has no operation ID"))?;
+        let revision_id = details
+            .pointer("/revision/id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::internal("Publish intent has no Revision ID"))?;
+        protected_staging.insert(operation_id.to_owned());
+        protected_revisions.insert(revision_id.to_owned());
     }
 
-    quarantine_all(root, connection, "staging", "unreferenced_staging")?;
-    let referenced = connection
+    let storage = StorageBoundary::open(root)?;
+    quarantine_all_except(
+        &storage,
+        connection,
+        "staging",
+        "unreferenced_staging",
+        &protected_staging,
+    )?;
+    let mut referenced = connection
         .prepare("SELECT id FROM revisions")
         .and_then(|mut statement| {
             statement
@@ -543,96 +692,70 @@ fn reconcile(root: &Path, connection: &Connection) -> Result<(), AppError> {
                 .collect::<Result<HashSet<_>, _>>()
         })
         .map_err(database_error)?;
-    quarantine_unreferenced_revisions(root, connection, &referenced)?;
+    referenced.extend(protected_revisions);
+    quarantine_unreferenced_revisions(&storage, connection, &referenced)?;
     Ok(())
 }
 
-fn quarantine_all(
-    root: &Path,
+fn quarantine_all_except(
+    storage: &StorageBoundary,
     connection: &Connection,
     directory: &str,
     cause: &str,
+    protected: &HashSet<String>,
 ) -> Result<(), AppError> {
-    let entries = fs::read_dir(root.join(directory)).map_err(|error| {
-        AppError::internal(format!(
-            "startup reconciliation could not inspect {directory}: {error}"
-        ))
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            AppError::internal(format!("startup reconciliation entry failed: {error}"))
-        })?;
-        quarantine_entry(root, connection, &entry.path(), cause)?;
+    for name in storage.entry_names(directory)? {
+        if !name.to_str().is_some_and(|name| protected.contains(name)) {
+            quarantine_entry(storage, connection, directory, &name, cause)?;
+        }
     }
     Ok(())
 }
 
 fn quarantine_unreferenced_revisions(
-    root: &Path,
+    storage: &StorageBoundary,
     connection: &Connection,
     referenced: &HashSet<String>,
 ) -> Result<(), AppError> {
-    let entries = fs::read_dir(root.join("revisions")).map_err(|error| {
-        AppError::internal(format!(
-            "startup reconciliation could not inspect revisions: {error}"
-        ))
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            AppError::internal(format!("startup reconciliation entry failed: {error}"))
-        })?;
-        reconcile_revision_entry(root, connection, referenced, &entry)?;
+    for name in storage.entry_names("revisions")? {
+        reconcile_revision_entry(storage, connection, referenced, &name)?;
     }
     Ok(())
 }
 
 fn reconcile_revision_entry(
-    root: &Path,
+    storage: &StorageBoundary,
     connection: &Connection,
     referenced: &HashSet<String>,
-    entry: &fs::DirEntry,
+    name: &std::ffi::OsStr,
 ) -> Result<(), AppError> {
-    let name = entry.file_name();
-    let name = name.to_str();
-    let metadata = entry
-        .file_type()
-        .map_err(|error| AppError::internal(format!("cannot classify Revision entry: {error}")))?;
-    let is_valid_reference = name.is_some_and(|id| referenced.contains(id))
-        && metadata.is_dir()
-        && !metadata.is_symlink();
+    let text_name = name.to_str();
+    let is_valid_reference = text_name.is_some_and(|id| referenced.contains(id))
+        && storage.is_directory("revisions", name)?;
     if is_valid_reference {
         return Ok(());
     }
-    if let Some(id) = name.filter(|id| referenced.contains(*id)) {
+    if let Some(id) = text_name.filter(|id| referenced.contains(*id)) {
         connection
             .execute("UPDATE revisions SET state='unavailable' WHERE id=?1", [id])
             .map_err(database_error)?;
     }
     quarantine_entry(
-        root,
+        storage,
         connection,
-        &entry.path(),
+        "revisions",
+        name,
         "unreferenced_or_malformed_revision",
     )
 }
 
 fn quarantine_entry(
-    root: &Path,
+    storage: &StorageBoundary,
     connection: &Connection,
-    source: &Path,
+    source_directory: &str,
+    source_name: &std::ffi::OsStr,
     cause: &str,
 ) -> Result<(), AppError> {
-    let quarantine = root.join("quarantine");
-    let mut ordinal = 1_u64;
-    let destination = loop {
-        let candidate = quarantine.join(format!("startup-{ordinal:016x}"));
-        if !candidate.exists() {
-            break candidate;
-        }
-        ordinal = ordinal
-            .checked_add(1)
-            .ok_or_else(|| AppError::internal("cannot allocate quarantine path"))?;
-    };
     connection
         .execute(
             "INSERT INTO audit_events(
@@ -644,9 +767,7 @@ fn quarantine_entry(
             params![json!({ "cause": cause }).to_string(), cause],
         )
         .map_err(database_error)?;
-    fs::rename(source, &destination).map_err(|error| {
-        AppError::internal(format!("cannot quarantine startup evidence: {error}"))
-    })?;
+    storage.quarantine_startup(source_directory, source_name)?;
     connection
         .execute(
             "INSERT INTO audit_events(

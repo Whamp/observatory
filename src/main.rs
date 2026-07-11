@@ -13,16 +13,22 @@
 #![allow(clippy::module_name_repetitions)]
 #![deny(clippy::all, clippy::correctness, clippy::suspicious)]
 
+mod artifact;
+mod artifact_storage;
 mod catalogue;
 mod cli;
 mod config;
 mod crypto;
 mod csrf;
+mod cursor;
 mod daemon;
 mod error;
 mod project;
+mod revision_manifest;
+mod route_slug;
 mod runtime_lock;
 mod safe_file;
+mod storage_boundary;
 mod storage_status;
 mod ui;
 mod web;
@@ -33,6 +39,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use artifact::{PublishArtifactRequest, RetentionMode};
 use config::ServeOverrides;
 use error::AppError;
 use project::{RegisterProjectRequest, TombstoneProjectRequest, UpdateProjectRequest};
@@ -63,6 +70,7 @@ enum Command {
     Serve(ServeCommand),
     System(SystemCommand),
     Project(ProjectCommand),
+    Artifact(ArtifactCommand),
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +160,74 @@ enum ProjectLeaf {
     },
 }
 
+#[derive(Debug, Args)]
+struct ArtifactCommand {
+    #[command(subcommand)]
+    command: ArtifactLeaf,
+}
+
+#[derive(Debug, Subcommand)]
+enum ArtifactLeaf {
+    Publish(ArtifactPublishCommand),
+    List(ArtifactListCommand),
+    Show {
+        selector: String,
+        #[arg(long)]
+        revisions: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ArtifactListCommand {
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    state: Option<String>,
+    #[arg(long, value_enum)]
+    retention: Option<ArtifactRetentionFilter>,
+    #[arg(long)]
+    query: Option<String>,
+    #[arg(long, value_enum)]
+    order: Option<ArtifactListOrder>,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=200))]
+    limit: Option<u16>,
+    #[arg(long)]
+    after: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ArtifactPublishCommand {
+    source: PathBuf,
+    #[arg(long)]
+    entry: Option<String>,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    slug: Option<String>,
+    #[arg(long, value_parser = parse_duration, conflicts_with = "pin")]
+    ttl: Option<u64>,
+    #[arg(long, conflicts_with = "ttl")]
+    pin: bool,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ArtifactListOrder {
+    Recent,
+    Title,
+    Attention,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ArtifactRetentionFilter {
+    Default,
+    Ttl,
+    Pinned,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ProjectListOrder {
     Recent,
@@ -206,6 +282,17 @@ async fn run(command: CommandLine) -> Result<(), AppError> {
         Command::Project(project) => {
             run_project(
                 project,
+                ProjectClientContext {
+                    client,
+                    selected_project: command.project,
+                    idempotency_key: command.idempotency_key,
+                },
+            )
+            .await
+        }
+        Command::Artifact(artifact) => {
+            run_artifact(
+                artifact,
                 ProjectClientContext {
                     client,
                     selected_project: command.project,
@@ -292,6 +379,125 @@ async fn run_project(
             run_project_tombstone(context, &selector, yes).await
         }
     }
+}
+
+async fn run_artifact(
+    command: ArtifactCommand,
+    context: ProjectClientContext,
+) -> Result<(), AppError> {
+    match command.command {
+        ArtifactLeaf::Publish(publish) => run_artifact_publish(context, publish).await,
+        ArtifactLeaf::List(list) => run_artifact_list(context, list).await,
+        ArtifactLeaf::Show {
+            selector,
+            revisions,
+        } => run_artifact_show(context.client, &selector, revisions).await,
+    }
+}
+
+async fn run_artifact_publish(
+    context: ProjectClientContext,
+    command: ArtifactPublishCommand,
+) -> Result<(), AppError> {
+    let idempotency_key = mutation_idempotency_key(context.idempotency_key)?;
+    let project_path = absolute_project_selection(context.selected_project)?;
+    let project_id = resolve_project_selector(
+        &project_path,
+        context.client.server.clone(),
+        context.client.timeout,
+    )
+    .await?;
+    let caller_working_directory = absolute_project_selection(None)?;
+    let source_path = absolute_source_selection(command.source)?;
+    if command.reason.is_some() && !command.pin {
+        return Err(AppError::invalid(
+            "invalid_retention",
+            "--reason requires --pin",
+        ));
+    }
+    let retention_mode = if command.pin {
+        RetentionMode::Pinned
+    } else if command.ttl.is_some() {
+        RetentionMode::Ttl
+    } else {
+        RetentionMode::Default
+    };
+    let request = PublishArtifactRequest::new(source_path, caller_working_directory, project_id)
+        .with_entry(command.entry)
+        .with_metadata(command.title, command.description, command.slug)
+        .with_retention(retention_mode, command.ttl, command.reason);
+    cli::post(
+        context.client.server,
+        context.client.timeout,
+        "/api/v1/artifacts",
+        &idempotency_key,
+        &request,
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_artifact_list(
+    context: ProjectClientContext,
+    command: ArtifactListCommand,
+) -> Result<(), AppError> {
+    let mut parameters = Vec::new();
+    if !command.all {
+        let project_path = absolute_project_selection(context.selected_project)?;
+        let project_id = resolve_project_selector(
+            &project_path,
+            context.client.server.clone(),
+            context.client.timeout,
+        )
+        .await?;
+        parameters.push(("projectId".to_owned(), project_id));
+    }
+    if let Some(state) = command.state {
+        parameters.push(("state".to_owned(), state));
+    }
+    if let Some(retention) = command.retention {
+        parameters.push(("retentionMode".to_owned(), retention.as_str().to_owned()));
+    }
+    if let Some(query) = command.query {
+        parameters.push(("query".to_owned(), query));
+    }
+    if let Some(order) = command.order {
+        parameters.push(("order".to_owned(), order.as_str().to_owned()));
+    }
+    if let Some(limit) = command.limit {
+        parameters.push(("limit".to_owned(), limit.to_string()));
+    }
+    if let Some(after) = command.after {
+        parameters.push(("after".to_owned(), after));
+    }
+    cli::get_with_query(
+        context.client.server,
+        context.client.timeout,
+        "/api/v1/artifacts",
+        &parameters,
+        context.client.json,
+    )
+    .await
+}
+
+async fn run_artifact_show(
+    client: ClientContext,
+    selector: &str,
+    revisions: bool,
+) -> Result<(), AppError> {
+    let id = selector.rsplit_once('~').map_or(selector, |(_, id)| id);
+    if !is_project_id(id) {
+        return Err(AppError::invalid(
+            "invalid_artifact_id",
+            "Artifact selector must be an opaque ID or Artifact key",
+        ));
+    }
+    let path = if revisions {
+        format!("/api/v1/artifacts/{id}/revisions")
+    } else {
+        format!("/api/v1/artifacts/{id}")
+    };
+    cli::get(client.server, client.timeout, &path, client.json).await
 }
 
 async fn run_project_list(
@@ -475,6 +681,26 @@ async fn run_project_show(client: ClientContext, selector: &str) -> Result<(), A
     .await
 }
 
+impl ArtifactListOrder {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Title => "title",
+            Self::Attention => "attention",
+        }
+    }
+}
+
+impl ArtifactRetentionFilter {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Ttl => "ttl",
+            Self::Pinned => "pinned",
+        }
+    }
+}
+
 impl ProjectListOrder {
     const fn as_str(self) -> &'static str {
         match self {
@@ -496,6 +722,20 @@ fn absolute_project_selection(selection: Option<PathBuf>) -> Result<String, AppE
     path.into_os_string()
         .into_string()
         .map_err(|_| AppError::usage("Project path must be valid UTF-8"))
+}
+
+fn absolute_source_selection(source: PathBuf) -> Result<String, AppError> {
+    let source = if source.is_absolute() {
+        source
+    } else {
+        std::env::current_dir()
+            .map_err(|error| AppError::usage(format!("cannot read current directory: {error}")))?
+            .join(source)
+    };
+    source
+        .into_os_string()
+        .into_string()
+        .map_err(|_| AppError::usage("Artifact source path must be valid UTF-8"))
 }
 
 fn mutation_idempotency_key(key: Option<String>) -> Result<String, AppError> {

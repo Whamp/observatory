@@ -1,13 +1,16 @@
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 struct Harness {
@@ -24,6 +27,10 @@ impl Harness {
     }
 
     fn start_with(setup: impl FnOnce(&Path)) -> Self {
+        Self::start_configured(setup, |_| {})
+    }
+
+    fn start_configured(setup: impl FnOnce(&Path), configure: impl FnOnce(&mut Command)) -> Self {
         let root = supported_tempdir("temporary root");
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).expect("runtime directory");
@@ -31,7 +38,9 @@ impl Harness {
         let storage = root.path().join("data");
         setup(&storage);
         let address = free_address();
-        let child = daemon(&runtime, &storage, address)
+        let mut process = daemon(&runtime, &storage, address);
+        configure(&mut process);
+        let child = process
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -45,6 +54,19 @@ impl Harness {
         };
         harness.wait_ready();
         harness
+    }
+
+    fn restart_configured(&mut self, configure: impl FnOnce(&mut Command)) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut process = daemon(&self.runtime, &self.storage, self.address);
+        configure(&mut process);
+        self.child = process
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("restart obs serve");
+        self.wait_ready();
     }
 
     fn url(&self, path: &str) -> String {
@@ -88,6 +110,25 @@ fn free_address() -> SocketAddr {
     let address = listener.local_addr().expect("listener address");
     drop(listener);
     address
+}
+
+fn raw_get_status(address: SocketAddr, path: &str) -> u16 {
+    let mut stream = TcpStream::connect(address).expect("raw HTTP connection");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("raw HTTP request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("raw HTTP response");
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_ascii_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("raw HTTP status")
 }
 
 fn daemon(runtime: &Path, storage: &Path, address: SocketAddr) -> Command {
@@ -183,6 +224,14 @@ fn seed_v2_catalogue(storage: &Path) {
             [vec![7_u8; 32]],
         )
         .expect("v2 cursor secret");
+    connection
+        .execute(
+            "INSERT INTO idempotency_requests(
+               key,fingerprint,state,status_code,response_json,etag,completed_at
+             ) VALUES ('preserved-key','preserved-fingerprint','completed',200,'{}',NULL,'2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .expect("v2 idempotency fixture");
 }
 
 fn one_response_server(status: &str, body: &str) -> (String, thread::JoinHandle<()>) {
@@ -242,7 +291,7 @@ fn migrates_empty_v1_catalogue_before_readiness() {
     );
     assert!(status.status.success());
     let status: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status["result"]["policy"]["userVersion"], 3);
+    assert_eq!(status["result"]["policy"]["userVersion"], 4);
     let backup_path = harness
         .storage
         .join("backups/schema-v1-pre-migration.sqlite");
@@ -280,8 +329,8 @@ fn migrates_v2_catalogue_for_project_tombstone_gates() {
         &["system", "status"],
     );
     assert!(status.status.success());
-    let status: Value = serde_json::from_slice(&status.stdout).expect("v3 status JSON");
-    assert_eq!(status["result"]["policy"]["userVersion"], 3);
+    let status: Value = serde_json::from_slice(&status.stdout).expect("v4 status JSON");
+    assert_eq!(status["result"]["policy"]["userVersion"], 4);
 
     let backup_path = harness
         .storage
@@ -304,9 +353,44 @@ fn migrates_v2_catalogue_for_project_tombstone_gates() {
             .expect("backup quick check"),
         "ok"
     );
+    let v3_backup = rusqlite::Connection::open_with_flags(
+        harness
+            .storage
+            .join("backups/schema-v3-pre-migration.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("v3 migration backup");
+    assert_eq!(
+        v3_backup
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("v3 backup schema version"),
+        3
+    );
+    assert_eq!(
+        v3_backup
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .expect("v3 backup quick check"),
+        "ok"
+    );
 
     let catalogue =
-        rusqlite::Connection::open(harness.storage.join("catalogue.sqlite")).expect("v3 catalogue");
+        rusqlite::Connection::open(harness.storage.join("catalogue.sqlite")).expect("v4 catalogue");
+    let idempotency_schema: String = catalogue
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='idempotency_requests'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("v4 idempotency schema");
+    assert!(idempotency_schema.contains("failed_terminal"));
+    let preserved_state: String = catalogue
+        .query_row(
+            "SELECT state FROM idempotency_requests WHERE key='preserved-key'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preserved idempotency row");
+    assert_eq!(preserved_state, "completed");
     let service_state: i64 = catalogue
         .query_row(
             "SELECT count(*) FROM pragma_table_info('services') WHERE name='state'",
@@ -540,6 +624,2185 @@ fn project_slugs_follow_normalization_fallback_and_route_grammar() {
         invalid.json::<Value>().expect("invalid slug JSON")["error"]["code"],
         "invalid_project_slug"
     );
+}
+
+#[test]
+fn single_file_publish_creates_current_artifact_and_immutable_revision() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-project");
+    fs::create_dir(&project_directory).expect("Artifact Project directory");
+    let source = harness._root.path().join("agent-report.html");
+    let source_bytes = b"<!doctype html><title>Agent Report</title><h1>Published exactly</h1>";
+    fs::write(&source, source_bytes).expect("single-file Artifact source");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-register-project")
+        .json(&serde_json::json!({
+            "path": project_directory.to_str().expect("Artifact Project path"),
+            "title": "Artifact Project",
+            "slug": "artifact-project"
+        }))
+        .send()
+        .expect("register Artifact Project")
+        .json::<Value>()
+        .expect("registered Artifact Project");
+    let project = &registered["result"];
+    let project_id = project["id"].as_str().expect("Project ID");
+    let project_key = project["key"].as_str().expect("Project key");
+
+    let published = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-publish-single-file")
+        .json(&serde_json::json!({
+            "source": {
+                "path": source.to_str().expect("source path"),
+                "callerWorkingDirectory": harness._root.path().to_str().expect("caller cwd")
+            },
+            "projectId": project_id,
+            "entry": null,
+            "title": null,
+            "description": null,
+            "slug": null,
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("publish single-file Artifact");
+    assert_eq!(published.status(), 201);
+    assert_eq!(published.headers()["cache-control"], "no-store");
+    assert_eq!(published.headers()["etag"], "\"rv-1\"");
+    let location = published.headers()["location"]
+        .to_str()
+        .expect("Artifact Location")
+        .to_owned();
+    let published: Value = published.json().expect("published Artifact result");
+    assert_eq!(published["schemaVersion"], 1);
+    assert_eq!(published["ok"], true);
+    assert_eq!(published["result"]["operation"], "publish");
+    let artifact = &published["result"]["artifact"];
+    let revision = &published["result"]["revision"];
+    let artifact_id = artifact["id"].as_str().expect("Artifact ID");
+    let revision_id = revision["id"].as_str().expect("Revision ID");
+    assert_eq!(artifact_id.len(), 26);
+    assert_eq!(revision_id.len(), 26);
+    assert_ne!(artifact_id, revision_id);
+    assert_eq!(artifact["kind"], "artifact");
+    assert_eq!(artifact["recordVersion"], 1);
+    assert_eq!(artifact["state"], "live");
+    assert_eq!(artifact["title"], "Agent Report");
+    assert_eq!(artifact["description"], "");
+    assert!(
+        artifact["key"]
+            .as_str()
+            .expect("Artifact key")
+            .starts_with("agent-report~")
+    );
+    assert_eq!(artifact["project"]["id"], project_id);
+    assert_eq!(artifact["project"]["key"], project_key);
+    assert_eq!(artifact["currentRevisionId"], revision_id);
+    assert_eq!(artifact["retention"]["mode"], "default");
+    assert_eq!(artifact["retention"]["ttlMs"], 2_592_000_000_u64);
+    assert!(artifact["retention"]["expiresAt"].is_string());
+    assert_eq!(artifact["retention"]["pinReason"], Value::Null);
+    assert_eq!(artifact["retention"]["recoveryUntil"], Value::Null);
+    assert_eq!(artifact["files"], 1);
+    assert_eq!(artifact["logicalBytes"], source_bytes.len());
+    assert_eq!(artifact["revisionCount"], 1);
+    assert_eq!(artifact["apiUrl"], location);
+    assert!(
+        artifact["openUrl"]
+            .as_str()
+            .expect("Artifact Open URL")
+            .ends_with('/')
+    );
+    assert!(
+        artifact["detailUrl"]
+            .as_str()
+            .expect("Artifact detail URL")
+            .ends_with('/')
+    );
+
+    assert_eq!(revision["kind"], "revision");
+    assert_eq!(revision["artifactId"], artifact_id);
+    assert_eq!(revision["state"], "current");
+    assert_eq!(revision["entryPath"], "agent-report.html");
+    assert_eq!(revision["entryMediaType"], "text/html");
+    assert_eq!(revision["files"], 1);
+    assert_eq!(revision["logicalBytes"], source_bytes.len());
+    assert!(
+        revision["manifestDigest"]
+            .as_str()
+            .expect("manifest digest")
+            .starts_with("sha256:")
+    );
+    assert!(
+        revision["apiUrl"]
+            .as_str()
+            .expect("Revision API URL")
+            .ends_with(revision_id)
+    );
+    assert!(
+        revision["openUrl"]
+            .as_str()
+            .expect("Revision Open URL")
+            .ends_with('/')
+    );
+
+    let revision_directory = harness.storage.join("revisions").join(revision_id);
+    let manifest_path = revision_directory.join("revision-manifest.json");
+    let payload_path = revision_directory.join("content/agent-report.html");
+    assert_eq!(
+        fs::metadata(&revision_directory)
+            .expect("Revision directory metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for path in [&manifest_path, &payload_path] {
+        assert_eq!(
+            fs::metadata(path)
+                .expect("Revision file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "path={}",
+            path.display()
+        );
+    }
+    let manifest_bytes = fs::read(&manifest_path).expect("Revision manifest bytes");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("Revision manifest JSON");
+    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["artifactId"], artifact_id);
+    assert_eq!(manifest["revisionId"], revision_id);
+    assert_eq!(manifest["entryPath"], "agent-report.html");
+    assert_eq!(manifest["entryMediaType"], "text/html");
+    assert_eq!(manifest["logicalBytes"], source_bytes.len());
+    assert_eq!(manifest["members"][0]["path"], "agent-report.html");
+    assert_eq!(
+        manifest["members"][0]["digest"],
+        format!("sha256:{:x}", Sha256::digest(source_bytes))
+    );
+    assert_eq!(
+        revision["manifestDigest"],
+        format!("sha256:{:x}", Sha256::digest(&manifest_bytes))
+    );
+    assert_eq!(
+        fs::read(&payload_path).expect("stored payload"),
+        source_bytes
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("Publish evidence catalogue");
+    let (operation_state, details): (String, String) = catalogue
+        .query_row(
+            "SELECT state,details_json FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("Publish operation evidence");
+    assert_eq!(operation_state, "completed");
+    assert!(!details.contains(source.to_str().expect("source path")));
+    assert!(!details.contains(harness._root.path().to_str().expect("private root")));
+    let audit_count: u64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE kind='artifact_published' AND actor='operator' AND cause='publish' AND resource_id=?1",
+            [artifact_id],
+            |row| row.get(0),
+        )
+        .expect("Publish audit count");
+    assert_eq!(audit_count, 1);
+
+    let artifact_open = artifact["openUrl"].as_str().expect("Artifact Open URL");
+    let revision_open = revision["openUrl"].as_str().expect("Revision Open URL");
+    for open_url in [
+        artifact_open.to_owned(),
+        revision_open.to_owned(),
+        format!("{artifact_open}agent-report.html"),
+        format!("{revision_open}agent-report.html"),
+    ] {
+        let path = url::Url::parse(&open_url)
+            .expect("canonical Open URL")
+            .path()
+            .to_owned();
+        let response = client
+            .get(harness.url(&path))
+            .send()
+            .expect("served Artifact bytes");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().expect("served bytes");
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(headers["content-type"], "text/html");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(bytes.as_ref(), source_bytes);
+        let head = client
+            .head(harness.url(&path))
+            .send()
+            .expect("served Artifact HEAD");
+        assert_eq!(head.status(), 200);
+        assert_eq!(head.headers()["content-type"], "text/html");
+        assert_eq!(head.headers()["x-content-type-options"], "nosniff");
+        assert!(head.bytes().expect("HEAD body").is_empty());
+    }
+}
+
+#[test]
+fn published_artifact_is_discoverable_through_api_ledger_and_browser_details() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-discovery-project");
+    fs::create_dir(&project_directory).expect("Artifact discovery Project directory");
+    let source = harness._root.path().join("discovery.txt");
+    fs::write(&source, "discoverable bytes").expect("discoverable Artifact source");
+    let client = reqwest::blocking::Client::new();
+    let registered = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-discovery-project")
+        .json(&serde_json::json!({
+            "path": project_directory.to_str().expect("Project path"),
+            "title": "Discovery Project",
+            "slug": "discovery-project"
+        }))
+        .send()
+        .expect("register discovery Project")
+        .json::<Value>()
+        .expect("discovery Project result");
+    let project = &registered["result"];
+    let project_id = project["id"].as_str().expect("Project ID");
+    let project_key = project["key"].as_str().expect("Project key");
+    let published = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-discovery-publish")
+        .json(&serde_json::json!({
+            "source": {
+                "path": source.to_str().expect("source path"),
+                "callerWorkingDirectory": harness._root.path().to_str().expect("caller cwd")
+            },
+            "projectId": project_id,
+            "title": "Discovery Note",
+            "description": "Visible from every read adapter",
+            "slug": "discovery-note",
+            "retention": {"mode": "pinned", "ttlMs": null, "pinReason": "test fixture"}
+        }))
+        .send()
+        .expect("publish discoverable Artifact")
+        .json::<Value>()
+        .expect("discoverable Publish result");
+    let artifact = published["result"]["artifact"].clone();
+    let revision = published["result"]["revision"].clone();
+    let artifact_id = artifact["id"].as_str().expect("Artifact ID");
+    let revision_id = revision["id"].as_str().expect("Revision ID");
+
+    let shown = client
+        .get(harness.url(&format!("/api/v1/artifacts/{artifact_id}")))
+        .send()
+        .expect("show Artifact");
+    assert_eq!(shown.status(), 200);
+    assert_eq!(shown.headers()["etag"], "\"rv-1\"");
+    assert_eq!(
+        shown.json::<Value>().expect("shown Artifact")["result"],
+        artifact
+    );
+
+    let shown_revision = client
+        .get(harness.url(&format!("/api/v1/revisions/{revision_id}")))
+        .send()
+        .expect("show Revision");
+    assert_eq!(shown_revision.status(), 200);
+    assert_eq!(
+        shown_revision.json::<Value>().expect("shown Revision")["result"],
+        revision
+    );
+
+    let listed = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[("projectId", project_id), ("order", "recent")])
+        .send()
+        .expect("list Artifacts");
+    assert_eq!(listed.status(), 200);
+    let listed = listed.json::<Value>().expect("Artifact list");
+    assert_eq!(
+        listed["result"]["items"],
+        serde_json::json!([artifact.clone()])
+    );
+    assert_eq!(listed["result"]["page"]["hasMore"], false);
+
+    for path in [
+        "/api/v1/projects/ledger".to_owned(),
+        format!("/api/v1/projects/{project_id}/ledger"),
+    ] {
+        let ledger = client
+            .get(harness.url(&path))
+            .query(&[("projectId", project_id), ("kind", "artifact")])
+            .send()
+            .expect("Artifact ledger");
+        assert_eq!(ledger.status(), 200);
+        let ledger = ledger.json::<Value>().expect("Artifact ledger result");
+        assert_eq!(
+            ledger["result"]["items"],
+            serde_json::json!([artifact.clone()])
+        );
+    }
+
+    let project_detail = client
+        .get(harness.url(&format!("/ui/projects/{project_key}/")))
+        .send()
+        .expect("Project detail with Artifact");
+    assert_eq!(project_detail.status(), 200);
+    let project_detail = project_detail.text().expect("Project detail HTML");
+    assert!(project_detail.contains("Discovery Note"));
+    assert!(project_detail.contains("ARTIFACT"));
+    assert!(project_detail.contains("PINNED"));
+    assert!(project_detail.contains(artifact["key"].as_str().expect("Artifact key")));
+    assert!(project_detail.contains(project_key));
+    assert!(project_detail.contains(revision_id));
+    assert!(project_detail.contains("1 file · 18 logical bytes · 1 Revision"));
+    assert!(project_detail.contains(artifact["publishedAt"].as_str().expect("Publish instant")));
+    assert!(project_detail.contains(artifact["openUrl"].as_str().expect("Artifact Open URL")));
+    assert!(project_detail.contains(artifact["detailUrl"].as_str().expect("Artifact detail URL")));
+
+    let detail_path = url::Url::parse(artifact["detailUrl"].as_str().expect("detail URL"))
+        .expect("canonical detail URL")
+        .path()
+        .to_owned();
+    let artifact_detail = client
+        .get(harness.url(&detail_path))
+        .send()
+        .expect("Artifact detail");
+    assert_eq!(artifact_detail.status(), 200);
+    let artifact_detail = artifact_detail.text().expect("Artifact detail HTML");
+    assert!(artifact_detail.contains("Discovery Note"));
+    assert!(artifact_detail.contains("Visible from every read adapter"));
+    assert!(artifact_detail.contains("Retention"));
+    assert!(artifact_detail.contains("PINNED"));
+    assert!(artifact_detail.contains("Pin reason"));
+    assert!(artifact_detail.contains("test fixture"));
+    assert!(artifact_detail.contains(revision_id));
+    assert!(artifact_detail.contains(revision["openUrl"].as_str().expect("Revision Open URL")));
+}
+
+#[test]
+fn artifact_cli_publishes_lists_and_shows_through_the_daemon() {
+    let harness = Harness::start();
+    let server = format!("http://{}", harness.address);
+    let project_directory = harness._root.path().join("artifact-cli-project");
+    fs::create_dir(&project_directory).expect("Artifact CLI Project directory");
+    let project_path = project_directory
+        .to_str()
+        .expect("Artifact CLI Project path");
+    let registered = cli(
+        &server,
+        &[
+            "--idempotency-key",
+            "issue-24-artifact-cli-project",
+            "project",
+            "register",
+            project_path,
+            "--title",
+            "Artifact CLI Project",
+        ],
+    );
+    assert!(registered.status.success(), "{registered:?}");
+    let source = harness._root.path().join("cli-note.md");
+    fs::write(&source, "# CLI note\n\nPublished through obs.\n").expect("CLI source");
+
+    let missing_key = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "artifact",
+            "publish",
+            source.to_str().expect("CLI source path"),
+        ],
+    );
+    assert_eq!(missing_key.status.code(), Some(2));
+    assert!(missing_key.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing_key.stderr).expect("missing key JSON")["error"]["code"],
+        "invalid_idempotency_key"
+    );
+
+    let published = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-24-artifact-cli-publish",
+            "artifact",
+            "publish",
+            source.to_str().expect("CLI source path"),
+            "--title",
+            "CLI Note",
+            "--description",
+            "Agent-facing Publish",
+            "--pin",
+            "--reason",
+            "CLI fixture",
+        ],
+    );
+    assert!(published.status.success(), "{published:?}");
+    assert!(published.stderr.is_empty());
+    let published: Value = serde_json::from_slice(&published.stdout).expect("CLI Publish JSON");
+    let artifact = &published["result"]["artifact"];
+    let artifact_id = artifact["id"].as_str().expect("CLI Artifact ID");
+    let artifact_key = artifact["key"].as_str().expect("CLI Artifact key");
+    assert_eq!(artifact["title"], "CLI Note");
+    assert_eq!(artifact["retention"]["mode"], "pinned");
+
+    let replayed = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-24-artifact-cli-publish",
+            "artifact",
+            "publish",
+            source.to_str().expect("CLI source path"),
+            "--title",
+            "CLI Note",
+            "--description",
+            "Agent-facing Publish",
+            "--pin",
+            "--reason",
+            "CLI fixture",
+        ],
+    );
+    assert!(replayed.status.success(), "{replayed:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replayed.stdout).expect("CLI replay JSON")["result"]["artifact"]
+            ["id"],
+        artifact_id
+    );
+
+    let zulu_source = harness._root.path().join("zulu-note.md");
+    fs::write(&zulu_source, "# Zulu note\n").expect("Zulu CLI source");
+    let zulu = cli(
+        &server,
+        &[
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-24-artifact-cli-zulu",
+            "artifact",
+            "publish",
+            zulu_source.to_str().expect("Zulu CLI source path"),
+            "--title",
+            "Zulu Note",
+        ],
+    );
+    assert!(zulu.status.success(), "{zulu:?}");
+    let selection_directory = harness._root.path().join("selection-directory");
+    fs::create_dir(&selection_directory).expect("relative selection directory");
+    let relative_source = harness._root.path().join("relative-note.html");
+    fs::write(&relative_source, "<p>relative</p>").expect("relative CLI source");
+    let relative = obs()
+        .current_dir(&selection_directory)
+        .args([
+            "--json",
+            "--server",
+            &server,
+            "-p",
+            project_path,
+            "--idempotency-key",
+            "issue-24-artifact-cli-relative",
+            "artifact",
+            "publish",
+            "../relative-note.html",
+            "--title",
+            "Middle Note",
+        ])
+        .output()
+        .expect("relative Artifact Publish CLI");
+    assert!(relative.status.success(), "{relative:?}");
+
+    let listed = cli(
+        &server,
+        &["-p", project_path, "artifact", "list", "--order", "title"],
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&listed.stdout).expect("CLI list JSON")["result"]["items"]
+            [0]["title"],
+        "Zulu Note"
+    );
+    let list_help = obs()
+        .args(["artifact", "list", "--help"])
+        .output()
+        .expect("Artifact list help");
+    assert!(list_help.status.success());
+    assert!(!String::from_utf8_lossy(&list_help.stdout).contains("--direction"));
+
+    for selector in [artifact_id, artifact_key] {
+        let shown = cli(&server, &["artifact", "show", selector]);
+        assert!(shown.status.success(), "selector={selector}: {shown:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&shown.stdout).expect("CLI show JSON")["result"]["id"],
+            artifact_id
+        );
+    }
+    let revisions = cli(&server, &["artifact", "show", artifact_id, "--revisions"]);
+    assert!(revisions.status.success(), "{revisions:?}");
+    let revisions: Value =
+        serde_json::from_slice(&revisions.stdout).expect("CLI Revision history JSON");
+    assert_eq!(
+        revisions["result"]["items"][0]["id"],
+        published["result"]["revision"]["id"]
+    );
+    let all = cli(
+        &server,
+        &["artifact", "list", "--all", "--retention", "pinned"],
+    );
+    assert!(all.status.success(), "{all:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&all.stdout).expect("all Artifact list JSON")["result"]["items"]
+            [0]["id"],
+        artifact_id
+    );
+    let invalid_retention = cli(
+        &server,
+        &["artifact", "list", "--all", "--retention", "typo"],
+    );
+    assert_eq!(invalid_retention.status.code(), Some(2));
+}
+
+#[test]
+fn artifact_publish_rejects_unsafe_or_unsupported_sources_without_path_disclosure() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-safety-project");
+    fs::create_dir(&project_directory).expect("Artifact safety Project");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-artifact-safety-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Artifact Safety"}))
+        .send()
+        .expect("register safety Project")
+        .json::<Value>()
+        .expect("safety Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let source_directory = harness._root.path().join("private-home-component");
+    fs::create_dir(&source_directory).expect("private source directory");
+    let unsupported = source_directory.join("payload.zip");
+    fs::write(&unsupported, b"not-an-entry").expect("unsupported source");
+    let regular = source_directory.join("regular.html");
+    fs::write(
+        &regular,
+        b"<!doctype html><title>Derived title</title><p>safe</p>",
+    )
+    .expect("regular source");
+    let symlink = source_directory.join("linked.html");
+    std::os::unix::fs::symlink(&regular, &symlink).expect("source symlink");
+    let hard_link = source_directory.join("hard-linked.html");
+    fs::hard_link(&regular, &hard_link).expect("source hard link");
+    let backslash = source_directory.join("unsafe\\name.html");
+    fs::write(&backslash, "unsafe route name").expect("backslash source");
+    let double_decode = source_directory.join("unsafe%2Fname.html");
+    fs::write(&double_decode, "double-decode route name").expect("double-decode source");
+
+    for (ordinal, source, expected_status, expected_code) in [
+        ("unsupported", &unsupported, 415, "unsupported_entry_media"),
+        ("symlink", &symlink, 422, "invalid_input"),
+        ("hardlink", &hard_link, 422, "unsafe_source"),
+        ("backslash", &backslash, 422, "invalid_source"),
+        ("double-decode", &double_decode, 422, "invalid_source"),
+    ] {
+        let response = client
+            .post(harness.url("/api/v1/artifacts"))
+            .header("Idempotency-Key", format!("issue-24-unsafe-{ordinal}"))
+            .json(&serde_json::json!({
+                "source": {
+                    "path": source,
+                    "callerWorkingDirectory": harness._root.path()
+                },
+                "projectId": project_id,
+                "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+            }))
+            .send()
+            .expect("rejected Publish");
+        assert_eq!(response.status(), expected_status, "case={ordinal}");
+        let body = response.text().expect("rejected Publish body");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("rejected Publish JSON")["error"]["code"],
+            expected_code
+        );
+        assert!(!body.contains("private-home-component"), "{body}");
+        assert!(
+            !body.contains(harness._root.path().to_str().expect("root path")),
+            "{body}"
+        );
+    }
+
+    fs::remove_file(&hard_link).expect("remove extra hard link");
+    let published = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-derived-title")
+        .json(&serde_json::json!({
+            "source": {"path": regular, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish with derived title");
+    assert_eq!(published.status(), 201);
+    let published = published.json::<Value>().expect("derived title Publish");
+    assert_eq!(published["result"]["artifact"]["title"], "Derived title");
+
+    let conflict = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-derived-title")
+        .json(&serde_json::json!({
+            "source": {"path": regular, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "title": "Changed request",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("Publish fingerprint conflict");
+    assert_eq!(conflict.status(), 409);
+    assert_eq!(
+        conflict.json::<Value>().expect("fingerprint conflict")["error"]["code"],
+        "idempotency_conflict"
+    );
+}
+
+#[test]
+fn artifact_publish_capacity_failure_precedes_storage_and_visibility() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.args(["--max-stored-bytes", "4", "--max-live-artifacts", "1"]);
+        },
+    );
+    let project_directory = harness._root.path().join("capacity-project");
+    fs::create_dir(&project_directory).expect("capacity Project");
+    let source = harness._root.path().join("too-large.txt");
+    fs::write(&source, "five!").expect("capacity source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-capacity-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Capacity"}))
+        .send()
+        .expect("register capacity Project")
+        .json::<Value>()
+        .expect("capacity Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let blocked = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-capacity-publish")
+        .json(&serde_json::json!({
+            "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("capacity-blocked Publish");
+    assert_eq!(blocked.status(), 507);
+    let blocked = blocked.json::<Value>().expect("capacity error");
+    assert_eq!(blocked["error"]["code"], "capacity");
+    assert_eq!(
+        blocked["error"]["details"]["blockingConstraint"],
+        "max_stored_bytes"
+    );
+    assert_eq!(blocked["error"]["details"]["requiredBytes"], 5);
+    for field in [
+        "requiredBytes",
+        "accountedStoredBytes",
+        "maxStoredBytes",
+        "liveArtifacts",
+        "maxLiveArtifacts",
+        "filesystemAvailableBytes",
+        "reserveBytes",
+        "reclaimableBytes",
+        "blockingConstraint",
+    ] {
+        assert!(
+            blocked["error"]["details"].get(field).is_some(),
+            "missing capacity field {field}"
+        );
+    }
+
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("capacity catalogue");
+    for table in ["artifacts", "revisions", "operation_intents"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("capacity table count");
+        assert_eq!(count, 0, "table={table}");
+    }
+    assert!(
+        fs::read_dir(harness.storage.join("staging"))
+            .expect("staging")
+            .next()
+            .is_none()
+    );
+    assert!(
+        fs::read_dir(harness.storage.join("revisions"))
+            .expect("revisions")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn concurrent_publish_capacity_counts_the_first_durable_reservation() {
+    let harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.args(["--max-stored-bytes", "5"]);
+            command.env("OBS_TEST_HOLD_PUBLISH_AFTER_INTENT_MS", "400");
+        },
+    );
+    let project_directory = harness._root.path().join("capacity-reservation-project");
+    fs::create_dir(&project_directory).expect("capacity reservation Project");
+    let source = harness._root.path().join("five.txt");
+    fs::write(&source, "five!").expect("capacity reservation source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-capacity-reservation-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Reservations"}))
+        .send()
+        .expect("register capacity reservation Project")
+        .json::<Value>()
+        .expect("capacity reservation Project JSON");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project["result"]["id"],
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let first_client = client.clone();
+    let publish_url = harness.url("/api/v1/artifacts");
+    let first_url = publish_url.clone();
+    let first_body = body.clone();
+    let first = thread::spawn(move || {
+        first_client
+            .post(first_url)
+            .header("Idempotency-Key", "issue-24-capacity-reservation-first")
+            .json(&first_body)
+            .send()
+            .expect("first reserved Publish")
+    });
+    let mut reservation_observed = false;
+    for _ in 0..100 {
+        let connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+            .expect("capacity reservation catalogue");
+        let count: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM operation_intents WHERE kind='artifact_publish'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("capacity reservation count");
+        if count == 1 {
+            reservation_observed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        reservation_observed,
+        "first Publish reservation was not observed"
+    );
+    let blocked = client
+        .post(publish_url)
+        .header("Idempotency-Key", "issue-24-capacity-reservation-second")
+        .json(&body)
+        .send()
+        .expect("second capacity-blocked Publish");
+    assert_eq!(blocked.status(), 507);
+    let blocked = blocked.json::<Value>().expect("reserved capacity error");
+    assert_eq!(blocked["error"]["details"]["accountedStoredBytes"], 5);
+    assert_eq!(
+        blocked["error"]["details"]["blockingConstraint"],
+        "max_stored_bytes"
+    );
+    assert_eq!(first.join().expect("first Publish worker").status(), 201);
+}
+
+#[test]
+fn source_change_binds_the_key_and_requires_a_new_key_for_later_bytes() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("source-race-project");
+    fs::create_dir(&project_directory).expect("source race Project");
+    let source = harness._root.path().join("changing.txt");
+    let mut source_file = fs::File::create(&source).expect("source race file");
+    source_file
+        .set_len(32 * 1024 * 1024)
+        .expect("size source race file");
+    source_file
+        .write_all(b"source race")
+        .expect("initialize source race file");
+    source_file.sync_all().expect("sync source race file");
+    drop(source_file);
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-source-race-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Source Race"}))
+        .send()
+        .expect("register source race Project")
+        .json::<Value>()
+        .expect("source race Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project_id,
+        "title": "Changing Source",
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let mutating = Arc::new(AtomicBool::new(true));
+    let writer_flag = mutating.clone();
+    let writer_source = source.clone();
+    let writer = thread::spawn(move || {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(writer_source)
+            .expect("open changing source writer");
+        let mut byte = 0_u8;
+        while writer_flag.load(Ordering::Acquire) {
+            file.seek(SeekFrom::End(-1)).expect("seek changing source");
+            file.write_all(&[byte]).expect("mutate changing source");
+            file.sync_data().expect("sync changing source mutation");
+            byte ^= 1;
+        }
+    });
+    thread::sleep(Duration::from_millis(10));
+    let changed = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-source-race-publish")
+        .json(&body)
+        .send()
+        .expect("source-changed Publish");
+    mutating.store(false, Ordering::Release);
+    writer.join().expect("source mutation writer");
+    assert_eq!(changed.status(), 422);
+    assert_eq!(
+        changed.json::<Value>().expect("source_changed JSON")["error"]["code"],
+        "source_changed"
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("source race catalogue");
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("source race authority count");
+        assert_eq!(count, 0, "table={table}");
+    }
+    let failed_state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("failed source race intent");
+    assert_eq!(failed_state, "failed_terminal");
+    drop(catalogue);
+
+    let replay = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-source-race-publish")
+        .json(&body)
+        .send()
+        .expect("source race replay");
+    assert_eq!(replay.status(), 422);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(
+        replay.json::<Value>().expect("source race replay JSON")["error"]["code"],
+        "source_changed"
+    );
+    let later_bytes = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-source-race-later-bytes")
+        .json(&body)
+        .send()
+        .expect("source race new request");
+    assert_eq!(later_bytes.status(), 201);
+    assert_eq!(
+        later_bytes
+            .json::<Value>()
+            .expect("source race new request JSON")["result"]["artifact"]["title"],
+        "Changing Source"
+    );
+}
+
+#[test]
+fn interrupted_publish_reconciles_before_restart_readiness_and_replays_exactly() {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_FAIL_PUBLISH_AFTER_RENAME", "1");
+        },
+    );
+    let project_directory = harness._root.path().join("publish-recovery-project");
+    fs::create_dir(&project_directory).expect("Publish recovery Project");
+    let source = harness._root.path().join("recover.html");
+    fs::write(
+        &source,
+        "<!doctype html><title>Recovered</title><p>durable</p>",
+    )
+    .expect("Publish recovery source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-recovery-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Recovery"}))
+        .send()
+        .expect("register recovery Project")
+        .json::<Value>()
+        .expect("recovery Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project_id,
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-recovery-publish")
+        .json(&body)
+        .send()
+        .expect("injected interrupted Publish");
+    assert_eq!(interrupted.status(), 500);
+    assert_eq!(
+        interrupted.json::<Value>().expect("injected failure")["error"]["code"],
+        "internal"
+    );
+    let before = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[("projectId", project_id)])
+        .send()
+        .expect("Artifact list before recovery")
+        .json::<Value>()
+        .expect("Artifact list before recovery JSON");
+    assert_eq!(before["result"]["items"], serde_json::json!([]));
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("interrupted Publish catalogue");
+    let state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("interrupted Publish state");
+    assert_eq!(state, "renamed");
+    assert_eq!(
+        fs::read_dir(harness.storage.join("revisions"))
+            .expect("durable Revisions")
+            .count(),
+        1
+    );
+    drop(catalogue);
+
+    harness.restart_configured(|_| {});
+    let replay = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-recovery-publish")
+        .json(&body)
+        .send()
+        .expect("replay recovered Publish");
+    assert_eq!(replay.status(), 201);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let replay = replay.json::<Value>().expect("recovered Publish result");
+    let artifact = &replay["result"]["artifact"];
+    let open_path = url::Url::parse(artifact["openUrl"].as_str().expect("recovered Open URL"))
+        .expect("recovered Open URL parse")
+        .path()
+        .to_owned();
+    let served = client
+        .get(harness.url(&open_path))
+        .send()
+        .expect("recovered Artifact bytes");
+    assert_eq!(served.status(), 200);
+    assert_eq!(
+        served.bytes().expect("recovered bytes").as_ref(),
+        b"<!doctype html><title>Recovered</title><p>durable</p>"
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("recovered Publish catalogue");
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("recovered row count");
+        assert_eq!(count, 1, "table={table}");
+    }
+    let operation_state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("recovered operation state");
+    assert_eq!(operation_state, "completed");
+}
+
+#[test]
+fn publish_restart_resumes_each_synced_previsibility_phase() {
+    for (fault, suffix) in [
+        ("OBS_TEST_FAIL_PUBLISH_AFTER_INTENT", "intent-recorded"),
+        ("OBS_TEST_FAIL_PUBLISH_AFTER_STAGE_SYNC", "stage-sync"),
+        ("OBS_TEST_FAIL_PUBLISH_AFTER_STAGED", "staged"),
+        ("OBS_TEST_FAIL_PUBLISH_AFTER_FINALIZE", "finalize"),
+    ] {
+        assert_publish_recovers_from_phase(fault, suffix);
+    }
+}
+
+fn assert_publish_recovers_from_phase(fault: &str, suffix: &str) {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env(fault, "1");
+        },
+    );
+    let project_directory = harness._root.path().join(format!("phase-{suffix}-project"));
+    fs::create_dir(&project_directory).expect("phase recovery Project");
+    let source = harness._root.path().join(format!("phase-{suffix}.html"));
+    fs::write(&source, format!("<!doctype html><title>{suffix}</title>"))
+        .expect("phase recovery source");
+    let client = reqwest::blocking::Client::new();
+    let project_key = format!("issue-24-phase-{suffix}-project");
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", project_key)
+        .json(&serde_json::json!({"path": project_directory, "title": suffix}))
+        .send()
+        .expect("register phase recovery Project")
+        .json::<Value>()
+        .expect("phase recovery Project JSON");
+    let publish_key = format!("issue-24-phase-{suffix}-publish");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project["result"]["id"],
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", &publish_key)
+        .json(&body)
+        .send()
+        .expect("phase-interrupted Publish");
+    assert_eq!(interrupted.status(), 500, "fault={fault}");
+    let (intent_artifact_id, intent_revision_id): (String, String) =
+        rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+            .expect("phase intent catalogue")
+            .query_row(
+                "SELECT json_extract(details_json,'$.artifact.id'),
+                        json_extract(details_json,'$.revision.id')
+         FROM operation_intents WHERE kind='artifact_publish'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("phase intent identities");
+    harness.restart_configured(|_| {});
+    let mut changed_body = body.clone();
+    changed_body["title"] = Value::String("changed request".to_owned());
+    let conflict = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", &publish_key)
+        .json(&changed_body)
+        .send()
+        .expect("phase recovery fingerprint conflict");
+    assert_eq!(conflict.status(), 409, "fault={fault}");
+    assert_eq!(
+        conflict.json::<Value>().expect("phase conflict JSON")["error"]["code"],
+        "idempotency_conflict"
+    );
+    let replay = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", publish_key)
+        .json(&body)
+        .send()
+        .expect("phase recovery replay");
+    assert_eq!(replay.status(), 201, "fault={fault}");
+    if fault != "OBS_TEST_FAIL_PUBLISH_AFTER_INTENT" {
+        assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    }
+    let replay = replay.json::<Value>().expect("phase recovery JSON");
+    assert_eq!(replay["result"]["artifact"]["id"], intent_artifact_id);
+    assert_eq!(replay["result"]["revision"]["id"], intent_revision_id);
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("phase recovery catalogue");
+    let state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("phase recovery state");
+    assert_eq!(state, "completed", "fault={fault}");
+}
+
+#[test]
+fn publish_restart_classifies_every_storage_durability_boundary() {
+    for (fault, suffix, completes) in [
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_COPY_DIGEST",
+            "copy-digest",
+            false,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_PAYLOAD_SYNC",
+            "payload-sync",
+            false,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_WRITE",
+            "manifest-write",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_MANIFEST_SYNC",
+            "manifest-sync",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_CONTENT_SYNC",
+            "content-sync",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_OPERATION_SYNC",
+            "operation-sync",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_STAGING_SYNC",
+            "staging-sync",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_STORAGE_RENAME",
+            "storage-rename",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_RENAME_STAGING_SYNC",
+            "rename-staging-sync",
+            true,
+        ),
+        (
+            "OBS_TEST_CRASH_PUBLISH_AFTER_RENAME_REVISIONS_SYNC",
+            "rename-revisions-sync",
+            true,
+        ),
+    ] {
+        assert_storage_boundary_recovery(fault, suffix, completes);
+    }
+}
+
+fn assert_storage_boundary_recovery(fault: &str, suffix: &str, completes: bool) {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env(fault, "1");
+        },
+    );
+    let project_directory = harness
+        ._root
+        .path()
+        .join(format!("boundary-{suffix}-project"));
+    fs::create_dir(&project_directory).expect("storage boundary Project");
+    let source = harness._root.path().join(format!("boundary-{suffix}.html"));
+    fs::write(&source, format!("<title>{suffix}</title>")).expect("storage boundary source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header(
+            "Idempotency-Key",
+            format!("issue-24-boundary-{suffix}-project"),
+        )
+        .json(&serde_json::json!({"path": project_directory, "title": suffix}))
+        .send()
+        .expect("register storage boundary Project")
+        .json::<Value>()
+        .expect("storage boundary Project JSON");
+    let key = format!("issue-24-boundary-{suffix}-publish");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project["result"]["id"],
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", &key)
+        .json(&body)
+        .send()
+        .expect("storage-boundary Publish response");
+    assert_eq!(interrupted.status(), 500, "fault={fault}");
+    harness.restart_configured(|_| {});
+    let classified = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", &key)
+        .json(&body)
+        .send()
+        .expect("classified storage-boundary retry");
+    assert_eq!(classified.status(), if completes { 201 } else { 500 });
+    if !completes {
+        assert_eq!(classified.headers()["idempotency-replayed"], "true");
+    }
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("storage boundary catalogue");
+    let (state, visible): (String, u64) = catalogue
+        .query_row(
+            "SELECT state,(SELECT count(*) FROM artifacts)
+             FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("storage boundary classification");
+    assert_eq!(
+        state,
+        if completes {
+            "completed"
+        } else {
+            "failed_terminal"
+        }
+    );
+    assert_eq!(visible, u64::from(completes));
+}
+
+#[test]
+fn intent_recorded_retry_rejects_changed_source_without_new_visibility() {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command
+                .arg("--max-stored-bytes")
+                .arg("5")
+                .env("OBS_TEST_FAIL_PUBLISH_AFTER_INTENT", "1");
+        },
+    );
+    let project_directory = harness._root.path().join("intent-source-project");
+    fs::create_dir(&project_directory).expect("intent source Project");
+    let source = harness._root.path().join("intent-source.html");
+    fs::write(&source, "12345").expect("accepted source snapshot");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-intent-source-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Intent Source"}))
+        .send()
+        .expect("register intent source Project")
+        .json::<Value>()
+        .expect("intent source Project JSON");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project["result"]["id"],
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-intent-source-publish")
+        .json(&body)
+        .send()
+        .expect("interrupt intent source Publish");
+    assert_eq!(interrupted.status(), 500);
+    harness.restart_configured(|command| {
+        command.arg("--max-stored-bytes").arg("5");
+    });
+    fs::write(&source, "123456").expect("change accepted source");
+    let changed = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-intent-source-publish")
+        .json(&body)
+        .send()
+        .expect("retry changed intent source");
+    assert_eq!(changed.status(), 422);
+    assert_eq!(
+        changed.json::<Value>().expect("changed intent source JSON")["error"]["code"],
+        "source_changed"
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("intent source catalogue");
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("intent source visible row count");
+        assert_eq!(count, 0, "table={table}");
+    }
+    let state: String = catalogue
+        .query_row(
+            "SELECT state FROM idempotency_requests
+             WHERE key='issue-24-intent-source-publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("changed source idempotency state");
+    assert_eq!(state, "failed_terminal");
+    drop(catalogue);
+    let fresh_source = harness._root.path().join("fresh-after-terminal.html");
+    fs::write(&fresh_source, "abcde").expect("fresh source after terminal failure");
+    let mut fresh_body = body;
+    fresh_body["source"]["path"] = serde_json::json!(fresh_source);
+    let fresh = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-fresh-after-terminal")
+        .json(&fresh_body)
+        .send()
+        .expect("Publish after byte-less terminal failure");
+    assert_eq!(fresh.status(), 201);
+}
+
+#[test]
+fn awaiting_retry_publish_keeps_capacity_reserved_across_restart() {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command
+                .arg("--max-stored-bytes")
+                .arg("5")
+                .env("OBS_TEST_FAIL_PUBLISH_AFTER_INTENT", "1");
+        },
+    );
+    let project_directory = harness._root.path().join("reserved-intent-project");
+    fs::create_dir(&project_directory).expect("reserved intent Project");
+    let accepted_source = harness._root.path().join("accepted.html");
+    let competing_source = harness._root.path().join("competing.html");
+    fs::write(&accepted_source, "12345").expect("accepted reserved source");
+    fs::write(&competing_source, "abcde").expect("competing reserved source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-reserved-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Reserved Intent"}))
+        .send()
+        .expect("register reserved intent Project")
+        .json::<Value>()
+        .expect("reserved intent Project JSON");
+    let project_id = project["result"]["id"].clone();
+    let accepted_body = serde_json::json!({
+        "source": {"path": accepted_source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project_id,
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-reserved-publish")
+        .json(&accepted_body)
+        .send()
+        .expect("interrupt reserved Publish");
+    assert_eq!(interrupted.status(), 500);
+    harness.restart_configured(|command| {
+        command.arg("--max-stored-bytes").arg("5");
+    });
+    let competing = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-competing-publish")
+        .json(&serde_json::json!({
+            "source": {"path": competing_source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("competing reserved Publish");
+    assert_eq!(competing.status(), 507);
+    assert_eq!(
+        competing.json::<Value>().expect("competing capacity JSON")["error"]["details"]["accountedStoredBytes"],
+        5
+    );
+    let resumed = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-reserved-publish")
+        .json(&accepted_body)
+        .send()
+        .expect("resume capacity-reserved Publish");
+    assert_eq!(resumed.status(), 201);
+}
+
+#[test]
+fn malformed_interrupted_publish_is_quarantined_and_bound_to_its_key() {
+    let mut harness = Harness::start_configured(
+        |_| {},
+        |command| {
+            command.env("OBS_TEST_FAIL_PUBLISH_AFTER_RENAME", "1");
+        },
+    );
+    let project_directory = harness._root.path().join("malformed-recovery-project");
+    fs::create_dir(&project_directory).expect("malformed recovery Project");
+    let source = harness._root.path().join("malformed.html");
+    fs::write(&source, "<!doctype html><title>Retry Cleanly</title>")
+        .expect("malformed recovery source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-malformed-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Malformed Recovery"}))
+        .send()
+        .expect("register malformed recovery Project")
+        .json::<Value>()
+        .expect("malformed recovery Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project_id,
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let interrupted = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-malformed-publish")
+        .json(&body)
+        .send()
+        .expect("interrupt malformed Publish");
+    assert_eq!(interrupted.status(), 500);
+    let revision_directory = fs::read_dir(harness.storage.join("revisions"))
+        .expect("interrupted Revision directory")
+        .next()
+        .expect("interrupted Revision entry")
+        .expect("interrupted Revision entry result")
+        .path();
+    fs::write(
+        revision_directory.join("revision-manifest.json"),
+        b"{\"tampered\":true}",
+    )
+    .expect("tamper interrupted manifest");
+
+    harness.restart_configured(|_| {});
+    let listed = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[("projectId", project_id)])
+        .send()
+        .expect("list after malformed recovery")
+        .json::<Value>()
+        .expect("list after malformed recovery JSON");
+    assert_eq!(listed["result"]["items"], serde_json::json!([]));
+    assert!(
+        fs::read_dir(harness.storage.join("revisions"))
+            .expect("revisions")
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_dir(harness.storage.join("quarantine"))
+            .expect("quarantine")
+            .count(),
+        1
+    );
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("malformed recovery catalogue");
+    let state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("malformed recovery state");
+    assert_eq!(state, "failed_terminal");
+    let idempotency_state: String = catalogue
+        .query_row(
+            "SELECT state FROM idempotency_requests WHERE key='issue-24-malformed-publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("malformed idempotency state");
+    assert_eq!(idempotency_state, "failed_terminal");
+    drop(catalogue);
+
+    let replay = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-malformed-publish")
+        .json(&body)
+        .send()
+        .expect("replay malformed Publish");
+    assert_eq!(replay.status(), 500);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let retried = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-malformed-new-attempt")
+        .json(&body)
+        .send()
+        .expect("retry malformed Publish with new key");
+    assert_eq!(retried.status(), 201);
+    let retried = retried
+        .json::<Value>()
+        .expect("retried malformed Publish JSON");
+    assert_eq!(retried["result"]["artifact"]["title"], "Retry Cleanly");
+}
+
+#[test]
+fn artifact_and_revision_routes_canonicalize_reject_and_never_follow_tampered_members() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-route-project");
+    fs::create_dir(&project_directory).expect("Artifact route Project");
+    let source = harness._root.path().join("route.html");
+    fs::write(&source, "<!doctype html><title>Routes</title><p>inside</p>")
+        .expect("Artifact route source");
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("no-redirect client");
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-route-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Routes"}))
+        .send()
+        .expect("register route Project")
+        .json::<Value>()
+        .expect("route Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let published = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-route-publish")
+        .json(&serde_json::json!({
+            "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+            "projectId": project_id,
+            "slug": "canonical-route",
+            "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+        }))
+        .send()
+        .expect("route Publish")
+        .json::<Value>()
+        .expect("route Publish result");
+    let artifact = &published["result"]["artifact"];
+    let revision = &published["result"]["revision"];
+    let artifact_id = artifact["id"].as_str().expect("Artifact ID");
+    let artifact_key = artifact["key"].as_str().expect("Artifact key");
+    let revision_id = revision["id"].as_str().expect("Revision ID");
+    let canonical_artifact = artifact["openUrl"].as_str().expect("Artifact Open URL");
+    let canonical_revision = revision["openUrl"].as_str().expect("Revision Open URL");
+
+    for (path, location) in [
+        (
+            format!("/artifacts/stale~{artifact_id}/"),
+            canonical_artifact,
+        ),
+        (
+            format!(
+                "/artifacts/canonical-route~{}/",
+                artifact_id.to_ascii_uppercase()
+            ),
+            canonical_artifact,
+        ),
+        (format!("/artifacts/{artifact_key}"), canonical_artifact),
+        (
+            format!("/revisions/{}/", revision_id.to_ascii_uppercase()),
+            canonical_revision,
+        ),
+        (format!("/revisions/{revision_id}"), canonical_revision),
+    ] {
+        let response = client
+            .get(harness.url(&path))
+            .send()
+            .expect("canonical redirect");
+        assert_eq!(response.status(), 308, "path={path}");
+        assert_eq!(response.headers()["location"], location, "path={path}");
+    }
+
+    let stale_with_query = client
+        .get(harness.url(&format!("/artifacts/stale~{artifact_id}/?view=compact")))
+        .send()
+        .expect("query-preserving canonical redirect");
+    assert_eq!(stale_with_query.status(), 308);
+    assert_eq!(
+        stale_with_query.headers()["location"],
+        format!("{canonical_artifact}?view=compact")
+    );
+    let malformed_slug = client
+        .get(harness.url(&format!("/artifacts/Not_Valid~{artifact_id}/")))
+        .send()
+        .expect("malformed Artifact slug");
+    assert_eq!(malformed_slug.status(), 422);
+
+    let impossible_id = "z0000000000000000000000000";
+    for path in [
+        "/api/v1/artifacts/not-an-id".to_owned(),
+        "/api/v1/revisions/not-an-id".to_owned(),
+        format!("/api/v1/artifacts/{impossible_id}"),
+        format!("/api/v1/revisions/{impossible_id}"),
+        format!("/artifacts/impossible~{impossible_id}/"),
+        format!("/revisions/{impossible_id}/"),
+    ] {
+        let malformed = client.get(harness.url(&path)).send().expect("malformed ID");
+        assert_eq!(malformed.status(), 422, "path={path}");
+    }
+    let unknown_id = "70000000000000000000000000";
+    for path in [
+        format!("/api/v1/artifacts/{unknown_id}"),
+        format!("/api/v1/revisions/{unknown_id}"),
+        format!("/artifacts/unknown~{unknown_id}/"),
+        format!("/revisions/{unknown_id}/"),
+    ] {
+        let unknown = client.get(harness.url(&path)).send().expect("unknown ID");
+        assert_eq!(unknown.status(), 404, "path={path}");
+    }
+    let suffix = client
+        .get(harness.url(&format!("/artifacts/{artifact_key}/missing")))
+        .send()
+        .expect("missing Artifact suffix");
+    assert_eq!(suffix.status(), 404);
+    let actual_member = client
+        .get(harness.url(&format!("/artifacts/{artifact_key}/route.html?download=0")))
+        .send()
+        .expect("actual Artifact member");
+    assert_eq!(actual_member.status(), 200);
+    for suffix in ["%5Coutside", "%2Foutside", "%252Foutside", "a//b"] {
+        let rejected = client
+            .get(harness.url(&format!("/artifacts/{artifact_key}/{suffix}")))
+            .send()
+            .expect("unsafe Artifact suffix");
+        assert!(
+            rejected.status().is_client_error(),
+            "suffix={suffix}, status={}",
+            rejected.status()
+        );
+    }
+    for suffix in ["%2e", "%2e%2e"] {
+        let status = raw_get_status(
+            harness.address,
+            &format!("/artifacts/{artifact_key}/{suffix}"),
+        );
+        assert!(
+            (400..500).contains(&status),
+            "suffix={suffix}, status={status}"
+        );
+    }
+
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("route boundary catalogue");
+    catalogue
+        .execute(
+            "UPDATE revisions SET entry_path='../catalogue.sqlite' WHERE id=?1",
+            [revision_id],
+        )
+        .expect("seed unsafe durable entry path");
+    let boundary_rejected = client
+        .get(
+            harness.url(
+                url::Url::parse(canonical_artifact)
+                    .expect("canonical Artifact URL")
+                    .path(),
+            ),
+        )
+        .send()
+        .expect("durable entry boundary rejection");
+    assert_eq!(boundary_rejected.status(), 500);
+    catalogue
+        .execute(
+            "UPDATE revisions SET entry_path='route.html' WHERE id=?1",
+            [revision_id],
+        )
+        .expect("restore durable entry path");
+    drop(catalogue);
+
+    let outside = harness._root.path().join("outside-secret.html");
+    fs::write(&outside, "outside secret").expect("outside secret");
+    let revision_member = harness
+        .storage
+        .join("revisions")
+        .join(revision_id)
+        .join("content")
+        .join("route.html");
+    fs::remove_file(&revision_member).expect("remove immutable member for tamper fixture");
+    std::os::unix::fs::symlink(&outside, &revision_member).expect("tampered member symlink");
+    let artifact_open_path = url::Url::parse(canonical_artifact)
+        .expect("Artifact URL")
+        .path()
+        .to_owned();
+    let revision_open_path = url::Url::parse(canonical_revision)
+        .expect("Revision URL")
+        .path()
+        .to_owned();
+    for path in [&artifact_open_path, &revision_open_path] {
+        let response = client
+            .get(harness.url(path))
+            .send()
+            .expect("tampered serving");
+        assert_eq!(response.status(), 500, "path={path}");
+        assert!(
+            !response
+                .text()
+                .expect("tamper response")
+                .contains("outside secret")
+        );
+    }
+
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("route tombstone catalogue");
+    catalogue
+        .execute(
+            "UPDATE artifacts SET state='gone' WHERE id=?1",
+            [artifact_id],
+        )
+        .expect("seed gone Artifact");
+    catalogue
+        .execute(
+            "UPDATE revisions SET state='gone' WHERE id=?1",
+            [revision_id],
+        )
+        .expect("seed gone Revision");
+    for (path, code) in [
+        (format!("/api/v1/artifacts/{artifact_id}"), "artifact_gone"),
+        (format!("/api/v1/revisions/{revision_id}"), "revision_gone"),
+        (artifact_open_path, "artifact_gone"),
+        (revision_open_path, "revision_gone"),
+    ] {
+        let gone = client
+            .get(harness.url(&path))
+            .send()
+            .expect("gone identity");
+        assert_eq!(gone.status(), 410, "path={path}");
+        assert_eq!(
+            gone.json::<Value>().expect("gone identity JSON")["error"]["code"],
+            code,
+            "path={path}"
+        );
+    }
+}
+
+#[test]
+fn artifact_discovery_uses_signed_filter_bound_pagination_across_restart() {
+    let mut harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-page-project");
+    fs::create_dir(&project_directory).expect("Artifact page Project");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-page-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Artifact Pages"}))
+        .send()
+        .expect("register Artifact page Project")
+        .json::<Value>()
+        .expect("Artifact page Project result");
+    let project_id = project["result"]["id"]
+        .as_str()
+        .expect("Artifact page Project ID")
+        .to_owned();
+    for (ordinal, title) in ["Bravo", "Alpha", "Charlie"].into_iter().enumerate() {
+        let source = harness._root.path().join(format!("page-{ordinal}.txt"));
+        fs::write(&source, format!("{title} body")).expect("Artifact page source");
+        let published = client
+            .post(harness.url("/api/v1/artifacts"))
+            .header("Idempotency-Key", format!("issue-24-page-{ordinal}"))
+            .json(&serde_json::json!({
+                "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+                "projectId": project_id,
+                "title": title,
+                "retention": {"mode": "pinned", "ttlMs": null, "pinReason": "pagination"}
+            }))
+            .send()
+            .expect("Publish paginated Artifact");
+        assert_eq!(published.status(), 201);
+    }
+    let invalid_direction = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("direction", "sideways"),
+        ])
+        .send()
+        .expect("invalid Artifact direction");
+    assert_eq!(invalid_direction.status(), 422);
+    assert_eq!(
+        invalid_direction
+            .json::<Value>()
+            .expect("invalid Artifact direction JSON")["error"]["code"],
+        "invalid_direction"
+    );
+    let first = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+        ])
+        .send()
+        .expect("first Artifact page");
+    assert_eq!(first.status(), 200);
+    assert!(
+        first.headers()["link"]
+            .to_str()
+            .expect("next Link")
+            .contains("direction=asc")
+    );
+    let first = first.json::<Value>().expect("first Artifact page JSON");
+    assert_eq!(first["result"]["items"][0]["title"], "Alpha");
+    assert_eq!(first["result"]["page"]["hasMore"], true);
+    let cursor = first["result"]["page"]["nextCursor"]
+        .as_str()
+        .expect("Artifact cursor")
+        .to_owned();
+
+    let mut tampered = cursor.clone();
+    let replacement = if tampered.ends_with('a') { 'b' } else { 'a' };
+    tampered.pop();
+    tampered.push(replacement);
+    let invalid = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+            ("after", tampered.as_str()),
+        ])
+        .send()
+        .expect("tampered Artifact cursor");
+    assert_eq!(invalid.status(), 422);
+    assert_eq!(
+        invalid.json::<Value>().expect("tampered cursor JSON")["error"]["code"],
+        "invalid_cursor"
+    );
+    let direction_mismatch = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "title"),
+            ("direction", "desc"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("direction-mismatched Artifact cursor");
+    assert_eq!(direction_mismatch.status(), 422);
+    let artifact_cursor_on_ledger = client
+        .get(harness.url("/api/v1/projects/ledger"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("kind", "artifact"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("Artifact cursor on Project ledger");
+    assert_eq!(artifact_cursor_on_ledger.status(), 422);
+    assert_eq!(
+        artifact_cursor_on_ledger
+            .json::<Value>()
+            .expect("cross-endpoint cursor JSON")["error"]["code"],
+        "invalid_cursor"
+    );
+    let mismatch = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "recent"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("filter-mismatched Artifact cursor");
+    assert_eq!(mismatch.status(), 422);
+
+    harness.restart_configured(|_| {});
+    let second = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+            ("after", cursor.as_str()),
+        ])
+        .send()
+        .expect("second Artifact page after restart");
+    assert_eq!(second.status(), 200);
+    let second = second.json::<Value>().expect("second Artifact page JSON");
+    assert_eq!(second["result"]["items"][0]["title"], "Bravo");
+    let descending = client
+        .get(harness.url("/api/v1/artifacts"))
+        .query(&[
+            ("projectId", project_id.as_str()),
+            ("retentionMode", "pinned"),
+            ("order", "title"),
+            ("direction", "desc"),
+            ("limit", "1"),
+        ])
+        .send()
+        .expect("descending Artifact page")
+        .json::<Value>()
+        .expect("descending Artifact page JSON");
+    assert_eq!(descending["result"]["items"][0]["title"], "Charlie");
+
+    for ledger_path in [
+        "/api/v1/projects/ledger".to_owned(),
+        format!("/api/v1/projects/{project_id}/ledger"),
+    ] {
+        let mut request = client.get(harness.url(&ledger_path)).query(&[
+            ("kind", "artifact"),
+            ("order", "title"),
+            ("direction", "asc"),
+            ("limit", "1"),
+        ]);
+        if ledger_path == "/api/v1/projects/ledger" {
+            request = request.query(&[("projectId", project_id.as_str())]);
+        }
+        let ledger = request.send().expect("first Project ledger page");
+        assert_eq!(ledger.status(), 200);
+        let link = ledger.headers()["link"]
+            .to_str()
+            .expect("Project ledger next Link");
+        let target = link
+            .strip_prefix('<')
+            .and_then(|value| value.split_once('>'))
+            .map(|(target, relation)| {
+                assert_eq!(relation, "; rel=\"next\"");
+                target
+            })
+            .expect("RFC 8288 Project ledger Link");
+        let target = url::Url::parse(target).expect("absolute Project ledger next URL");
+        assert_eq!(target.path(), ledger_path);
+        assert!(
+            target
+                .query()
+                .expect("ledger next query")
+                .contains("direction=asc")
+        );
+        let continuation_cursor = target
+            .query_pairs()
+            .find_map(|(name, value)| (name == "after").then(|| value.into_owned()))
+            .expect("ledger continuation cursor");
+        let wrong_kind = client
+            .get(harness.url(&ledger_path))
+            .query(&[
+                ("kind", "all"),
+                ("order", "title"),
+                ("direction", "asc"),
+                ("limit", "1"),
+                ("after", continuation_cursor.as_str()),
+            ])
+            .send()
+            .expect("filter-mismatched ledger cursor");
+        assert_eq!(wrong_kind.status(), 422);
+        let local_target = format!(
+            "{}?{}",
+            target.path(),
+            target.query().expect("ledger continuation query")
+        );
+        let continued = client
+            .get(harness.url(&local_target))
+            .send()
+            .expect("continued Project ledger page");
+        assert_eq!(continued.status(), 200);
+        assert_eq!(
+            continued
+                .json::<Value>()
+                .expect("continued Project ledger JSON")["result"]["items"][0]["title"],
+            "Bravo"
+        );
+    }
+}
+
+#[test]
+fn artifact_publish_client_timeout_continues_and_identical_retry_replays() {
+    let harness = Harness::start();
+    let project_directory = harness._root.path().join("artifact-timeout-project");
+    fs::create_dir(&project_directory).expect("Artifact timeout Project");
+    let source = harness._root.path().join("timeout.html");
+    fs::write(&source, "<!doctype html><title>Timeout Artifact</title>")
+        .expect("Artifact timeout source");
+    let server = format!("http://{}", harness.address);
+    let registered = cli(
+        &server,
+        &[
+            "--idempotency-key",
+            "issue-24-timeout-project",
+            "project",
+            "register",
+            project_directory.to_str().expect("timeout Project path"),
+            "--title",
+            "Artifact Timeout",
+        ],
+    );
+    assert!(registered.status.success(), "{registered:?}");
+    let registered: Value =
+        serde_json::from_slice(&registered.stdout).expect("timeout Project JSON");
+    let project_id = registered["result"]["id"]
+        .as_str()
+        .expect("timeout Project ID")
+        .to_owned();
+    let mut lock_connection = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("Artifact timeout catalogue lock");
+    let lock = lock_connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("hold Artifact timeout write lock");
+    let mut command = obs();
+    command
+        .args([
+            "--json",
+            "--server",
+            &server,
+            "--timeout",
+            "20ms",
+            "-p",
+            project_directory.to_str().expect("timeout Project path"),
+            "--idempotency-key",
+            "issue-24-timeout-publish",
+            "artifact",
+            "publish",
+            source.to_str().expect("timeout source path"),
+            "--title",
+            "Timeout Artifact",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("timed Artifact Publish CLI");
+    thread::sleep(Duration::from_millis(100));
+    let timed_out = child
+        .wait_with_output()
+        .expect("timed Artifact Publish output");
+    assert_eq!(timed_out.status.code(), Some(5));
+    assert!(timed_out.stdout.is_empty());
+    let timeout: Value = serde_json::from_slice(&timed_out.stderr).expect("Publish timeout JSON");
+    assert_eq!(timeout["error"]["code"], "client_timeout");
+    assert_eq!(
+        timeout["error"]["details"]["idempotencyKey"],
+        "issue-24-timeout-publish"
+    );
+
+    let body = serde_json::json!({
+        "source": {
+            "path": source,
+            "callerWorkingDirectory": std::env::current_dir().expect("test current directory")
+        },
+        "projectId": project_id,
+        "title": "Timeout Artifact",
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let client = reqwest::blocking::Client::new();
+    let concurrent = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-timeout-publish")
+        .json(&body)
+        .send()
+        .expect("concurrent Artifact Publish");
+    assert_eq!(concurrent.status(), 409);
+    assert_eq!(concurrent.headers()["retry-after"], "1");
+    assert_eq!(
+        concurrent.json::<Value>().expect("concurrent Publish JSON")["error"]["code"],
+        "idempotency_in_progress"
+    );
+    drop(lock);
+    drop(lock_connection);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let replay = loop {
+        let response = client
+            .post(harness.url("/api/v1/artifacts"))
+            .header("Idempotency-Key", "issue-24-timeout-publish")
+            .json(&body)
+            .send()
+            .expect("retry timed Artifact Publish");
+        if response.status() == 201 {
+            break response;
+        }
+        assert_eq!(response.status(), 409);
+        assert!(Instant::now() < deadline, "Artifact Publish did not finish");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let catalogue = rusqlite::Connection::open(harness.storage.join("catalogue.sqlite"))
+        .expect("Artifact timeout result catalogue");
+    let count: u64 = catalogue
+        .query_row("SELECT count(*) FROM artifacts", [], |row| row.get(0))
+        .expect("Artifact timeout result count");
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn publish_visibility_transaction_failure_rolls_back_and_restart_finishes_once() {
+    let mut harness = Harness::start();
+    let project_directory = harness._root.path().join("publish-rollback-project");
+    fs::create_dir(&project_directory).expect("Publish rollback Project");
+    let source = harness._root.path().join("rollback.txt");
+    fs::write(&source, "transactional bytes").expect("Publish rollback source");
+    let client = reqwest::blocking::Client::new();
+    let project = client
+        .post(harness.url("/api/v1/projects"))
+        .header("Idempotency-Key", "issue-24-rollback-project")
+        .json(&serde_json::json!({"path": project_directory, "title": "Publish Rollback"}))
+        .send()
+        .expect("register Publish rollback Project")
+        .json::<Value>()
+        .expect("Publish rollback Project result");
+    let project_id = project["result"]["id"].as_str().expect("Project ID");
+    let catalogue_path = harness.storage.join("catalogue.sqlite");
+    let catalogue = rusqlite::Connection::open(&catalogue_path).expect("rollback catalogue");
+    catalogue
+        .execute_batch(
+            "CREATE TRIGGER inject_artifact_publish_audit_failure
+             BEFORE INSERT ON audit_events
+             WHEN NEW.kind='artifact_published'
+             BEGIN SELECT RAISE(ABORT, 'injected Artifact Publish audit failure'); END;",
+        )
+        .expect("install Artifact Publish transaction fault");
+    let body = serde_json::json!({
+        "source": {"path": source, "callerWorkingDirectory": harness._root.path()},
+        "projectId": project_id,
+        "retention": {"mode": "default", "ttlMs": null, "pinReason": null}
+    });
+    let failed = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-rollback-publish")
+        .json(&body)
+        .send()
+        .expect("faulted Publish transaction");
+    assert_eq!(failed.status(), 500);
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("rolled-back authority count");
+        assert_eq!(count, 0, "table={table}");
+    }
+    let operation_state: String = catalogue
+        .query_row(
+            "SELECT state FROM operation_intents WHERE kind='artifact_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back operation state");
+    assert_eq!(operation_state, "renamed");
+    catalogue
+        .execute_batch("DROP TRIGGER inject_artifact_publish_audit_failure;")
+        .expect("remove Artifact Publish transaction fault");
+    drop(catalogue);
+
+    harness.restart_configured(|_| {});
+    let replay = client
+        .post(harness.url("/api/v1/artifacts"))
+        .header("Idempotency-Key", "issue-24-rollback-publish")
+        .json(&body)
+        .send()
+        .expect("replay transaction-recovered Publish");
+    assert_eq!(replay.status(), 201);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    let catalogue = rusqlite::Connection::open(catalogue_path).expect("recovered catalogue");
+    for table in ["artifacts", "revisions"] {
+        let count: u64 = catalogue
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("recovered authority count");
+        assert_eq!(count, 1, "table={table}");
+    }
+    let audit_count: u64 = catalogue
+        .query_row(
+            "SELECT count(*) FROM audit_events WHERE kind='artifact_published' AND resource_id=(SELECT id FROM artifacts LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Artifact Publish audit count");
+    assert_eq!(audit_count, 1);
 }
 
 #[test]
@@ -840,7 +3103,14 @@ fn project_tombstone_enforces_gates_and_preserves_artifact_association() {
     let catalogue = rusqlite::Connection::open(&catalogue_path).expect("catalogue");
     catalogue
         .execute(
-            "INSERT INTO artifacts(id,project_id,record_version) VALUES (?1,?2,1)",
+            "INSERT INTO artifacts(
+                 id,project_id,record_version,state,title,description,slug,title_fold,search_text,
+                 retention_mode,files,logical_bytes,revision_count,published_at,updated_at
+             ) VALUES (
+                 ?1,?2,1,'live','Fixture Artifact','','fixture-artifact','fixture artifact',
+                 'fixture artifact','default',1,0,1,
+                 '2026-07-10T00:00:00.000Z','2026-07-10T00:00:00.000Z'
+             )",
             rusqlite::params!["11111111111111111111111111", id],
         )
         .expect("associated Artifact fixture");
@@ -2150,7 +4420,7 @@ fn daemon_exposes_empty_authority_configuration_and_shell() {
         }
     }
     assert_eq!(status["result"]["policy"]["applicationId"], 0x4f42_5356_u64);
-    assert_eq!(status["result"]["policy"]["userVersion"], 3);
+    assert_eq!(status["result"]["policy"]["userVersion"], 4);
     assert_eq!(status["result"]["policy"]["foreignKeys"], true);
     assert_eq!(status["result"]["policy"]["journalMode"], "wal");
     assert_eq!(status["result"]["policy"]["synchronous"], "FULL");

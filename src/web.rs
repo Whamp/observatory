@@ -4,7 +4,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Form, Path as AxumPath, Query, State};
+use axum::extract::{Form, OriginalUri, Path as AxumPath, Query, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION, ORIGIN, REFERER,
 };
@@ -13,6 +13,9 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::{
+    ArtifactService, ListArtifactsQuery, PublishArtifactRequest, PublishOutcome, ServedRevision,
+};
 use crate::catalogue::{Catalogue, CatalogueCounts, CataloguePolicy};
 use crate::config::{EffectiveConfiguration, validate_proposal};
 use crate::crypto::random_opaque_id;
@@ -22,14 +25,15 @@ use crate::project::{
     LedgerQuery, ListProjectsQuery, Project, ProjectList, ProjectMutationOutcome, ProjectService,
     ProjectTombstonePreview, RegisterProjectRequest, TombstoneProjectRequest, UpdateProjectRequest,
 };
+use crate::route_slug;
 use crate::storage_status::StorageStatus;
 use crate::ui;
 
-const BUILD_ID: &str = "project-lifecycle-v3";
+const BUILD_ID: &str = "artifact-publish-v5";
 const CSS: &str = include_str!("assets/app.css");
 const JAVASCRIPT: &str = include_str!("assets/app.js");
 const CSS_ETAG: &str =
-    "\"sha256-3c60f9f30cdeb66a7a382adcd786342ee8a4fe5ebcf5e232a5124c3253c7139d\"";
+    "\"sha256-a60da16359860b6522559806e9e417020c5d49b6f66623f77cf056dd060a5adf\"";
 const JS_ETAG: &str = "\"sha256-a27290f25b511dccc01582d65ff2153b5d47c320ec4f537ae5a8c7ebc78d7f18\"";
 
 #[derive(Clone)]
@@ -37,21 +41,33 @@ pub struct ApplicationState {
     configuration: Arc<EffectiveConfiguration>,
     catalogue: Catalogue,
     projects: ProjectService,
+    artifacts: ArtifactService,
     csrf: CsrfStore,
 }
 
 impl ApplicationState {
-    pub fn new(configuration: EffectiveConfiguration, catalogue: Catalogue) -> Self {
+    pub fn new(
+        configuration: EffectiveConfiguration,
+        catalogue: Catalogue,
+    ) -> Result<Self, AppError> {
         let projects = ProjectService::new(
             catalogue.clone(),
             configuration.server.canonical_origin.clone(),
         );
-        Self {
+        let artifacts = ArtifactService::new(
+            catalogue.clone(),
+            configuration.server.canonical_origin.clone(),
+            configuration.storage.max_stored_bytes,
+            configuration.storage.max_live_artifacts,
+        )?;
+        artifacts.reconcile_publish_intents()?;
+        Ok(Self {
             configuration: Arc::new(configuration),
             catalogue,
             projects,
+            artifacts,
             csrf: CsrfStore::default(),
-        }
+        })
     }
 }
 
@@ -176,6 +192,10 @@ pub fn router(state: ApplicationState) -> Router {
         .route("/ui/projects/", post(ui_submit_project))
         .route("/ui/projects/{project_key}/", get(ui_project_detail))
         .route(
+            "/ui/projects/{project_key}/artifacts/{artifact_key}/",
+            get(ui_artifact_detail),
+        )
+        .route(
             "/ui/projects/{project_key}/update/",
             post(ui_update_project),
         )
@@ -191,6 +211,28 @@ pub fn router(state: ApplicationState) -> Router {
         .route(
             "/api/v1/projects",
             get(list_projects).post(register_project),
+        )
+        .route(
+            "/api/v1/artifacts",
+            get(list_artifacts).post(publish_artifact),
+        )
+        .route("/api/v1/artifacts/{artifact_id}", get(show_artifact))
+        .route(
+            "/api/v1/artifacts/{artifact_id}/revisions",
+            get(list_artifact_revisions),
+        )
+        .route("/api/v1/revisions/{revision_id}", get(show_revision))
+        .route("/artifacts/{artifact_key}", get(open_artifact))
+        .route("/artifacts/{artifact_key}/", get(open_artifact))
+        .route(
+            "/artifacts/{artifact_key}/{*member_path}",
+            get(open_artifact_member),
+        )
+        .route("/revisions/{revision_id}", get(open_revision))
+        .route("/revisions/{revision_id}/", get(open_revision))
+        .route(
+            "/revisions/{revision_id}/{*member_path}",
+            get(open_revision_member),
         )
         .route("/api/v1/projects/resolve", get(resolve_project))
         .route("/api/v1/projects/ledger", get(all_projects_ledger))
@@ -266,9 +308,19 @@ async fn ui_project_detail(
         Err(response) => return *response,
     };
     let projects = state.projects.clone();
-    match tokio::task::spawn_blocking(move || projects.show(&project_id)).await {
-        Ok(Ok(project)) if project.key() == project_key => render_project_detail(&state, &project),
-        Ok(Ok(project)) => browser_project_redirect(project.detail_url()),
+    let artifacts = state.artifacts.clone();
+    let selected_id = project_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        let project = projects.show(&project_id)?;
+        let entries = artifacts.list(ListArtifactsQuery::for_project(selected_id))?;
+        Ok::<_, AppError>((project, entries))
+    })
+    .await
+    {
+        Ok(Ok((project, entries))) if project.key() == project_key => {
+            render_project_detail(&state, &project, &entries)
+        }
+        Ok(Ok((project, _))) => browser_project_redirect(project.detail_url()),
         Ok(Err(error)) => ui_error(&error),
         Err(error) => ui_error(&AppError::internal(format!(
             "Project detail worker failed: {error}"
@@ -276,7 +328,11 @@ async fn ui_project_detail(
     }
 }
 
-fn render_project_detail(state: &ApplicationState, project: &Project) -> Response {
+fn render_project_detail(
+    state: &ApplicationState,
+    project: &Project,
+    entries: &crate::artifact::ArtifactList,
+) -> Response {
     let scope = project_csrf_scope(
         ProjectMutationAction::Update,
         project,
@@ -295,10 +351,43 @@ fn render_project_detail(state: &ApplicationState, project: &Project) -> Respons
             project,
             &csrf_token,
             &idempotency_key,
+            entries,
             BUILD_ID,
         ))
         .into_response(),
     )
+}
+
+async fn ui_artifact_detail(
+    State(state): State<ApplicationState>,
+    AxumPath((project_key, artifact_key)): AxumPath<(String, String)>,
+) -> Response {
+    let Some((_, artifact_id)) = artifact_key.rsplit_once('~') else {
+        return ui_error(&AppError::invalid(
+            "invalid_artifact_id",
+            "Artifact key is malformed",
+        ));
+    };
+    let artifacts = state.artifacts.clone();
+    let artifact_id = artifact_id.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let artifact = artifacts.show_artifact(&artifact_id)?;
+        let revision = artifacts.show_revision(artifact.current_revision_id())?;
+        Ok::<_, AppError>((artifact, revision))
+    })
+    .await
+    {
+        Ok(Ok((artifact, revision)))
+            if artifact.key() == artifact_key && artifact.project_key() == project_key =>
+        {
+            no_store(Html(ui::artifact_detail(&artifact, &revision, BUILD_ID)).into_response())
+        }
+        Ok(Ok((artifact, _))) => browser_project_redirect(artifact.detail_url()),
+        Ok(Err(error)) => ui_error(&error),
+        Err(error) => ui_error(&AppError::internal(format!(
+            "Artifact detail worker failed: {error}"
+        ))),
+    }
 }
 
 async fn ui_tombstone_project(
@@ -788,13 +877,76 @@ async fn ledger_response(
         }
     };
     let projects = state.projects.clone();
-    match tokio::task::spawn_blocking(move || projects.ledger(query, project_id)).await {
-        Ok(Ok(result)) => api_success(result),
+    let artifacts = state.artifacts.clone();
+    let query_for_link = query.clone();
+    let project_id_for_link = project_id.clone();
+    let canonical_origin = state.configuration.server.canonical_origin.clone();
+    match tokio::task::spawn_blocking(move || {
+        projects.ledger(query.clone(), project_id.clone())?;
+        let limit = query.limit.unwrap_or(50);
+        let artifact_query = ListArtifactsQuery::from_ledger(&query, project_id.as_deref());
+        match artifact_query {
+            Some(query) => artifacts.list(query),
+            None => Ok(crate::artifact::ArtifactList::empty(limit)),
+        }
+    })
+    .await
+    {
+        Ok(Ok(result)) => {
+            let next_link = result
+                .next_cursor()
+                .map(|cursor| {
+                    ledger_next_link(
+                        &canonical_origin,
+                        &query_for_link,
+                        project_id_for_link.as_deref(),
+                        cursor,
+                    )
+                })
+                .transpose();
+            match next_link {
+                Ok(next_link) => artifact_list_response(result, next_link.as_deref()),
+                Err(error) => api_error(&error),
+            }
+        }
         Ok(Err(error)) => api_error(&error),
         Err(error) => api_error(&AppError::internal(format!(
             "Project ledger worker failed: {error}"
         ))),
     }
+}
+
+fn ledger_next_link(
+    canonical_origin: &str,
+    query: &LedgerQuery,
+    project_id: Option<&str>,
+    cursor: &str,
+) -> Result<String, AppError> {
+    let path = project_id.map_or_else(
+        || "api/v1/projects/ledger".to_owned(),
+        |project_id| format!("api/v1/projects/{project_id}/ledger"),
+    );
+    let mut url = url::Url::parse(&format!("{canonical_origin}{path}"))
+        .map_err(|error| AppError::internal(format!("Project ledger URL is invalid: {error}")))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (name, value) in [
+            ("projectId", query.project_id.as_deref()),
+            ("kind", query.kind.as_deref()),
+            ("query", query.query.as_deref()),
+            ("order", query.order.as_deref()),
+            ("direction", query.direction.as_deref()),
+        ] {
+            if let Some(value) = value {
+                pairs.append_pair(name, value);
+            }
+        }
+        if let Some(limit) = query.limit {
+            pairs.append_pair("limit", &limit.to_string());
+        }
+        pairs.append_pair("after", cursor);
+    }
+    Ok(url.into())
 }
 
 async fn register_project(
@@ -829,6 +981,424 @@ async fn register_project(
             "Project registration worker failed: {error}"
         ))),
     }
+}
+
+async fn list_artifacts(
+    State(state): State<ApplicationState>,
+    query: Result<Query<ListArtifactsQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return api_failure(rejection.status(), &AppError::usage(rejection.body_text()));
+        }
+    };
+    let artifacts = state.artifacts.clone();
+    let query_for_link = query.clone();
+    let canonical_origin = state.configuration.server.canonical_origin.clone();
+    match tokio::task::spawn_blocking(move || artifacts.list(query)).await {
+        Ok(Ok(list)) => {
+            let next_link = list
+                .next_cursor()
+                .map(|cursor| query_for_link.next_link(&canonical_origin, cursor))
+                .transpose();
+            match next_link {
+                Ok(next_link) => artifact_list_response(list, next_link.as_deref()),
+                Err(error) => api_error(&error),
+            }
+        }
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Artifact list worker failed: {error}"
+        ))),
+    }
+}
+
+fn artifact_list_response<T: Serialize>(result: T, next_link: Option<&str>) -> Response {
+    let mut response = api_success(result);
+    if let Some(next_link) = next_link {
+        let Ok(link) = HeaderValue::from_str(&format!("<{next_link}>; rel=\"next\"")) else {
+            return api_error(&AppError::internal("Artifact next link is invalid"));
+        };
+        response
+            .headers_mut()
+            .insert(axum::http::header::LINK, link);
+    }
+    response
+}
+
+async fn show_artifact(
+    State(state): State<ApplicationState>,
+    AxumPath(artifact_id): AxumPath<String>,
+) -> Response {
+    let artifacts = state.artifacts.clone();
+    match tokio::task::spawn_blocking(move || artifacts.show_artifact(&artifact_id)).await {
+        Ok(Ok(artifact)) => {
+            let etag = artifact.etag();
+            let mut response = api_success(artifact);
+            let Ok(etag) = HeaderValue::from_str(&etag) else {
+                return api_error(&AppError::internal("Artifact ETag is invalid"));
+            };
+            response.headers_mut().insert(ETAG, etag);
+            response
+        }
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Artifact show worker failed: {error}"
+        ))),
+    }
+}
+
+async fn list_artifact_revisions(
+    State(state): State<ApplicationState>,
+    AxumPath(artifact_id): AxumPath<String>,
+) -> Response {
+    let artifacts = state.artifacts.clone();
+    match tokio::task::spawn_blocking(move || artifacts.list_revisions(&artifact_id)).await {
+        Ok(Ok(revisions)) => api_success(revisions),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Revision list worker failed: {error}"
+        ))),
+    }
+}
+
+async fn show_revision(
+    State(state): State<ApplicationState>,
+    AxumPath(revision_id): AxumPath<String>,
+) -> Response {
+    let artifacts = state.artifacts.clone();
+    match tokio::task::spawn_blocking(move || artifacts.show_revision(&revision_id)).await {
+        Ok(Ok(revision)) => api_success(revision),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Revision show worker failed: {error}"
+        ))),
+    }
+}
+
+async fn publish_artifact(
+    State(state): State<ApplicationState>,
+    headers: HeaderMap,
+    request: Result<Json<PublishArtifactRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return api_failure(rejection.status(), &AppError::usage(rejection.body_text()));
+        }
+    };
+    if let Err(error) = authorize_api_browser_mutation(&state, &headers, "artifact.publish") {
+        return api_error(&error);
+    }
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return api_error(&AppError::invalid(
+            "invalid_idempotency_key",
+            "Idempotency-Key is required",
+        ));
+    };
+    let artifacts = state.artifacts.clone();
+    match tokio::task::spawn_blocking(move || artifacts.publish(&request, &idempotency_key)).await {
+        Ok(Ok(outcome)) => artifact_publish_response(&outcome),
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Artifact Publish worker failed: {error}"
+        ))),
+    }
+}
+
+async fn open_artifact(
+    State(state): State<ApplicationState>,
+    OriginalUri(uri): OriginalUri,
+    AxumPath(artifact_key): AxumPath<String>,
+) -> Response {
+    serve_artifact_request(state, uri, artifact_key, None).await
+}
+
+async fn open_artifact_member(
+    State(state): State<ApplicationState>,
+    OriginalUri(uri): OriginalUri,
+    AxumPath((artifact_key, member_path)): AxumPath<(String, String)>,
+) -> Response {
+    serve_artifact_request(state, uri, artifact_key, Some(member_path)).await
+}
+
+async fn serve_artifact_request(
+    state: ApplicationState,
+    uri: axum::http::Uri,
+    artifact_key: String,
+    member_path: Option<String>,
+) -> Response {
+    let artifact_id = match artifact_route_id(&artifact_key) {
+        Ok(id) => id,
+        Err(error) => return api_error(&error),
+    };
+    let artifacts = state.artifacts.clone();
+    let artifact_id = artifact_id.to_ascii_lowercase();
+    let requested_member = match member_path {
+        Some(_) => match decode_raw_member_path(uri.path(), "artifacts") {
+            Ok(member) => Some(member),
+            Err(error) => return api_error(&error),
+        },
+        None => None,
+    };
+    let lookup_member = requested_member.clone();
+    match tokio::task::spawn_blocking(move || {
+        artifacts.serve_artifact(&artifact_id, lookup_member.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(served)) => {
+            let canonical_key = served.artifact_key.as_deref().unwrap_or_default();
+            let canonical = match canonical_byte_url(
+                &state.configuration.server.canonical_origin,
+                "artifacts",
+                canonical_key,
+                requested_member.as_deref(),
+                uri.query(),
+            ) {
+                Ok(url) => url,
+                Err(error) => return api_error(&error),
+            };
+            if canonical.path() != uri.path() {
+                return permanent_redirect(canonical.as_str());
+            }
+            served_revision_response(served)
+        }
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Artifact serving worker failed: {error}"
+        ))),
+    }
+}
+
+async fn open_revision(
+    State(state): State<ApplicationState>,
+    OriginalUri(uri): OriginalUri,
+    AxumPath(revision_id): AxumPath<String>,
+) -> Response {
+    serve_revision_request(state, uri, revision_id, None).await
+}
+
+async fn open_revision_member(
+    State(state): State<ApplicationState>,
+    OriginalUri(uri): OriginalUri,
+    AxumPath((revision_id, member_path)): AxumPath<(String, String)>,
+) -> Response {
+    serve_revision_request(state, uri, revision_id, Some(member_path)).await
+}
+
+async fn serve_revision_request(
+    state: ApplicationState,
+    uri: axum::http::Uri,
+    revision_id: String,
+    member_path: Option<String>,
+) -> Response {
+    let artifacts = state.artifacts.clone();
+    let canonical_id = revision_id.to_ascii_lowercase();
+    let lookup_id = canonical_id.clone();
+    let requested_member = match member_path {
+        Some(_) => match decode_raw_member_path(uri.path(), "revisions") {
+            Ok(member) => Some(member),
+            Err(error) => return api_error(&error),
+        },
+        None => None,
+    };
+    let lookup_member = requested_member.clone();
+    match tokio::task::spawn_blocking(move || {
+        artifacts.serve_revision(&lookup_id, lookup_member.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(served)) => {
+            let canonical = match canonical_byte_url(
+                &state.configuration.server.canonical_origin,
+                "revisions",
+                &canonical_id,
+                requested_member.as_deref(),
+                uri.query(),
+            ) {
+                Ok(url) => url,
+                Err(error) => return api_error(&error),
+            };
+            if canonical.path() != uri.path() {
+                return permanent_redirect(canonical.as_str());
+            }
+            served_revision_response(served)
+        }
+        Ok(Err(error)) => api_error(&error),
+        Err(error) => api_error(&AppError::internal(format!(
+            "Revision serving worker failed: {error}"
+        ))),
+    }
+}
+
+fn artifact_route_id(key: &str) -> Result<&str, AppError> {
+    let (slug, id) = key
+        .rsplit_once('~')
+        .ok_or_else(|| AppError::invalid("invalid_artifact_id", "Artifact key is malformed"))?;
+    if !route_slug::is_valid(slug) {
+        return Err(AppError::invalid(
+            "invalid_artifact_id",
+            "Artifact route slug is malformed",
+        ));
+    }
+    Ok(id)
+}
+
+fn decode_raw_member_path(raw_path: &str, resource: &str) -> Result<String, AppError> {
+    let prefix = format!("/{resource}/");
+    let remainder = raw_path.strip_prefix(&prefix).ok_or_else(|| {
+        AppError::invalid("invalid_artifact_path", "Artifact byte path is malformed")
+    })?;
+    let (_, raw_member) = remainder.split_once('/').ok_or_else(|| {
+        AppError::invalid("invalid_artifact_path", "Artifact member path is missing")
+    })?;
+    if raw_member.is_empty() || raw_member.contains(['/', '\\', '\0']) {
+        return Err(AppError::invalid(
+            "invalid_artifact_path",
+            "Artifact member path is unsafe",
+        ));
+    }
+    let bytes = percent_decode_once(raw_member)?;
+    let member = String::from_utf8(bytes).map_err(|_| {
+        AppError::invalid("invalid_artifact_path", "Artifact member path is not UTF-8")
+    })?;
+    if member == "."
+        || member == ".."
+        || member.contains(['/', '\\', '\0'])
+        || contains_percent_escape(&member)
+    {
+        return Err(AppError::invalid(
+            "invalid_artifact_path",
+            "Artifact member path is unsafe",
+        ));
+    }
+    Ok(member)
+}
+
+fn percent_decode_once(value: &str) -> Result<Vec<u8>, AppError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(AppError::invalid(
+                "invalid_artifact_path",
+                "Artifact member path has a malformed escape",
+            ));
+        }
+        let high = hex_value(bytes[index + 1]);
+        let low = hex_value(bytes[index + 2]);
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(AppError::invalid(
+                "invalid_artifact_path",
+                "Artifact member path has a malformed escape",
+            ));
+        };
+        let byte = high * 16 + low;
+        if matches!(byte, b'/' | b'\\' | 0) {
+            return Err(AppError::invalid(
+                "invalid_artifact_path",
+                "Artifact member path contains an encoded separator",
+            ));
+        }
+        decoded.push(byte);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
+fn contains_percent_escape(value: &str) -> bool {
+    value.as_bytes().windows(3).any(|window| {
+        window[0] == b'%' && hex_value(window[1]).is_some() && hex_value(window[2]).is_some()
+    })
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn canonical_byte_url(
+    canonical_origin: &str,
+    resource: &str,
+    identity: &str,
+    member_path: Option<&str>,
+    query: Option<&str>,
+) -> Result<url::Url, AppError> {
+    let mut url = url::Url::parse(canonical_origin)
+        .map_err(|error| AppError::internal(format!("canonical origin is invalid: {error}")))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| AppError::internal("canonical origin cannot carry byte routes"))?;
+        segments.clear().push(resource).push(identity);
+        match member_path {
+            Some(member) => {
+                segments.push(member);
+            }
+            None => {
+                segments.push("");
+            }
+        }
+    }
+    url.set_query(query);
+    Ok(url)
+}
+
+fn artifact_publish_response(outcome: &PublishOutcome) -> Response {
+    let mut response = (StatusCode::CREATED, Json(Success::new(outcome.result()))).into_response();
+    for (name, value) in [
+        (ETAG, outcome.etag()),
+        (LOCATION, outcome.location().to_owned()),
+    ] {
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            return api_error(&AppError::internal("Artifact response header is invalid"));
+        };
+        response.headers_mut().insert(name, value);
+    }
+    if outcome.replayed() {
+        response
+            .headers_mut()
+            .insert("idempotency-replayed", HeaderValue::from_static("true"));
+    }
+    no_store(response)
+}
+
+fn served_revision_response(served: ServedRevision) -> Response {
+    let Ok(content_type) = HeaderValue::from_str(&served.media_type) else {
+        return api_error(&AppError::internal("Revision media type is invalid"));
+    };
+    let mut response = Response::new(Body::from(served.bytes));
+    response.headers_mut().insert(CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn permanent_redirect(location: &str) -> Response {
+    let Ok(location) = HeaderValue::from_str(location) else {
+        return api_error(&AppError::internal("canonical Artifact URL is invalid"));
+    };
+    let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
+    response.headers_mut().insert(LOCATION, location);
+    response
 }
 
 async fn update_project(
@@ -1200,6 +1770,11 @@ fn api_error(error: &AppError) -> Response {
     let status =
         StatusCode::from_u16(error.api_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = no_store((status, Json(error.envelope())).into_response());
+    if error.replayed() {
+        response
+            .headers_mut()
+            .insert("idempotency-replayed", HeaderValue::from_static("true"));
+    }
     if error.code() == "idempotency_in_progress" {
         response.headers_mut().insert(
             axum::http::header::RETRY_AFTER,

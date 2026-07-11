@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
@@ -16,7 +16,7 @@ impl ErrorCode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Retryability {
     Retryable,
     Terminal,
@@ -36,13 +36,14 @@ impl Retryability {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CliExit {
     Usage,
     NotFound,
     Conflict,
     Unavailable,
     Contention,
+    SourceChanged,
     Internal,
 }
 
@@ -54,12 +55,13 @@ impl CliExit {
             Self::Conflict => 4,
             Self::Unavailable => 5,
             Self::Contention => 6,
+            Self::SourceChanged => 7,
             Self::Internal => 10,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ApiStatus {
     Forbidden,
     NotFound,
@@ -67,10 +69,12 @@ enum ApiStatus {
     PreconditionFailed,
     PreconditionRequired,
     Gone,
+    UnsupportedMedia,
     Unprocessable,
     Locked,
     Internal,
     Unavailable,
+    InsufficientStorage,
 }
 
 impl ApiStatus {
@@ -80,8 +84,16 @@ impl ApiStatus {
             Self::NotFound => 404,
             Self::Conflict => 409,
             Self::Gone => 410,
+            _ => self.server_or_extended_code(),
+        }
+    }
+
+    const fn server_or_extended_code(self) -> u16 {
+        match self {
+            Self::UnsupportedMedia => 415,
             Self::Internal => 500,
             Self::Unavailable => 503,
+            Self::InsufficientStorage => 507,
             _ => self.extended_code(),
         }
     }
@@ -97,6 +109,17 @@ impl ApiStatus {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredError {
+    code: String,
+    message: String,
+    retryability: Retryability,
+    details: Value,
+    exit: CliExit,
+    api_status: ApiStatus,
+}
+
 #[derive(Debug)]
 pub struct AppError {
     code: ErrorCode,
@@ -105,6 +128,7 @@ pub struct AppError {
     details: Value,
     exit: CliExit,
     api_status: ApiStatus,
+    replayed: bool,
 }
 
 impl AppError {
@@ -186,6 +210,38 @@ impl AppError {
             CliExit::Contention,
             ApiStatus::Locked,
         )
+    }
+
+    pub fn source_changed() -> Self {
+        Self::new(
+            "source_changed",
+            "source changed while it was copied",
+            Retryability::Retryable,
+            CliExit::SourceChanged,
+            ApiStatus::Unprocessable,
+        )
+    }
+
+    pub fn unsupported_media(message: impl Into<String>) -> Self {
+        Self::new(
+            "unsupported_entry_media",
+            message,
+            Retryability::Terminal,
+            CliExit::Usage,
+            ApiStatus::UnsupportedMedia,
+        )
+    }
+
+    pub fn capacity(details: Value) -> Self {
+        let mut error = Self::new(
+            "capacity",
+            "Artifact Publish is blocked by storage capacity",
+            Retryability::Terminal,
+            CliExit::Internal,
+            ApiStatus::InsufficientStorage,
+        );
+        error.details = details;
+        error
     }
 
     pub fn gone(code: &'static str, message: impl Into<String>) -> Self {
@@ -292,7 +348,35 @@ impl AppError {
             details,
             exit,
             api_status: ApiStatus::Internal,
+            replayed: false,
         }
+    }
+
+    pub(crate) fn stored(&self) -> StoredError {
+        StoredError {
+            code: self.code.as_str().to_owned(),
+            message: self.message.clone(),
+            retryability: self.retryability,
+            details: self.details.clone(),
+            exit: self.exit,
+            api_status: self.api_status,
+        }
+    }
+
+    pub(crate) fn from_stored(stored: StoredError) -> Self {
+        Self {
+            code: ErrorCode::new(stored.code),
+            message: stored.message,
+            retryability: stored.retryability,
+            details: stored.details,
+            exit: stored.exit,
+            api_status: stored.api_status,
+            replayed: true,
+        }
+    }
+
+    pub const fn replayed(&self) -> bool {
+        self.replayed
     }
 
     pub fn envelope(&self) -> Value {
@@ -334,6 +418,7 @@ impl AppError {
             details: json!({}),
             exit,
             api_status,
+            replayed: false,
         }
     }
 }

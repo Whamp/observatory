@@ -1,3 +1,4 @@
+use crate::artifact::{Artifact, ArtifactList, Revision};
 use crate::project::{Project, ProjectList, ProjectTombstonePreview};
 
 pub fn index(projects: &ProjectList, build_id: &str, query: &str) -> String {
@@ -43,6 +44,7 @@ pub fn project_detail(
     project: &Project,
     csrf_token: &str,
     idempotency_key: &str,
+    entries: &ArtifactList,
     build_id: &str,
 ) -> String {
     let mut body = String::new();
@@ -78,8 +80,103 @@ pub fn project_detail(
         "/ui/projects/{}/tombstone/",
         project.key()
     )));
-    body.push_str("\">Tombstone Project</a></section><section><div class=\"section-heading\"><h2>Entries</h2><span>0 shown</span></div><div class=\"empty\"><h3>No Entries yet</h3><p>Published Artifacts and registered Services will appear here.</p></div></section>");
+    body.push_str("\">Tombstone Project</a></section><section><div class=\"section-heading\"><h2>Entries</h2><span>");
+    body.push_str(&entries.items().len().to_string());
+    body.push_str(" shown</span></div>");
+    if entries.items().is_empty() {
+        body.push_str("<div class=\"empty\"><h3>No Entries yet</h3><p>Published Artifacts and registered Services will appear here.</p></div>");
+    } else {
+        body.push_str("<ol class=\"project-list entry-list\">");
+        for artifact in entries.items() {
+            body.push_str(
+                "<li><article><div><span class=\"state live\">ARTIFACT</span><span class=\"state\">",
+            );
+            body.push_str(artifact.retention_label());
+            body.push_str("</span><h3><a href=\"");
+            body.push_str(&attribute_escape(artifact.detail_url()));
+            body.push_str("\">");
+            body.push_str(&text_escape(artifact.title()));
+            body.push_str("</a></h3><p>");
+            body.push_str(&text_escape(artifact.description()));
+            body.push_str("</p><dl class=\"entry-facts\"><div><dt>Artifact</dt><dd><code>");
+            body.push_str(&text_escape(artifact.key()));
+            body.push_str("</code></dd></div><div><dt>Project</dt><dd><code>");
+            body.push_str(&text_escape(artifact.project_key()));
+            body.push_str("</code></dd></div><div><dt>Current Revision</dt><dd><code>");
+            body.push_str(&text_escape(artifact.current_revision_id()));
+            body.push_str("</code></dd></div><div><dt>Size</dt><dd>");
+            body.push_str(&artifact.files().to_string());
+            body.push_str(" file · ");
+            body.push_str(&artifact.logical_bytes().to_string());
+            body.push_str(" logical bytes · ");
+            body.push_str(&artifact.revision_count().to_string());
+            body.push_str(" Revision");
+            body.push_str("</dd></div><div><dt>Published</dt><dd>");
+            body.push_str(&text_escape(artifact.published_at()));
+            body.push_str("</dd></div>");
+            if let Some(deadline) = artifact.retention_deadline() {
+                body.push_str("<div><dt>Expiry deadline</dt><dd>");
+                body.push_str(&text_escape(deadline));
+                body.push_str("</dd></div>");
+            }
+            body.push_str("</dl></div><div class=\"entry-actions\"><a class=\"primary\" href=\"");
+            body.push_str(&attribute_escape(artifact.open_url()));
+            body.push_str("\">Open</a><a href=\"");
+            body.push_str(&attribute_escape(artifact.detail_url()));
+            body.push_str("\">Details</a></div></article></li>");
+        }
+        body.push_str("</ol>");
+    }
+    body.push_str("</section>");
     shell(project.title(), &body, build_id)
+}
+
+pub fn artifact_detail(artifact: &Artifact, revision: &Revision, build_id: &str) -> String {
+    let mut body = String::new();
+    body.push_str("<nav><a href=\"");
+    body.push_str(&attribute_escape(&format!(
+        "/ui/projects/{}/",
+        artifact.project_key()
+    )));
+    body.push_str(
+        "\">← Project detail</a></nav><header><p class=\"eyebrow\">Live Artifact</p><h1>",
+    );
+    body.push_str(&text_escape(artifact.title()));
+    body.push_str("</h1><p class=\"lede\">");
+    body.push_str(&text_escape(artifact.description()));
+    body.push_str("</p><div class=\"entry-actions\"><a class=\"primary\" href=\"");
+    body.push_str(&attribute_escape(artifact.open_url()));
+    body.push_str("\">Open current</a><a href=\"");
+    body.push_str(&attribute_escape(revision.open_url()));
+    body.push_str("\">Open immutable Revision</a></div></header><dl class=\"facts\"><div><dt>Artifact key</dt><dd><code>");
+    body.push_str(&text_escape(artifact.key()));
+    body.push_str("</code></dd></div><div><dt>Artifact ID</dt><dd><code>");
+    body.push_str(&text_escape(artifact.id()));
+    body.push_str("</code></dd></div><div><dt>Current Revision</dt><dd><code>");
+    body.push_str(&text_escape(revision.id()));
+    body.push_str("</code></dd></div><div><dt>Published</dt><dd>");
+    body.push_str(&text_escape(artifact.published_at()));
+    body.push_str("</dd></div><div><dt>Files</dt><dd>");
+    body.push_str(&artifact.files().to_string());
+    body.push_str("</dd></div><div><dt>Logical bytes</dt><dd>");
+    body.push_str(&artifact.logical_bytes().to_string());
+    body.push_str("</dd></div><div><dt>Revisions</dt><dd>");
+    body.push_str(&artifact.revision_count().to_string());
+    body.push_str("</dd></div><div><dt>Retention</dt><dd>");
+    body.push_str(artifact.retention_label());
+    body.push_str("</dd></div>");
+    if let Some(deadline) = artifact.retention_deadline() {
+        body.push_str("<div><dt>Expiry deadline</dt><dd>");
+        body.push_str(&text_escape(deadline));
+        body.push_str("</dd></div>");
+    }
+    if let Some(reason) = artifact.pin_reason() {
+        body.push_str("<div><dt>Pin reason</dt><dd>");
+        body.push_str(&text_escape(reason));
+        body.push_str("</dd></div>");
+    }
+    body.push_str("</dl>");
+    shell(artifact.title(), &body, build_id)
 }
 
 pub fn tombstone_review(
